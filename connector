@@ -766,8 +766,11 @@ EOF
     echo "  From your main machine (through VPS):"
     echo "    ssh -J root@$vps_endpoint $(whoami)@$assigned_ip"
     echo
+    # Get hostname safely
+    local wsl_hostname=$(cat /etc/hostname 2>/dev/null || echo "wsl")
+    
     echo "  Or add to ~/.ssh/config on main machine:"
-    echo "    Host wsl-$(hostname)"
+    echo "    Host wsl-$wsl_hostname"
     echo "      HostName $assigned_ip"
     echo "      User $(whoami)"
     echo "      ProxyJump root@$vps_endpoint"
