@@ -183,11 +183,31 @@ EOF
 
 # REGISTER: Register WSL machine to VPS
 cmd_register() {
-    local vps_ip="$1"
-    local staging_password="$2"
+    local vps_ip=""
+    local staging_password=""
+    local ssh_port="22"
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--port)
+                ssh_port="$2"
+                shift 2
+                ;;
+            *)
+                if [ -z "$vps_ip" ]; then
+                    vps_ip="$1"
+                elif [ -z "$staging_password" ]; then
+                    staging_password="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     if [ -z "$vps_ip" ]; then
-        log_error "Usage: connector register <vps-ip> [staging-password]"
+        log_error "Usage: connector register <vps-ip> [staging-password] [-p|--port <port>]"
+        log_error "Example: connector register 203.0.113.1 -p 2222"
         exit 1
     fi
 
@@ -248,6 +268,13 @@ EOF
 
     # Save registration locally
     echo "$reg_json" > "$WSL_CONNECTOR_DIR/registration.json"
+    
+    # Save VPS connection info for finalize
+    cat > "$WSL_CONNECTOR_DIR/vps-info" <<EOF
+VPS_IP=$vps_ip
+SSH_PORT=$ssh_port
+EOF
+    chmod 600 "$WSL_CONNECTOR_DIR/vps-info"
 
     # Prompt for staging password if not provided
     if [ -z "$staging_password" ]; then
@@ -256,18 +283,18 @@ EOF
     fi
 
     # Upload registration to VPS
-    log_info "Uploading registration to VPS..."
+    log_info "Uploading registration to VPS (port $ssh_port)..."
     local temp_file="/tmp/${machine_id}.json"
     echo "$reg_json" > "$temp_file"
     
     # Check if sshpass is available
     if command -v sshpass &> /dev/null && [ -n "$staging_password" ]; then
         log_info "Using sshpass for authentication..."
-        if sshpass -p "$staging_password" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>&1; then
+        if sshpass -p "$staging_password" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>&1; then
             rm "$temp_file"
             log_success "Registration uploaded successfully!"
         else
-            log_error "Upload failed. Check VPS IP, password, and network connectivity."
+            log_error "Upload failed. Check VPS IP, port ($ssh_port), password, and network connectivity."
             rm "$temp_file"
             exit 1
         fi
@@ -280,11 +307,11 @@ EOF
             log_info "Using interactive SCP (enter staging password when prompted)..."
         fi
         
-        if scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json"; then
+        if scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json"; then
             rm "$temp_file"
             log_success "Registration uploaded successfully!"
         else
-            log_error "Upload failed. Check VPS IP and network connectivity."
+            log_error "Upload failed. Check VPS IP, port ($ssh_port), and network connectivity."
             rm "$temp_file"
             exit 1
         fi
@@ -430,7 +457,28 @@ EOF
 
 # FINALIZE: Complete WSL setup after approval
 cmd_finalize() {
-    local token="$1"
+    local token=""
+    local vps_ip=""
+    local staging_password=""
+    local ssh_port="22"
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--port)
+                ssh_port="$2"
+                shift 2
+                ;;
+            *)
+                if [ -z "$token" ]; then
+                    token="$1"
+                elif [ -z "$staging_password" ]; then
+                    staging_password="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     # Try to read token from saved state if not provided
     if [ -z "$token" ] && [ -f "$WSL_CONNECTOR_DIR/machine-id" ]; then
@@ -439,7 +487,7 @@ cmd_finalize() {
     fi
 
     if [ -z "$token" ]; then
-        log_error "Usage: connector finalize <token>"
+        log_error "Usage: connector finalize <token> [staging-password] [-p|--port <port>]"
         log_error "Or run after successful registration (token auto-detected)"
         exit 1
     fi
@@ -452,20 +500,37 @@ cmd_finalize() {
         exit 1
     fi
 
-    # Get VPS IP from previous registration
-    read -p "Enter VPS IP: " vps_ip
-    read -sp "Enter staging user password: " staging_password
-    echo
+    # Try to load VPS connection info from saved state
+    if [ -f "$WSL_CONNECTOR_DIR/vps-info" ]; then
+        source "$WSL_CONNECTOR_DIR/vps-info"
+        if [ -z "$vps_ip" ]; then
+            vps_ip="$VPS_IP"
+        fi
+        if [ "$ssh_port" = "22" ] && [ -n "$SSH_PORT" ]; then
+            ssh_port="$SSH_PORT"
+        fi
+        log_info "Using saved VPS info: $vps_ip:$ssh_port"
+    fi
+
+    # Prompt for missing info
+    if [ -z "$vps_ip" ]; then
+        read -p "Enter VPS IP: " vps_ip
+    fi
+    if [ -z "$staging_password" ]; then
+        read -sp "Enter staging user password: " staging_password
+        echo
+    fi
 
     # Download WireGuard config
-    log_info "Downloading WireGuard configuration..."
+    log_info "Downloading WireGuard configuration from $vps_ip:$ssh_port..."
     local temp_config="/tmp/${token}-wg.conf"
     
     # Check if sshpass is available
     if command -v sshpass &> /dev/null && [ -n "$staging_password" ]; then
         log_info "Using sshpass for authentication..."
-        if ! sshpass -p "$staging_password" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>&1; then
+        if ! sshpass -p "$staging_password" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>&1; then
             log_error "Download failed. Ensure machine has been approved by admin."
+            log_error "Check VPS IP ($vps_ip) and port ($ssh_port) are correct."
             exit 1
         fi
     else
@@ -477,8 +542,9 @@ cmd_finalize() {
             log_info "Using interactive SCP (enter staging password when prompted)..."
         fi
         
-        if ! scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config"; then
+        if ! scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config"; then
             log_error "Download failed. Ensure machine has been approved by admin."
+            log_error "Check VPS IP ($vps_ip) and port ($ssh_port) are correct."
             exit 1
         fi
     fi
@@ -730,9 +796,9 @@ VPS Commands (run on VPS):
   revoke <machine-id>     Revoke machine access
 
 WSL Commands (run on WSL):
-  register <vps-ip>       Register WSL machine to VPS
-  finalize [token]        Complete setup after approval
-  status                  Show connection status
+  register <vps-ip> [-p port]     Register WSL machine to VPS
+  finalize [token] [-p port]      Complete setup after approval
+  status                          Show connection status
 
 General:
   help                    Show this help message
@@ -741,14 +807,20 @@ Examples:
   # On VPS (first time setup):
   sudo ./connector vps-init
 
-  # On WSL machine:
+  # On WSL machine (default SSH port 22):
   ./connector register 1.2.3.4
+
+  # On WSL machine (custom SSH port):
+  ./connector register 1.2.3.4 -p 2222
 
   # On VPS (approve machine):
   sudo ./connector approve
 
-  # On WSL (after approval):
+  # On WSL (after approval, auto-detects saved port):
   ./connector finalize wsl-abc12345
+
+  # On WSL (specify port manually):
+  ./connector finalize wsl-abc12345 -p 2222
 
   # Check status:
   ./connector status
