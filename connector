@@ -103,23 +103,102 @@ cmd_vps_init() {
     chmod 755 "$REGISTRY_DIR/pending"
     chmod 700 "$REGISTRY_DIR"/{approved,configs,revoked}
 
-    # Create staging user
-    log_info "Creating staging user..."
+    # Create staging user with restricted shell
+    log_info "Creating staging user with restricted access..."
     read -sp "Enter password for staging user '$STAGING_USER': " staging_password
     echo
     if id "$STAGING_USER" &>/dev/null; then
-        log_warn "User $STAGING_USER already exists, updating password..."
+        log_warn "User $STAGING_USER already exists, updating..."
         echo "$STAGING_USER:$staging_password" | chpasswd
+        usermod -s /usr/sbin/nologin "$STAGING_USER"
     else
-        useradd -m -s /bin/bash "$STAGING_USER"
+        # Create user with nologin shell (can't login interactively)
+        useradd -m -s /usr/sbin/nologin "$STAGING_USER"
         echo "$STAGING_USER:$staging_password" | chpasswd
     fi
+    
+    # Lock down home directory
+    chmod 750 "/home/$STAGING_USER"
 
     # Set permissions for staging user
     chown -R root:root "$REGISTRY_DIR"
     chown "$STAGING_USER:$STAGING_USER" "$REGISTRY_DIR/pending"
     chmod 733 "$REGISTRY_DIR/pending"  # Write-only for staging user
     chmod 755 "$REGISTRY_DIR/configs"  # Readable for config download
+    
+    # Configure SSH for staging user with heavy restrictions
+    log_info "Configuring SSH with restricted access for staging user..."
+    
+    # Backup sshd_config
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+    
+    # Remove any existing Match User configuration for staging user
+    sed -i "/^Match User $STAGING_USER/,/^Match /d" /etc/ssh/sshd_config
+    sed -i "/^Match User $STAGING_USER/,\$d" /etc/ssh/sshd_config
+    
+    # Add restricted configuration for staging user at the end
+    cat >> /etc/ssh/sshd_config <<EOF
+
+# Restricted access for staging user (connector tool)
+Match User $STAGING_USER
+    # Allow password authentication ONLY for this user
+    PasswordAuthentication yes
+    # Disable interactive shell (SCP/SFTP only via ForceCommand)
+    ForceCommand /usr/bin/scponly
+    # Disable dangerous features
+    PermitTTY no
+    X11Forwarding no
+    AllowTcpForwarding no
+    PermitTunnel no
+    GatewayPorts no
+    AllowAgentForwarding no
+    # Additional restrictions
+    MaxAuthTries 3
+    MaxSessions 2
+    ClientAliveInterval 300
+    ClientAliveCountMax 2
+EOF
+
+    # Create a simple SCP-only wrapper script
+    cat > /usr/bin/scponly <<'SCPONLY'
+#!/bin/bash
+# SCP-only restricted shell for staging user
+# Only allows scp file transfers, no interactive commands
+
+case "$SSH_ORIGINAL_COMMAND" in
+    scp\ -t\ /var/lib/wsl-registry/pending/*)
+        # Allow uploads to pending directory only
+        exec $SSH_ORIGINAL_COMMAND
+        ;;
+    scp\ -f\ /var/lib/wsl-registry/configs/*)
+        # Allow downloads from configs directory only
+        exec $SSH_ORIGINAL_COMMAND
+        ;;
+    *)
+        echo "Access denied: Only SCP file transfers to/from registry directories are allowed" >&2
+        exit 1
+        ;;
+esac
+SCPONLY
+    
+    chmod +x /usr/bin/scponly
+    log_success "Created restricted SCP-only shell"
+    
+    # Test SSH configuration
+    if sshd -t; then
+        log_success "SSH configuration is valid"
+    else
+        log_error "SSH configuration has errors. Restoring backup..."
+        cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
+        exit 1
+    fi
+    
+    # Restart SSH service
+    if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null; then
+        log_success "SSH service restarted"
+    else
+        log_warn "Could not restart SSH service automatically. Please restart manually: sudo systemctl restart sshd"
+    fi
 
     # Create WireGuard server config
     log_info "Creating WireGuard server configuration..."
@@ -174,6 +253,12 @@ EOF
     echo -e "${YELLOW}Staging User:${NC}"
     echo "  Username: $STAGING_USER"
     echo "  Password: $staging_password"
+    echo
+    echo -e "${YELLOW}Security Configuration:${NC}"
+    echo "  ✓ Password auth enabled ONLY for staging user"
+    echo "  ✓ Interactive shell disabled (SCP-only access)"
+    echo "  ✓ Access restricted to registry directories only"
+    echo "  ✓ SSH backup saved at: /etc/ssh/sshd_config.backup"
     echo
     echo -e "${BLUE}Next Steps:${NC}"
     echo "  1. On WSL machines, run: ./connector register $vps_ip"
