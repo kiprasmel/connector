@@ -120,20 +120,14 @@ if [ -z "$SSH_ORIGINAL_COMMAND" ]; then
     exit 1
 fi
 
-# Only allow SCP commands to/from allowed directories
-case "$SSH_ORIGINAL_COMMAND" in
-    scp\ -t\ /var/lib/wsl-registry/pending/* | \
-    scp\ -f\ /var/lib/wsl-registry/configs/* | \
-    scp\ -t\ \/var\/lib\/wsl-registry\/pending\/* | \
-    scp\ -f\ \/var\/lib\/wsl-registry\/configs\/*)
-        # Execute the allowed SCP command
-        exec $SSH_ORIGINAL_COMMAND
-        ;;
-    *)
-        # Silently deny everything else
-        exit 1
-        ;;
-esac
+# Check if this is an SCP command to allowed directories
+if echo "$SSH_ORIGINAL_COMMAND" | grep -qE '^scp -(t|f) /var/lib/wsl-registry/(pending|configs)/'; then
+    # Execute the SCP command
+    exec $SSH_ORIGINAL_COMMAND
+else
+    # Deny everything else silently
+    exit 1
+fi
 SCPSHELL
     
     chmod +x /usr/local/bin/scponly-shell

@@ -81,7 +81,7 @@ Directory structure on VPS:
 
 ### 3. Staging User
 
-Special user account `wsl-staging`:
+Special user account `connector`:
 - Purpose: Accept registration uploads
 - Permissions: Write-only to `pending/` directory
 - Authentication: Password-based (shared with WSL users)
