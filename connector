@@ -546,7 +546,6 @@ EOF
 [Interface]
 Address = $client_ip/32
 PrivateKey = PLACEHOLDER_PRIVATE_KEY
-DNS = 1.1.1.1
 
 [Peer]
 PublicKey = $server_public
@@ -707,12 +706,25 @@ EOF
 
     # Enable and start services
     log_info "Enabling WireGuard service..."
-    sudo systemctl enable wg-quick@$WG_INTERFACE
-    sudo systemctl start wg-quick@$WG_INTERFACE
+    sudo systemctl enable wg-quick@$WG_INTERFACE 2>&1 || log_warn "Could not enable WireGuard service"
+    
+    log_info "Starting WireGuard..."
+    if ! timeout 10 sudo systemctl start wg-quick@$WG_INTERFACE 2>&1; then
+        log_warn "WireGuard failed to start or timed out. Check logs with: sudo journalctl -u wg-quick@wg0"
+        log_warn "You may need to start it manually: sudo systemctl start wg-quick@wg0"
+    else
+        log_success "WireGuard started"
+    fi
 
     log_info "Enabling SSH service..."
-    sudo systemctl enable sshd
-    sudo systemctl start sshd
+    sudo systemctl enable sshd 2>&1 || log_warn "Could not enable SSH service"
+    
+    log_info "Starting SSH..."
+    if ! timeout 5 sudo systemctl start sshd 2>&1; then
+        log_warn "SSH failed to start or timed out"
+    else
+        log_success "SSH started"
+    fi
 
     # Extract assigned IP from config
     local assigned_ip=$(grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
