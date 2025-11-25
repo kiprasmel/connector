@@ -99,9 +99,18 @@ cmd_vps_init() {
     # Create registry directories
     log_info "Creating registry directories..."
     mkdir -p "$REGISTRY_DIR"/{pending,approved,configs,revoked}
+    
+    # Verify directories were created
+    for dir in pending approved configs revoked; do
+        if [ ! -d "$REGISTRY_DIR/$dir" ]; then
+            log_error "Failed to create directory: $REGISTRY_DIR/$dir"
+            exit 1
+        fi
+    done
+    
+    # Set initial ownership (will be refined after user creation)
+    chown -R root:root "$REGISTRY_DIR"
     chmod 755 "$REGISTRY_DIR"
-    chmod 755 "$REGISTRY_DIR/pending"
-    chmod 700 "$REGISTRY_DIR"/{approved,configs,revoked}
 
     # Create staging user with restricted shell
     log_info "Creating staging user with restricted access..."
@@ -113,49 +122,53 @@ cmd_vps_init() {
 # SCP-only restricted shell for staging user
 # This script acts as the user's login shell and only allows SCP operations
 
-# Suppress all output to stdout to avoid breaking SCP protocol
-exec 3>&1  # Save stdout
-exec 1>/dev/null  # Redirect stdout to null
+# Debug logging (comment out in production)
+DEBUG_LOG="/tmp/scponly-debug.log"
+echo "=== $(date) ===" >> "$DEBUG_LOG"
+echo "SSH_ORIGINAL_COMMAND: $SSH_ORIGINAL_COMMAND" >> "$DEBUG_LOG"
 
-# Extract the actual path from the SCP command
-# SCP commands come in two forms:
-# - Upload: scp [options] -t /path/to/file
-# - Download: scp [options] -f /path/to/file
-
+# If no SSH_ORIGINAL_COMMAND, this is an interactive login attempt - deny it
 if [[ -z "$SSH_ORIGINAL_COMMAND" ]]; then
-    echo "Access denied: No command specified" >&2
+    echo "Access denied: Interactive login not allowed" >&2
+    echo "ERROR: No SSH_ORIGINAL_COMMAND (interactive login)" >> "$DEBUG_LOG"
     exit 1
 fi
 
-# Check if this is an SCP command
-if [[ ! "$SSH_ORIGINAL_COMMAND" =~ ^scp[[:space:]] ]]; then
+# Log the command we received
+echo "Command: $SSH_ORIGINAL_COMMAND" >> "$DEBUG_LOG"
+
+# Check if this is an SCP command (looking for "scp -" pattern)
+if [[ ! "$SSH_ORIGINAL_COMMAND" =~ scp[[:space:]-] ]]; then
     echo "Access denied: Only SCP file transfers are allowed" >&2
+    echo "ERROR: Not an SCP command" >> "$DEBUG_LOG"
     exit 1
 fi
 
-# Restore stdout for SCP execution
-exec 1>&3
-
-# Extract the target path (last argument after -t or -f flag)
-if [[ "$SSH_ORIGINAL_COMMAND" =~ -t[[:space:]]+(/[^[:space:]]+) ]] || \
-   [[ "$SSH_ORIGINAL_COMMAND" =~ -f[[:space:]]+(/[^[:space:]]+) ]]; then
+# Extract the target path (looking for -t or -f flag followed by a path)
+if [[ "$SSH_ORIGINAL_COMMAND" =~ -t[[:space:]]+(/[^[:space:]]+) ]]; then
+    # Upload mode
     target_path="${BASH_REMATCH[1]}"
-    
-    # Check if the path is in allowed directories
-    if [[ "$target_path" == /var/lib/wsl-registry/pending/* ]]; then
-        # Allow uploads to pending directory
-        exec $SSH_ORIGINAL_COMMAND
-    elif [[ "$target_path" == /var/lib/wsl-registry/configs/* ]]; then
-        # Allow downloads from configs directory
-        exec $SSH_ORIGINAL_COMMAND
-    else
-        exec 1>/dev/null  # Suppress stdout for error
-        echo "Access denied: Path '$target_path' is not in allowed directories" >&2
-        exit 1
-    fi
+    echo "Upload mode, target: $target_path" >> "$DEBUG_LOG"
+elif [[ "$SSH_ORIGINAL_COMMAND" =~ -f[[:space:]]+(/[^[:space:]]+) ]]; then
+    # Download mode
+    target_path="${BASH_REMATCH[1]}"
+    echo "Download mode, target: $target_path" >> "$DEBUG_LOG"
 else
-    exec 1>/dev/null  # Suppress stdout for error
     echo "Access denied: Invalid SCP command format" >&2
+    echo "ERROR: Could not extract target path" >> "$DEBUG_LOG"
+    exit 1
+fi
+
+# Check if the path is in allowed directories
+if [[ "$target_path" == /var/lib/wsl-registry/pending/* ]]; then
+    echo "ALLOWED: Upload to pending" >> "$DEBUG_LOG"
+    exec $SSH_ORIGINAL_COMMAND
+elif [[ "$target_path" == /var/lib/wsl-registry/configs/* ]]; then
+    echo "ALLOWED: Download from configs" >> "$DEBUG_LOG"
+    exec $SSH_ORIGINAL_COMMAND
+else
+    echo "Access denied: Path '$target_path' is not in allowed directories" >&2
+    echo "ERROR: Path not in allowed directories" >> "$DEBUG_LOG"
     exit 1
 fi
 SCPONLY
@@ -182,11 +195,28 @@ SCPONLY
     # Lock down home directory
     chmod 750 "/home/$STAGING_USER"
 
-    # Set permissions for staging user
-    chown -R root:root "$REGISTRY_DIR"
+    # Set final permissions for registry directories
+    log_info "Setting registry directory permissions..."
+    
+    # pending: writable by staging user (for uploads)
     chown "$STAGING_USER:$STAGING_USER" "$REGISTRY_DIR/pending"
-    chmod 733 "$REGISTRY_DIR/pending"  # Write-only for staging user
-    chmod 755 "$REGISTRY_DIR/configs"  # Readable for config download
+    chmod 755 "$REGISTRY_DIR/pending"  # rwxr-xr-x
+    
+    # configs: readable by staging user (for downloads)
+    chown root:root "$REGISTRY_DIR/configs"
+    chmod 755 "$REGISTRY_DIR/configs"  # rwxr-xr-x
+    
+    # approved and revoked: root only
+    chown root:root "$REGISTRY_DIR"/{approved,revoked}
+    chmod 700 "$REGISTRY_DIR"/{approved,revoked}  # rwx------
+    
+    # Verify permissions
+    if [ ! -w "$REGISTRY_DIR/pending" ] || [ ! -r "$REGISTRY_DIR/configs" ]; then
+        log_error "Failed to set proper permissions on registry directories"
+        exit 1
+    fi
+    
+    log_success "Registry directories configured with proper permissions"
     
     # Configure SSH for staging user with heavy restrictions
     log_info "Configuring SSH with restricted access for staging user..."
