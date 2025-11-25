@@ -107,18 +107,54 @@ cmd_vps_init() {
     log_info "Creating staging user with restricted access..."
     read -sp "Enter password for staging user '$STAGING_USER': " staging_password
     echo
+    
+    # Create the restricted shell script first
+    cat > /usr/local/bin/scponly-shell <<'SCPSHELL'
+#!/bin/bash
+# Restricted shell that only allows SCP operations to specific directories
+# This is the user's actual login shell
+
+# If no command specified (interactive login attempt), deny
+if [ -z "$SSH_ORIGINAL_COMMAND" ]; then
+    echo "Interactive login not allowed" >&2
+    exit 1
+fi
+
+# Only allow SCP commands to/from allowed directories
+case "$SSH_ORIGINAL_COMMAND" in
+    scp\ -t\ /var/lib/wsl-registry/pending/* | \
+    scp\ -f\ /var/lib/wsl-registry/configs/* | \
+    scp\ -t\ \/var\/lib\/wsl-registry\/pending\/* | \
+    scp\ -f\ \/var\/lib\/wsl-registry\/configs\/*)
+        # Execute the allowed SCP command
+        exec $SSH_ORIGINAL_COMMAND
+        ;;
+    *)
+        # Silently deny everything else
+        exit 1
+        ;;
+esac
+SCPSHELL
+    
+    chmod +x /usr/local/bin/scponly-shell
+    
+    # Add to /etc/shells if not already there
+    if ! grep -q "/usr/local/bin/scponly-shell" /etc/shells; then
+        echo "/usr/local/bin/scponly-shell" >> /etc/shells
+    fi
+    
     if id "$STAGING_USER" &>/dev/null; then
         log_warn "User $STAGING_USER already exists, updating..."
         echo "$STAGING_USER:$staging_password" | chpasswd
-        usermod -s /usr/sbin/nologin "$STAGING_USER"
+        usermod -s /usr/local/bin/scponly-shell "$STAGING_USER"
     else
-        # Create user with nologin shell (can't login interactively)
-        useradd -m -s /usr/sbin/nologin "$STAGING_USER"
+        # Create user with restricted shell
+        useradd -m -s /usr/local/bin/scponly-shell "$STAGING_USER"
         echo "$STAGING_USER:$staging_password" | chpasswd
     fi
     
     # Lock down home directory
-    chmod 750 "/home/$STAGING_USER"
+    chmod 700 "/home/$STAGING_USER"
 
     # Set permissions for staging user
     chown -R root:root "$REGISTRY_DIR"
@@ -143,9 +179,7 @@ cmd_vps_init() {
 Match User $STAGING_USER
     # Allow password authentication ONLY for this user
     PasswordAuthentication yes
-    # Disable interactive shell (SCP/SFTP only via ForceCommand)
-    ForceCommand /usr/bin/scponly
-    # Disable dangerous features
+    # Disable dangerous features (shell itself restricts commands)
     PermitTTY no
     X11Forwarding no
     AllowTcpForwarding no
@@ -159,30 +193,11 @@ Match User $STAGING_USER
     ClientAliveCountMax 2
 EOF
 
-    # Create a simple SCP-only wrapper script
-    cat > /usr/bin/scponly <<'SCPONLY'
-#!/bin/bash
-# SCP-only restricted shell for staging user
-# Only allows scp file transfers, no interactive commands
-
-case "$SSH_ORIGINAL_COMMAND" in
-    scp\ -t\ /var/lib/wsl-registry/pending/*)
-        # Allow uploads to pending directory only
-        exec $SSH_ORIGINAL_COMMAND
-        ;;
-    scp\ -f\ /var/lib/wsl-registry/configs/*)
-        # Allow downloads from configs directory only
-        exec $SSH_ORIGINAL_COMMAND
-        ;;
-    *)
-        echo "Access denied: Only SCP file transfers to/from registry directories are allowed" >&2
-        exit 1
-        ;;
-esac
-SCPONLY
-    
-    chmod +x /usr/bin/scponly
-    log_success "Created restricted SCP-only shell"
+    # Ensure staging user home directory is clean
+    log_info "Securing staging user home directory..."
+    rm -f "/home/$STAGING_USER/.bashrc" "/home/$STAGING_USER/.bash_profile" "/home/$STAGING_USER/.profile" "/home/$STAGING_USER/.bash_login"
+    chmod 700 "/home/$STAGING_USER"
+    log_success "Created restricted shell for staging user"
     
     # Test SSH configuration
     if sshd -t; then
@@ -256,7 +271,8 @@ EOF
     echo
     echo -e "${YELLOW}Security Configuration:${NC}"
     echo "  ✓ Password auth enabled ONLY for staging user"
-    echo "  ✓ Interactive shell disabled (SCP-only access)"
+    echo "  ✓ Restricted shell: /usr/local/bin/scponly-shell"
+    echo "  ✓ SCP-only access (interactive login blocked)"
     echo "  ✓ Access restricted to registry directories only"
     echo "  ✓ SSH backup saved at: /etc/ssh/sshd_config.backup"
     echo
