@@ -112,14 +112,23 @@ cmd_vps_init() {
     chown -R root:root "$REGISTRY_DIR"
     chmod 755 "$REGISTRY_DIR"
 
+    # Clean up old scponly script if it exists
+    if [ -f /usr/bin/scponly ]; then
+        log_info "Removing old scponly script..."
+        rm -f /usr/bin/scponly
+        sed -i '\|^/usr/bin/scponly$|d' /etc/shells 2>/dev/null || true
+    fi
+    
     # Create staging user (simple approach - let file permissions do the work)
     log_info "Creating staging user with restricted access..."
     read -sp "Enter password for staging user '$STAGING_USER': " staging_password
     echo
     
     if id "$STAGING_USER" &>/dev/null; then
-        log_warn "User $STAGING_USER already exists, updating password..."
+        log_warn "User $STAGING_USER already exists, updating..."
         echo "$STAGING_USER:$staging_password" | chpasswd
+        # Ensure shell is /bin/bash (not old scponly)
+        usermod -s /bin/bash "$STAGING_USER"
     else
         # Create user with /bin/bash (SCP will work fine, interactive login blocked by SSH config)
         useradd -m -s /bin/bash "$STAGING_USER"
