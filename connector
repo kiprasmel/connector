@@ -704,6 +704,10 @@ EOF
         exit 0
     fi
 
+    # Verify the IP in the config before starting
+    local config_ip=$(sudo grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
+    log_info "Configured WireGuard IP: $config_ip"
+    
     # Enable and start services
     log_info "Enabling WireGuard service..."
     sudo systemctl enable wg-quick@$WG_INTERFACE 2>&1 || log_warn "Could not enable WireGuard service"
@@ -729,9 +733,24 @@ EOF
     # Extract assigned IP from config
     local assigned_ip=$(sudo grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
 
+    # Verify the actual IP assigned
+    log_info "Verifying WireGuard interface..."
+    sleep 2
+    local actual_ip=$(ip addr show wg0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+    if [ -n "$actual_ip" ]; then
+        log_success "WireGuard interface has IP: $actual_ip"
+        if [ "$actual_ip" != "$assigned_ip" ]; then
+            log_warn "WARNING: IP mismatch detected!"
+            log_warn "  Expected: $assigned_ip"
+            log_warn "  Actual: $actual_ip"
+            log_warn "  The VPS may have a different IP in its config. Contact admin to verify."
+        fi
+    else
+        log_warn "Could not detect WireGuard IP address"
+    fi
+    
     # Test connectivity
     log_info "Testing VPS connectivity..."
-    sleep 2
     if sudo wg show | grep -q "latest handshake"; then
         log_success "WireGuard tunnel established!"
     else
