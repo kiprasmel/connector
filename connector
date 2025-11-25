@@ -107,13 +107,75 @@ cmd_vps_init() {
     log_info "Creating staging user with restricted access..."
     read -sp "Enter password for staging user '$STAGING_USER': " staging_password
     echo
+    # Create scponly shell first (needed for user creation)
+    cat > /usr/bin/scponly <<'SCPONLY'
+#!/bin/bash
+# SCP-only restricted shell for staging user
+# This script acts as the user's login shell and only allows SCP operations
+
+# Suppress all output to stdout to avoid breaking SCP protocol
+exec 3>&1  # Save stdout
+exec 1>/dev/null  # Redirect stdout to null
+
+# Extract the actual path from the SCP command
+# SCP commands come in two forms:
+# - Upload: scp [options] -t /path/to/file
+# - Download: scp [options] -f /path/to/file
+
+if [[ -z "$SSH_ORIGINAL_COMMAND" ]]; then
+    echo "Access denied: No command specified" >&2
+    exit 1
+fi
+
+# Check if this is an SCP command
+if [[ ! "$SSH_ORIGINAL_COMMAND" =~ ^scp[[:space:]] ]]; then
+    echo "Access denied: Only SCP file transfers are allowed" >&2
+    exit 1
+fi
+
+# Restore stdout for SCP execution
+exec 1>&3
+
+# Extract the target path (last argument after -t or -f flag)
+if [[ "$SSH_ORIGINAL_COMMAND" =~ -t[[:space:]]+(/[^[:space:]]+) ]] || \
+   [[ "$SSH_ORIGINAL_COMMAND" =~ -f[[:space:]]+(/[^[:space:]]+) ]]; then
+    target_path="${BASH_REMATCH[1]}"
+    
+    # Check if the path is in allowed directories
+    if [[ "$target_path" == /var/lib/wsl-registry/pending/* ]]; then
+        # Allow uploads to pending directory
+        exec $SSH_ORIGINAL_COMMAND
+    elif [[ "$target_path" == /var/lib/wsl-registry/configs/* ]]; then
+        # Allow downloads from configs directory
+        exec $SSH_ORIGINAL_COMMAND
+    else
+        exec 1>/dev/null  # Suppress stdout for error
+        echo "Access denied: Path '$target_path' is not in allowed directories" >&2
+        exit 1
+    fi
+else
+    exec 1>/dev/null  # Suppress stdout for error
+    echo "Access denied: Invalid SCP command format" >&2
+    exit 1
+fi
+SCPONLY
+    
+    chmod +x /usr/bin/scponly
+    
+    # Add scponly to /etc/shells if not already there
+    if ! grep -q "^/usr/bin/scponly$" /etc/shells 2>/dev/null; then
+        echo "/usr/bin/scponly" >> /etc/shells
+    fi
+    
+    log_success "Created restricted SCP-only shell"
+    
     if id "$STAGING_USER" &>/dev/null; then
         log_warn "User $STAGING_USER already exists, updating..."
         echo "$STAGING_USER:$staging_password" | chpasswd
-        usermod -s /usr/sbin/nologin "$STAGING_USER"
+        usermod -s /usr/bin/scponly "$STAGING_USER"
     else
-        # Create user with nologin shell (can't login interactively)
-        useradd -m -s /usr/sbin/nologin "$STAGING_USER"
+        # Create user with scponly shell (restricted to SCP only)
+        useradd -m -s /usr/bin/scponly "$STAGING_USER"
         echo "$STAGING_USER:$staging_password" | chpasswd
     fi
     
@@ -143,8 +205,6 @@ cmd_vps_init() {
 Match User $STAGING_USER
     # Allow password authentication ONLY for this user
     PasswordAuthentication yes
-    # Disable interactive shell (SCP/SFTP only via ForceCommand)
-    ForceCommand /usr/bin/scponly
     # Disable dangerous features
     PermitTTY no
     X11Forwarding no
