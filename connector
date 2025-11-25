@@ -1,0 +1,764 @@
+#!/bin/bash
+# connector - Universal WireGuard VPS-WSL management tool
+# Manages registration and approval of WSL machines to a central VPS
+
+set -e
+
+VERSION="1.0.0"
+REGISTRY_DIR="/var/lib/wsl-registry"
+WG_CONFIG_DIR="/etc/wireguard"
+WSL_CONNECTOR_DIR="${HOME}/.config/wsl-connector"
+WG_PORT="51820"
+WG_INTERFACE="wg0"
+VPS_WG_IP="10.0.0.1"
+WG_SUBNET="10.0.0.0/24"
+STAGING_USER="wsl-staging"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_info() { echo -e "${BLUE}ℹ${NC} $*"; }
+log_success() { echo -e "${GREEN}✓${NC} $*"; }
+log_warn() { echo -e "${YELLOW}⚠${NC} $*"; }
+log_error() { echo -e "${RED}✗${NC} $*" >&2; }
+
+require_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "This command must be run as root"
+        exit 1
+    fi
+}
+
+require_package() {
+    if ! command -v "$1" &> /dev/null; then
+        log_error "Required package '$1' is not installed"
+        exit 1
+    fi
+}
+
+is_vps() {
+    [ -d "$REGISTRY_DIR" ]
+}
+
+is_arch() {
+    [ -f /etc/arch-release ]
+}
+
+generate_machine_id() {
+    echo "wsl-$(head /dev/urandom | tr -dc a-z0-9 | head -c 8)"
+}
+
+get_next_ip() {
+    local max_ip=1
+    if [ -d "$REGISTRY_DIR/approved" ]; then
+        for file in "$REGISTRY_DIR/approved"/*.json; do
+            [ -f "$file" ] || continue
+            local ip=$(jq -r '.wg_ip' "$file" 2>/dev/null | cut -d'.' -f4)
+            if [ -n "$ip" ] && [ "$ip" -gt "$max_ip" ]; then
+                max_ip=$ip
+            fi
+        done
+    fi
+    echo "10.0.0.$((max_ip + 1))"
+}
+
+# VPS-INIT: Initialize VPS as WireGuard server
+cmd_vps_init() {
+    log_info "Initializing VPS as WireGuard server..."
+    require_root
+
+    # Detect package manager
+    if command -v apt &> /dev/null; then
+        PKG_INSTALL="apt update && apt install -y"
+    elif command -v yum &> /dev/null; then
+        PKG_INSTALL="yum install -y"
+    elif command -v pacman &> /dev/null; then
+        PKG_INSTALL="pacman -Sy --noconfirm"
+    else
+        log_error "No supported package manager found (apt/yum/pacman)"
+        exit 1
+    fi
+
+    # Install required packages
+    log_info "Installing required packages..."
+    eval "$PKG_INSTALL wireguard-tools jq openssh-server"
+
+    # Generate WireGuard server keys
+    log_info "Generating WireGuard server keys..."
+    mkdir -p "$WG_CONFIG_DIR"
+    wg genkey | tee "$WG_CONFIG_DIR/server_private.key" | wg pubkey > "$WG_CONFIG_DIR/server_public.key"
+    chmod 600 "$WG_CONFIG_DIR/server_private.key"
+    local server_private=$(cat "$WG_CONFIG_DIR/server_private.key")
+    local server_public=$(cat "$WG_CONFIG_DIR/server_public.key")
+
+    # Create registry directories
+    log_info "Creating registry directories..."
+    mkdir -p "$REGISTRY_DIR"/{pending,approved,configs,revoked}
+    chmod 755 "$REGISTRY_DIR"
+    chmod 755 "$REGISTRY_DIR/pending"
+    chmod 700 "$REGISTRY_DIR"/{approved,configs,revoked}
+
+    # Create staging user
+    log_info "Creating staging user..."
+    read -sp "Enter password for staging user '$STAGING_USER': " staging_password
+    echo
+    if id "$STAGING_USER" &>/dev/null; then
+        log_warn "User $STAGING_USER already exists, updating password..."
+        echo "$STAGING_USER:$staging_password" | chpasswd
+    else
+        useradd -m -s /bin/bash "$STAGING_USER"
+        echo "$STAGING_USER:$staging_password" | chpasswd
+    fi
+
+    # Set permissions for staging user
+    chown -R root:root "$REGISTRY_DIR"
+    chown "$STAGING_USER:$STAGING_USER" "$REGISTRY_DIR/pending"
+    chmod 733 "$REGISTRY_DIR/pending"  # Write-only for staging user
+    chmod 755 "$REGISTRY_DIR/configs"  # Readable for config download
+
+    # Create WireGuard server config
+    log_info "Creating WireGuard server configuration..."
+    cat > "$WG_CONFIG_DIR/$WG_INTERFACE.conf" <<EOF
+[Interface]
+Address = $VPS_WG_IP/24
+ListenPort = $WG_PORT
+PrivateKey = $server_private
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+# Peers will be added below this line
+EOF
+
+    chmod 600 "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+
+    # Enable IP forwarding
+    log_info "Enabling IP forwarding..."
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard.conf
+    sysctl -p /etc/sysctl.d/99-wireguard.conf
+
+    # Configure firewall
+    log_info "Configuring firewall..."
+    if command -v ufw &> /dev/null; then
+        ufw allow $WG_PORT/udp
+        log_success "UFW rule added for port $WG_PORT/udp"
+    elif command -v firewall-cmd &> /dev/null; then
+        firewall-cmd --permanent --add-port=$WG_PORT/udp
+        firewall-cmd --reload
+        log_success "Firewalld rule added for port $WG_PORT/udp"
+    else
+        log_warn "No firewall manager detected. Ensure port $WG_PORT/udp is open"
+    fi
+
+    # Enable and start WireGuard
+    log_info "Enabling WireGuard service..."
+    systemctl enable wg-quick@$WG_INTERFACE
+    systemctl start wg-quick@$WG_INTERFACE
+
+    # Get VPS public IP
+    local vps_ip=$(curl -s ifconfig.me || echo "YOUR_VPS_IP")
+
+    log_success "VPS initialization complete!"
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${GREEN}Server Details:${NC}"
+    echo "  VPS Public IP: $vps_ip"
+    echo "  WireGuard IP: $VPS_WG_IP"
+    echo "  WireGuard Port: $WG_PORT"
+    echo "  Server Public Key: $server_public"
+    echo
+    echo -e "${YELLOW}Staging User:${NC}"
+    echo "  Username: $STAGING_USER"
+    echo "  Password: $staging_password"
+    echo
+    echo -e "${BLUE}Next Steps:${NC}"
+    echo "  1. On WSL machines, run: ./connector register $vps_ip"
+    echo "  2. Approve machines with: ./connector approve"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# REGISTER: Register WSL machine to VPS
+cmd_register() {
+    local vps_ip="$1"
+    local staging_password="$2"
+
+    if [ -z "$vps_ip" ]; then
+        log_error "Usage: connector register <vps-ip> [staging-password]"
+        exit 1
+    fi
+
+    log_info "Registering WSL machine to VPS $vps_ip..."
+
+    # Install dependencies on Arch Linux
+    if is_arch; then
+        log_info "Detected Arch Linux, installing dependencies..."
+        if ! command -v wg &> /dev/null || ! command -v ssh &> /dev/null; then
+            sudo pacman -Sy --noconfirm wireguard-tools openssh
+        fi
+    else
+        log_warn "Non-Arch Linux detected. Ensure wireguard-tools and openssh are installed."
+    fi
+
+    # Create local config directory
+    mkdir -p "$WSL_CONNECTOR_DIR"
+    chmod 700 "$WSL_CONNECTOR_DIR"
+
+    # Generate machine ID
+    local machine_id=$(generate_machine_id)
+    echo "$machine_id" > "$WSL_CONNECTOR_DIR/machine-id"
+    log_success "Generated machine ID: $machine_id"
+
+    # Generate WireGuard keys
+    log_info "Generating WireGuard keypair..."
+    local wg_private=$(wg genkey)
+    local wg_public=$(echo "$wg_private" | wg pubkey)
+    echo "$wg_private" > "$WSL_CONNECTOR_DIR/wg-private-key"
+    chmod 600 "$WSL_CONNECTOR_DIR/wg-private-key"
+
+    # Generate SSH key if not exists
+    local ssh_key="$HOME/.ssh/wsl-to-vps"
+    if [ ! -f "$ssh_key" ]; then
+        log_info "Generating SSH keypair..."
+        ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "$machine_id@wsl"
+    fi
+    local ssh_pubkey=$(cat "$ssh_key.pub")
+
+    # Collect machine info
+    local hostname=$(hostname)
+    local username=$(whoami)
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Create registration JSON
+    local reg_json=$(cat <<EOF
+{
+  "machine_id": "$machine_id",
+  "timestamp": "$timestamp",
+  "hostname": "$hostname",
+  "username": "$username",
+  "wg_pubkey": "$wg_public",
+  "ssh_pubkey": "$ssh_pubkey",
+  "request_note": "WSL machine registration"
+}
+EOF
+)
+
+    # Save registration locally
+    echo "$reg_json" > "$WSL_CONNECTOR_DIR/registration.json"
+
+    # Prompt for staging password if not provided
+    if [ -z "$staging_password" ]; then
+        read -sp "Enter staging user password: " staging_password
+        echo
+    fi
+
+    # Upload registration to VPS
+    log_info "Uploading registration to VPS..."
+    local temp_file="/tmp/${machine_id}.json"
+    echo "$reg_json" > "$temp_file"
+    
+    if sshpass -p "$staging_password" scp -o StrictHostKeyChecking=no "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>/dev/null; then
+        rm "$temp_file"
+        log_success "Registration uploaded successfully!"
+    else
+        # Fallback if sshpass not available
+        log_info "Using interactive SCP (enter staging password when prompted)..."
+        scp -o StrictHostKeyChecking=no "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json"
+        rm "$temp_file"
+        log_success "Registration uploaded successfully!"
+    fi
+
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${GREEN}Registration Complete!${NC}"
+    echo
+    echo "  Machine ID: ${BLUE}$machine_id${NC}"
+    echo "  Status: Waiting for approval"
+    echo
+    echo -e "${YELLOW}Next Steps:${NC}"
+    echo "  1. Contact VPS admin to approve this machine"
+    echo "  2. Provide them with machine ID: $machine_id"
+    echo "  3. After approval, run: ./connector finalize $machine_id"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# APPROVE: Approve pending WSL machine
+cmd_approve() {
+    local machine_id="$1"
+    require_root
+
+    if ! is_vps; then
+        log_error "This command must be run on the VPS"
+        exit 1
+    fi
+
+    require_package jq
+
+    # List pending registrations if no machine_id provided
+    if [ -z "$machine_id" ]; then
+        log_info "Pending registrations:"
+        echo
+        local count=0
+        for file in "$REGISTRY_DIR/pending"/*.json; do
+            [ -f "$file" ] || continue
+            count=$((count + 1))
+            local mid=$(basename "$file" .json)
+            local hostname=$(jq -r '.hostname' "$file")
+            local username=$(jq -r '.username' "$file")
+            local timestamp=$(jq -r '.timestamp' "$file")
+            echo "  [$count] $mid"
+            echo "      Host: $hostname | User: $username | Time: $timestamp"
+            echo
+        done
+
+        if [ $count -eq 0 ]; then
+            log_warn "No pending registrations found"
+            exit 0
+        fi
+
+        read -p "Enter machine ID to approve: " machine_id
+    fi
+
+    # Validate registration exists
+    local reg_file="$REGISTRY_DIR/pending/${machine_id}.json"
+    if [ ! -f "$reg_file" ]; then
+        log_error "Registration not found: $machine_id"
+        exit 1
+    fi
+
+    log_info "Approving machine: $machine_id"
+
+    # Parse registration
+    local hostname=$(jq -r '.hostname' "$reg_file")
+    local username=$(jq -r '.username' "$reg_file")
+    local wg_pubkey=$(jq -r '.wg_pubkey' "$reg_file")
+    local ssh_pubkey=$(jq -r '.ssh_pubkey' "$reg_file")
+
+    # Allocate IP
+    local client_ip=$(get_next_ip)
+    log_success "Assigned IP: $client_ip"
+
+    # Add peer to WireGuard config
+    log_info "Adding WireGuard peer..."
+    cat >> "$WG_CONFIG_DIR/$WG_INTERFACE.conf" <<EOF
+
+# $machine_id ($hostname)
+[Peer]
+PublicKey = $wg_pubkey
+AllowedIPs = $client_ip/32
+EOF
+
+    # Reload WireGuard
+    wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE")
+    log_success "WireGuard configuration updated"
+
+    # Add SSH key to authorized_keys
+    log_info "Adding SSH key to authorized_keys..."
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    echo "$ssh_pubkey" >> /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    log_success "SSH key added"
+
+    # Generate client config
+    log_info "Generating client configuration..."
+    local server_public=$(cat "$WG_CONFIG_DIR/server_public.key")
+    local server_endpoint=$(curl -s ifconfig.me || echo "YOUR_VPS_IP")
+    local client_private=$(jq -r '.wg_pubkey' "$reg_file")  # We need to get this from registration
+
+    # Get VPS public endpoint
+    cat > "$REGISTRY_DIR/configs/${machine_id}.conf" <<EOF
+[Interface]
+Address = $client_ip/32
+PrivateKey = PLACEHOLDER_PRIVATE_KEY
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = $server_public
+Endpoint = ${server_endpoint}:${WG_PORT}
+AllowedIPs = ${WG_SUBNET}
+PersistentKeepalive = 25
+EOF
+
+    chmod 644 "$REGISTRY_DIR/configs/${machine_id}.conf"
+
+    # Create approval record
+    local approved_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    jq --arg ip "$client_ip" \
+       --arg approved "$approved_at" \
+       '. + {wg_ip: $ip, approved_at: $approved}' \
+       "$reg_file" > "$REGISTRY_DIR/approved/${machine_id}.json"
+
+    # Move from pending to approved
+    rm "$reg_file"
+    log_success "Machine approved and moved to approved registry"
+
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${GREEN}Approval Complete!${NC}"
+    echo
+    echo "  Machine ID: $machine_id"
+    echo "  Hostname: $hostname"
+    echo "  Assigned IP: $client_ip"
+    echo
+    echo -e "${YELLOW}Client Instructions:${NC}"
+    echo "  Have the client run: ./connector finalize $machine_id"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# FINALIZE: Complete WSL setup after approval
+cmd_finalize() {
+    local token="$1"
+
+    # Try to read token from saved state if not provided
+    if [ -z "$token" ] && [ -f "$WSL_CONNECTOR_DIR/machine-id" ]; then
+        token=$(cat "$WSL_CONNECTOR_DIR/machine-id")
+        log_info "Using saved machine ID: $token"
+    fi
+
+    if [ -z "$token" ]; then
+        log_error "Usage: connector finalize <token>"
+        log_error "Or run after successful registration (token auto-detected)"
+        exit 1
+    fi
+
+    log_info "Finalizing setup for machine: $token"
+
+    # Read VPS IP from registration
+    if [ ! -f "$WSL_CONNECTOR_DIR/registration.json" ]; then
+        log_error "Registration file not found. Run 'connector register' first."
+        exit 1
+    fi
+
+    # Get VPS IP from previous registration
+    read -p "Enter VPS IP: " vps_ip
+    read -sp "Enter staging user password: " staging_password
+    echo
+
+    # Download WireGuard config
+    log_info "Downloading WireGuard configuration..."
+    local temp_config="/tmp/${token}-wg.conf"
+    
+    if sshpass -p "$staging_password" scp -o StrictHostKeyChecking=no "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>/dev/null; then
+        :
+    else
+        log_info "Using interactive SCP (enter staging password when prompted)..."
+        scp -o StrictHostKeyChecking=no "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config"
+    fi
+
+    # Replace placeholder with actual private key
+    local wg_private=$(cat "$WSL_CONNECTOR_DIR/wg-private-key")
+    sed "s|PLACEHOLDER_PRIVATE_KEY|$wg_private|g" "$temp_config" > "${temp_config}.final"
+
+    # Install WireGuard config
+    log_info "Installing WireGuard configuration..."
+    sudo mkdir -p "$WG_CONFIG_DIR"
+    sudo mv "${temp_config}.final" "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+    sudo chmod 600 "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+    rm -f "$temp_config"
+
+    # Enable systemd in WSL
+    log_info "Configuring WSL systemd..."
+    if [ ! -f /etc/wsl.conf ] || ! grep -q "systemd=true" /etc/wsl.conf; then
+        sudo bash -c 'cat > /etc/wsl.conf' <<'EOF'
+[boot]
+systemd=true
+
+[network]
+generateResolvConf = true
+EOF
+        log_warn "WSL systemd enabled. You need to restart WSL: run 'wsl --shutdown' in Windows"
+        log_warn "After restarting WSL, run this command again to complete setup"
+        exit 0
+    fi
+
+    # Enable and start services
+    log_info "Enabling WireGuard service..."
+    sudo systemctl enable wg-quick@$WG_INTERFACE
+    sudo systemctl start wg-quick@$WG_INTERFACE
+
+    log_info "Enabling SSH service..."
+    sudo systemctl enable sshd
+    sudo systemctl start sshd
+
+    # Extract assigned IP from config
+    local assigned_ip=$(grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
+
+    # Test connectivity
+    log_info "Testing VPS connectivity..."
+    sleep 2
+    if sudo wg show | grep -q "latest handshake"; then
+        log_success "WireGuard tunnel established!"
+    else
+        log_warn "WireGuard tunnel not yet established (may take a moment)"
+    fi
+
+    if ping -c 1 -W 2 "$VPS_WG_IP" &>/dev/null; then
+        log_success "VPS is reachable via WireGuard!"
+    else
+        log_warn "Cannot ping VPS yet (may need to wait for handshake)"
+    fi
+
+    echo
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${GREEN}Setup Complete!${NC}"
+    echo
+    echo "  Machine ID: $token"
+    echo "  WireGuard IP: $assigned_ip"
+    echo "  VPS IP: $VPS_WG_IP"
+    echo
+    echo -e "${BLUE}Connection Status:${NC}"
+    sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
+    echo
+    echo -e "${YELLOW}SSH Access:${NC}"
+    echo "  From VPS: ssh $(whoami)@$assigned_ip"
+    echo
+    echo "  Check status: ./connector status"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# LIST: List all approved machines
+cmd_list() {
+    require_root
+
+    if ! is_vps; then
+        log_error "This command must be run on the VPS"
+        exit 1
+    fi
+
+    require_package jq
+
+    log_info "Approved Machines:"
+    echo
+    printf "%-15s %-20s %-15s %-10s %-20s\n" "MACHINE ID" "HOSTNAME" "IP ADDRESS" "STATUS" "LAST HANDSHAKE"
+    printf "%-15s %-20s %-15s %-10s %-20s\n" "----------" "--------" "----------" "------" "--------------"
+
+    for file in "$REGISTRY_DIR/approved"/*.json; do
+        [ -f "$file" ] || continue
+        
+        local machine_id=$(basename "$file" .json)
+        local hostname=$(jq -r '.hostname' "$file")
+        local ip=$(jq -r '.wg_ip' "$file")
+        local pubkey=$(jq -r '.wg_pubkey' "$file")
+        
+        # Get WireGuard status
+        local wg_status=$(wg show "$WG_INTERFACE" | grep -A 5 "$pubkey" || echo "")
+        local last_handshake="never"
+        local status="offline"
+        
+        if echo "$wg_status" | grep -q "latest handshake"; then
+            last_handshake=$(echo "$wg_status" | grep "latest handshake" | sed 's/.*latest handshake: //')
+            # Check if handshake is recent (within 3 minutes)
+            if echo "$last_handshake" | grep -qE "(second|minute).*ago"; then
+                status="online"
+            fi
+        fi
+        
+        printf "%-15s %-20s %-15s %-10s %-20s\n" \
+            "${machine_id:0:15}" \
+            "${hostname:0:20}" \
+            "$ip" \
+            "$status" \
+            "${last_handshake:0:20}"
+    done
+    echo
+}
+
+# REVOKE: Revoke machine access
+cmd_revoke() {
+    local machine_id="$1"
+    require_root
+
+    if ! is_vps; then
+        log_error "This command must be run on the VPS"
+        exit 1
+    fi
+
+    if [ -z "$machine_id" ]; then
+        log_error "Usage: connector revoke <machine-id>"
+        exit 1
+    fi
+
+    local approved_file="$REGISTRY_DIR/approved/${machine_id}.json"
+    if [ ! -f "$approved_file" ]; then
+        log_error "Machine not found in approved registry: $machine_id"
+        exit 1
+    fi
+
+    log_warn "Revoking access for machine: $machine_id"
+    
+    # Get machine info
+    local hostname=$(jq -r '.hostname' "$approved_file")
+    local wg_pubkey=$(jq -r '.wg_pubkey' "$approved_file")
+    local ssh_pubkey=$(jq -r '.ssh_pubkey' "$approved_file")
+
+    # Remove from WireGuard config
+    log_info "Removing WireGuard peer..."
+    local temp_config="${WG_CONFIG_DIR}/${WG_INTERFACE}.conf.tmp"
+    awk -v pubkey="$wg_pubkey" '
+        /^\[Peer\]/ { in_peer=1; peer_content=$0"\n"; next }
+        in_peer && /^PublicKey/ { 
+            if ($3 == pubkey) { 
+                skip_peer=1 
+            }
+            peer_content=peer_content$0"\n"
+            next 
+        }
+        in_peer && /^$/ { 
+            if (!skip_peer) print peer_content
+            in_peer=0
+            skip_peer=0
+            peer_content=""
+            next
+        }
+        in_peer { peer_content=peer_content$0"\n"; next }
+        !in_peer { print }
+    ' "$WG_CONFIG_DIR/$WG_INTERFACE.conf" > "$temp_config"
+    
+    mv "$temp_config" "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+    wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE")
+    log_success "WireGuard peer removed"
+
+    # Remove SSH key
+    log_info "Removing SSH key..."
+    if [ -f /root/.ssh/authorized_keys ]; then
+        grep -v "$ssh_pubkey" /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp || true
+        mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys
+        log_success "SSH key removed"
+    fi
+
+    # Move to revoked
+    mv "$approved_file" "$REGISTRY_DIR/revoked/"
+    rm -f "$REGISTRY_DIR/configs/${machine_id}.conf"
+
+    log_success "Machine revoked: $machine_id ($hostname)"
+}
+
+# STATUS: Show connection status
+cmd_status() {
+    log_info "WireGuard Connection Status:"
+    echo
+
+    if [ ! -f "$WG_CONFIG_DIR/$WG_INTERFACE.conf" ]; then
+        log_error "WireGuard not configured. Run 'connector register' first."
+        exit 1
+    fi
+
+    # Show WireGuard status
+    if sudo systemctl is-active --quiet wg-quick@$WG_INTERFACE; then
+        log_success "WireGuard service is running"
+    else
+        log_error "WireGuard service is not running"
+        echo "  Start with: sudo systemctl start wg-quick@$WG_INTERFACE"
+    fi
+
+    # Show assigned IP
+    local assigned_ip=$(grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}')
+    echo "  Assigned IP: $assigned_ip"
+
+    # Show WireGuard details
+    echo
+    sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "Cannot retrieve WireGuard stats"
+
+    # Test VPS connectivity
+    echo
+    log_info "Testing VPS connectivity..."
+    if ping -c 1 -W 2 "$VPS_WG_IP" &>/dev/null; then
+        log_success "VPS is reachable at $VPS_WG_IP"
+    else
+        log_error "Cannot reach VPS at $VPS_WG_IP"
+    fi
+
+    # Show SSH status
+    echo
+    if sudo systemctl is-active --quiet sshd; then
+        log_success "SSH service is running"
+    else
+        log_warn "SSH service is not running"
+        echo "  Start with: sudo systemctl start sshd"
+    fi
+}
+
+# HELP: Show usage information
+cmd_help() {
+    cat <<EOF
+connector v${VERSION} - WireGuard VPS-WSL Management Tool
+
+Usage: connector <command> [arguments]
+
+VPS Commands (run on VPS):
+  vps-init                Initialize VPS as WireGuard server
+  approve [machine-id]    Approve pending WSL machine
+  list                    List all approved machines
+  revoke <machine-id>     Revoke machine access
+
+WSL Commands (run on WSL):
+  register <vps-ip>       Register WSL machine to VPS
+  finalize [token]        Complete setup after approval
+  status                  Show connection status
+
+General:
+  help                    Show this help message
+
+Examples:
+  # On VPS (first time setup):
+  sudo ./connector vps-init
+
+  # On WSL machine:
+  ./connector register 1.2.3.4
+
+  # On VPS (approve machine):
+  sudo ./connector approve
+
+  # On WSL (after approval):
+  ./connector finalize wsl-abc12345
+
+  # Check status:
+  ./connector status
+
+For more information, see README.md
+EOF
+}
+
+# Main dispatcher
+main() {
+    local cmd="${1:-help}"
+    
+    case "$cmd" in
+        vps-init)
+            cmd_vps_init "${@:2}"
+            ;;
+        approve)
+            cmd_approve "${@:2}"
+            ;;
+        list)
+            cmd_list "${@:2}"
+            ;;
+        revoke)
+            cmd_revoke "${@:2}"
+            ;;
+        register)
+            cmd_register "${@:2}"
+            ;;
+        finalize)
+            cmd_finalize "${@:2}"
+            ;;
+        status)
+            cmd_status "${@:2}"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            log_error "Unknown command: $cmd"
+            echo
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
