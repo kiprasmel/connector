@@ -228,7 +228,7 @@ cmd_register() {
     local ssh_pubkey=$(cat "$ssh_key.pub")
 
     # Collect machine info
-    local hostname=$(hostname)
+    local hostname=$(cat /etc/hostname 2>/dev/null || echo "${HOSTNAME:-unknown}")
     local username=$(whoami)
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -260,15 +260,34 @@ EOF
     local temp_file="/tmp/${machine_id}.json"
     echo "$reg_json" > "$temp_file"
     
-    if sshpass -p "$staging_password" scp -o StrictHostKeyChecking=no "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>/dev/null; then
-        rm "$temp_file"
-        log_success "Registration uploaded successfully!"
+    # Check if sshpass is available
+    if command -v sshpass &> /dev/null && [ -n "$staging_password" ]; then
+        log_info "Using sshpass for authentication..."
+        if sshpass -p "$staging_password" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>&1; then
+            rm "$temp_file"
+            log_success "Registration uploaded successfully!"
+        else
+            log_error "Upload failed. Check VPS IP, password, and network connectivity."
+            rm "$temp_file"
+            exit 1
+        fi
     else
-        # Fallback if sshpass not available
-        log_info "Using interactive SCP (enter staging password when prompted)..."
-        scp -o StrictHostKeyChecking=no "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json"
-        rm "$temp_file"
-        log_success "Registration uploaded successfully!"
+        # Fallback to interactive SCP
+        if [ -z "$staging_password" ]; then
+            log_info "Using interactive SCP (enter staging password when prompted)..."
+        else
+            log_warn "sshpass not installed. Install with: sudo pacman -S sshpass"
+            log_info "Using interactive SCP (enter staging password when prompted)..."
+        fi
+        
+        if scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json"; then
+            rm "$temp_file"
+            log_success "Registration uploaded successfully!"
+        else
+            log_error "Upload failed. Check VPS IP and network connectivity."
+            rm "$temp_file"
+            exit 1
+        fi
     fi
 
     echo
@@ -442,11 +461,26 @@ cmd_finalize() {
     log_info "Downloading WireGuard configuration..."
     local temp_config="/tmp/${token}-wg.conf"
     
-    if sshpass -p "$staging_password" scp -o StrictHostKeyChecking=no "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>/dev/null; then
-        :
+    # Check if sshpass is available
+    if command -v sshpass &> /dev/null && [ -n "$staging_password" ]; then
+        log_info "Using sshpass for authentication..."
+        if ! sshpass -p "$staging_password" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>&1; then
+            log_error "Download failed. Ensure machine has been approved by admin."
+            exit 1
+        fi
     else
-        log_info "Using interactive SCP (enter staging password when prompted)..."
-        scp -o StrictHostKeyChecking=no "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config"
+        # Fallback to interactive SCP
+        if [ -z "$staging_password" ]; then
+            log_info "Using interactive SCP (enter staging password when prompted)..."
+        else
+            log_warn "sshpass not installed. Install with: sudo pacman -S sshpass"
+            log_info "Using interactive SCP (enter staging password when prompted)..."
+        fi
+        
+        if ! scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config"; then
+            log_error "Download failed. Ensure machine has been approved by admin."
+            exit 1
+        fi
     fi
 
     # Replace placeholder with actual private key
