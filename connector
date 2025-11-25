@@ -107,48 +107,18 @@ cmd_vps_init() {
     log_info "Creating staging user with restricted access..."
     read -sp "Enter password for staging user '$STAGING_USER': " staging_password
     echo
-    
-    # Create the restricted shell script first
-    cat > /usr/local/bin/scponly-shell <<'SCPSHELL'
-#!/bin/bash
-# Restricted shell that only allows SCP operations to specific directories
-# This is the user's actual login shell
-
-# If no command specified (interactive login attempt), deny
-if [ -z "$SSH_ORIGINAL_COMMAND" ]; then
-    echo "Interactive login not allowed" >&2
-    exit 1
-fi
-
-# Check if this is an SCP command to allowed directories
-if echo "$SSH_ORIGINAL_COMMAND" | grep -qE '^scp -(t|f) /var/lib/wsl-registry/(pending|configs)/'; then
-    # Execute the SCP command
-    exec $SSH_ORIGINAL_COMMAND
-else
-    # Deny everything else silently
-    exit 1
-fi
-SCPSHELL
-    
-    chmod +x /usr/local/bin/scponly-shell
-    
-    # Add to /etc/shells if not already there
-    if ! grep -q "/usr/local/bin/scponly-shell" /etc/shells; then
-        echo "/usr/local/bin/scponly-shell" >> /etc/shells
-    fi
-    
     if id "$STAGING_USER" &>/dev/null; then
         log_warn "User $STAGING_USER already exists, updating..."
         echo "$STAGING_USER:$staging_password" | chpasswd
-        usermod -s /usr/local/bin/scponly-shell "$STAGING_USER"
+        usermod -s /usr/sbin/nologin "$STAGING_USER"
     else
-        # Create user with restricted shell
-        useradd -m -s /usr/local/bin/scponly-shell "$STAGING_USER"
+        # Create user with nologin shell (can't login interactively)
+        useradd -m -s /usr/sbin/nologin "$STAGING_USER"
         echo "$STAGING_USER:$staging_password" | chpasswd
     fi
     
     # Lock down home directory
-    chmod 700 "/home/$STAGING_USER"
+    chmod 750 "/home/$STAGING_USER"
 
     # Set permissions for staging user
     chown -R root:root "$REGISTRY_DIR"
@@ -173,7 +143,9 @@ SCPSHELL
 Match User $STAGING_USER
     # Allow password authentication ONLY for this user
     PasswordAuthentication yes
-    # Disable dangerous features (shell itself restricts commands)
+    # Disable interactive shell (SCP/SFTP only via ForceCommand)
+    ForceCommand /usr/bin/scponly
+    # Disable dangerous features
     PermitTTY no
     X11Forwarding no
     AllowTcpForwarding no
@@ -187,11 +159,57 @@ Match User $STAGING_USER
     ClientAliveCountMax 2
 EOF
 
-    # Ensure staging user home directory is clean
-    log_info "Securing staging user home directory..."
-    rm -f "/home/$STAGING_USER/.bashrc" "/home/$STAGING_USER/.bash_profile" "/home/$STAGING_USER/.profile" "/home/$STAGING_USER/.bash_login"
-    chmod 700 "/home/$STAGING_USER"
-    log_success "Created restricted shell for staging user"
+    # Create a simple SCP-only wrapper script
+    cat > /usr/bin/scponly <<'SCPONLY'
+#!/bin/bash
+# SCP-only restricted shell for staging user
+# Only allows scp file transfers, no interactive commands
+
+# Log the command for debugging (optional, can be disabled in production)
+# echo "DEBUG: SSH_ORIGINAL_COMMAND=$SSH_ORIGINAL_COMMAND" >> /tmp/scponly.log
+
+# Extract the actual path from the SCP command
+# SCP commands come in two forms:
+# - Upload: scp [options] -t /path/to/file
+# - Download: scp [options] -f /path/to/file
+
+if [[ -z "$SSH_ORIGINAL_COMMAND" ]]; then
+    echo "Access denied: No command specified" >&2
+    exit 1
+fi
+
+# Check if this is an SCP command
+if [[ ! "$SSH_ORIGINAL_COMMAND" =~ ^scp[[:space:]] ]]; then
+    echo "Access denied: Only SCP file transfers are allowed" >&2
+    exit 1
+fi
+
+# Extract the target path (last argument after -t or -f flag)
+if [[ "$SSH_ORIGINAL_COMMAND" =~ -t[[:space:]]+(/[^[:space:]]+) ]] || \
+   [[ "$SSH_ORIGINAL_COMMAND" =~ -f[[:space:]]+(/[^[:space:]]+) ]]; then
+    target_path="${BASH_REMATCH[1]}"
+    
+    # Check if the path is in allowed directories
+    if [[ "$target_path" == /var/lib/wsl-registry/pending/* ]]; then
+        # Allow uploads to pending directory
+        exec $SSH_ORIGINAL_COMMAND
+    elif [[ "$target_path" == /var/lib/wsl-registry/configs/* ]]; then
+        # Allow downloads from configs directory
+        exec $SSH_ORIGINAL_COMMAND
+    else
+        echo "Access denied: Path '$target_path' is not in allowed directories" >&2
+        echo "Allowed paths: /var/lib/wsl-registry/pending/* (upload), /var/lib/wsl-registry/configs/* (download)" >&2
+        exit 1
+    fi
+else
+    echo "Access denied: Invalid SCP command format" >&2
+    echo "Command received: $SSH_ORIGINAL_COMMAND" >&2
+    exit 1
+fi
+SCPONLY
+    
+    chmod +x /usr/bin/scponly
+    log_success "Created restricted SCP-only shell"
     
     # Test SSH configuration
     if sshd -t; then
@@ -265,8 +283,7 @@ EOF
     echo
     echo -e "${YELLOW}Security Configuration:${NC}"
     echo "  ✓ Password auth enabled ONLY for staging user"
-    echo "  ✓ Restricted shell: /usr/local/bin/scponly-shell"
-    echo "  ✓ SCP-only access (interactive login blocked)"
+    echo "  ✓ Interactive shell disabled (SCP-only access)"
     echo "  ✓ Access restricted to registry directories only"
     echo "  ✓ SSH backup saved at: /etc/ssh/sshd_config.backup"
     echo
@@ -371,42 +388,44 @@ SSH_PORT=$ssh_port
 EOF
     chmod 600 "$WSL_CONNECTOR_DIR/vps-info"
 
-    # Prompt for staging password if not provided
-    if [ -z "$staging_password" ]; then
-        read -sp "Enter staging user password: " staging_password
-        echo
-    fi
-
     # Upload registration to VPS
     log_info "Uploading registration to VPS (port $ssh_port)..."
     local temp_file="/tmp/${machine_id}.json"
     echo "$reg_json" > "$temp_file"
     
     # Check if sshpass is available
-    if command -v sshpass &> /dev/null && [ -n "$staging_password" ]; then
+    if command -v sshpass &> /dev/null; then
+        # Prompt for staging password if not provided and sshpass is available
+        if [ -z "$staging_password" ]; then
+            read -sp "Enter staging user password: " staging_password
+            echo
+        fi
+        
         log_info "Using sshpass for authentication..."
-        if sshpass -p "$staging_password" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>&1; then
+        local scp_output
+        if scp_output=$(sshpass -p "$staging_password" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>&1); then
             rm "$temp_file"
             log_success "Registration uploaded successfully!"
         else
-            log_error "Upload failed. Check VPS IP, port ($ssh_port), password, and network connectivity."
+            log_error "Upload failed. Error details:"
+            echo "$scp_output" >&2
+            log_error "Check VPS IP, port ($ssh_port), password, and network connectivity."
             rm "$temp_file"
             exit 1
         fi
     else
         # Fallback to interactive SCP
-        if [ -z "$staging_password" ]; then
-            log_info "Using interactive SCP (enter staging password when prompted)..."
-        else
-            log_warn "sshpass not installed. Install with: sudo pacman -S sshpass"
-            log_info "Using interactive SCP (enter staging password when prompted)..."
-        fi
+        log_info "sshpass not installed. Using interactive SCP..."
+        log_info "You will be prompted for the staging user password."
         
-        if scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json"; then
+        local scp_output
+        if scp_output=$(scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>&1); then
             rm "$temp_file"
             log_success "Registration uploaded successfully!"
         else
-            log_error "Upload failed. Check VPS IP, port ($ssh_port), and network connectivity."
+            log_error "Upload failed. Error details:"
+            echo "$scp_output" >&2
+            log_error "Check VPS IP, port ($ssh_port), and network connectivity."
             rm "$temp_file"
             exit 1
         fi
@@ -611,34 +630,38 @@ cmd_finalize() {
     if [ -z "$vps_ip" ]; then
         read -p "Enter VPS IP: " vps_ip
     fi
-    if [ -z "$staging_password" ]; then
-        read -sp "Enter staging user password: " staging_password
-        echo
-    fi
 
     # Download WireGuard config
     log_info "Downloading WireGuard configuration from $vps_ip:$ssh_port..."
     local temp_config="/tmp/${token}-wg.conf"
     
     # Check if sshpass is available
-    if command -v sshpass &> /dev/null && [ -n "$staging_password" ]; then
+    if command -v sshpass &> /dev/null; then
+        # Prompt for staging password if not provided and sshpass is available
+        if [ -z "$staging_password" ]; then
+            read -sp "Enter staging user password: " staging_password
+            echo
+        fi
+        
         log_info "Using sshpass for authentication..."
-        if ! sshpass -p "$staging_password" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>&1; then
-            log_error "Download failed. Ensure machine has been approved by admin."
+        local scp_output
+        if ! scp_output=$(sshpass -p "$staging_password" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>&1); then
+            log_error "Download failed. Error details:"
+            echo "$scp_output" >&2
+            log_error "Ensure machine has been approved by admin."
             log_error "Check VPS IP ($vps_ip) and port ($ssh_port) are correct."
             exit 1
         fi
     else
         # Fallback to interactive SCP
-        if [ -z "$staging_password" ]; then
-            log_info "Using interactive SCP (enter staging password when prompted)..."
-        else
-            log_warn "sshpass not installed. Install with: sudo pacman -S sshpass"
-            log_info "Using interactive SCP (enter staging password when prompted)..."
-        fi
+        log_info "sshpass not installed. Using interactive SCP..."
+        log_info "You will be prompted for the staging user password."
         
-        if ! scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config"; then
-            log_error "Download failed. Ensure machine has been approved by admin."
+        local scp_output
+        if ! scp_output=$(scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>&1); then
+            log_error "Download failed. Error details:"
+            echo "$scp_output" >&2
+            log_error "Ensure machine has been approved by admin."
             log_error "Check VPS IP ($vps_ip) and port ($ssh_port) are correct."
             exit 1
         fi
