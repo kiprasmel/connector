@@ -14,18 +14,11 @@ VPS_WG_IP="10.0.0.1"
 WG_SUBNET="10.0.0.0/24"
 STAGING_USER="connector"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
 # Helper functions
-log_info() { echo -e "${BLUE}ℹ${NC} $*"; }
-log_success() { echo -e "${GREEN}✓${NC} $*"; }
-log_warn() { echo -e "${YELLOW}⚠${NC} $*"; }
-log_error() { echo -e "${RED}✗${NC} $*" >&2; }
+log_info() { echo "[INFO] $*"; }
+log_success() { echo "[SUCCESS] $*"; }
+log_warn() { echo "[WARN] $*"; }
+log_error() { echo "[ERROR] $*" >&2; }
 
 require_root() {
     if [ "$EUID" -ne 0 ]; then
@@ -289,27 +282,27 @@ EOF
 
     log_success "VPS initialization complete!"
     echo
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "${GREEN}Server Details:${NC}"
+    echo "=================================================="
+    echo "Server Details:"
     echo "  VPS Public IP: $vps_ip"
     echo "  WireGuard IP: $VPS_WG_IP"
     echo "  WireGuard Port: $WG_PORT"
     echo "  Server Public Key: $server_public"
     echo
-    echo -e "${YELLOW}Staging User:${NC}"
+    echo "Staging User:"
     echo "  Username: $STAGING_USER"
     echo "  Password: $staging_password"
     echo
-    echo -e "${YELLOW}Security Configuration:${NC}"
-    echo "  ✓ Password auth enabled ONLY for staging user"
-    echo "  ✓ Interactive shell disabled (SCP-only access)"
-    echo "  ✓ Access restricted to registry directories only"
-    echo "  ✓ SSH backup saved at: /etc/ssh/sshd_config.backup"
+    echo "Security Configuration:"
+    echo "  - Password auth enabled ONLY for staging user"
+    echo "  - Interactive shell disabled (SCP-only access)"
+    echo "  - Access restricted to registry directories only"
+    echo "  - SSH backup saved at: /etc/ssh/sshd_config.backup"
     echo
-    echo -e "${BLUE}Next Steps:${NC}"
+    echo "Next Steps:"
     echo "  1. On WSL machines, run: ./connector register $vps_ip"
     echo "  2. Approve machines with: ./connector approve"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "=================================================="
 }
 
 # REGISTER: Register WSL machine to VPS
@@ -451,17 +444,17 @@ EOF
     fi
 
     echo
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "${GREEN}Registration Complete!${NC}"
+    echo "=================================================="
+    echo "Registration Complete!"
     echo
-    echo "  Machine ID: ${BLUE}$machine_id${NC}"
+    echo "  Machine ID: $machine_id"
     echo "  Status: Waiting for approval"
     echo
-    echo -e "${YELLOW}Next Steps:${NC}"
+    echo "Next Steps:"
     echo "  1. Contact VPS admin to approve this machine"
     echo "  2. Provide them with machine ID: $machine_id"
     echo "  3. After approval, run: ./connector finalize $machine_id"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "=================================================="
 }
 
 # APPROVE: Approve pending WSL machine
@@ -576,16 +569,16 @@ EOF
     log_success "Machine approved and moved to approved registry"
 
     echo
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "${GREEN}Approval Complete!${NC}"
+    echo "=================================================="
+    echo "Approval Complete!"
     echo
     echo "  Machine ID: $machine_id"
     echo "  Hostname: $hostname"
     echo "  Assigned IP: $client_ip"
     echo
-    echo -e "${YELLOW}Client Instructions:${NC}"
+    echo "Client Instructions:"
     echo "  Have the client run: ./connector finalize $machine_id"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "=================================================="
 }
 
 # FINALIZE: Complete WSL setup after approval
@@ -740,21 +733,21 @@ EOF
     fi
 
     echo
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo -e "${GREEN}Setup Complete!${NC}"
+    echo "=================================================="
+    echo "Setup Complete!"
     echo
     echo "  Machine ID: $token"
     echo "  WireGuard IP: $assigned_ip"
     echo "  VPS IP: $VPS_WG_IP"
     echo
-    echo -e "${BLUE}Connection Status:${NC}"
+    echo "Connection Status:"
     sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
     echo
-    echo -e "${YELLOW}SSH Access:${NC}"
+    echo "SSH Access:"
     echo "  From VPS: ssh $(whoami)@$assigned_ip"
     echo
     echo "  Check status: ./connector status"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "=================================================="
 }
 
 # LIST: List all approved machines
