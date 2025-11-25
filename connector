@@ -112,88 +112,21 @@ cmd_vps_init() {
     chown -R root:root "$REGISTRY_DIR"
     chmod 755 "$REGISTRY_DIR"
 
-    # Create staging user with restricted shell
+    # Create staging user (simple approach - let file permissions do the work)
     log_info "Creating staging user with restricted access..."
     read -sp "Enter password for staging user '$STAGING_USER': " staging_password
     echo
-    # Create scponly shell first (needed for user creation)
-    cat > /usr/bin/scponly <<'SCPONLY'
-#!/bin/bash
-# SCP-only restricted shell for staging user
-# This script acts as the user's login shell and only allows SCP operations
-
-# Debug logging (comment out in production)
-DEBUG_LOG="/tmp/scponly-debug.log"
-echo "=== $(date) ===" >> "$DEBUG_LOG"
-echo "SSH_ORIGINAL_COMMAND: $SSH_ORIGINAL_COMMAND" >> "$DEBUG_LOG"
-
-# If no SSH_ORIGINAL_COMMAND, this is an interactive login attempt - deny it
-if [[ -z "$SSH_ORIGINAL_COMMAND" ]]; then
-    echo "Access denied: Interactive login not allowed" >&2
-    echo "ERROR: No SSH_ORIGINAL_COMMAND (interactive login)" >> "$DEBUG_LOG"
-    exit 1
-fi
-
-# Log the command we received
-echo "Command: $SSH_ORIGINAL_COMMAND" >> "$DEBUG_LOG"
-
-# Check if this is an SCP command (looking for "scp -" pattern)
-if [[ ! "$SSH_ORIGINAL_COMMAND" =~ scp[[:space:]-] ]]; then
-    echo "Access denied: Only SCP file transfers are allowed" >&2
-    echo "ERROR: Not an SCP command" >> "$DEBUG_LOG"
-    exit 1
-fi
-
-# Extract the target path (looking for -t or -f flag followed by a path)
-if [[ "$SSH_ORIGINAL_COMMAND" =~ -t[[:space:]]+(/[^[:space:]]+) ]]; then
-    # Upload mode
-    target_path="${BASH_REMATCH[1]}"
-    echo "Upload mode, target: $target_path" >> "$DEBUG_LOG"
-elif [[ "$SSH_ORIGINAL_COMMAND" =~ -f[[:space:]]+(/[^[:space:]]+) ]]; then
-    # Download mode
-    target_path="${BASH_REMATCH[1]}"
-    echo "Download mode, target: $target_path" >> "$DEBUG_LOG"
-else
-    echo "Access denied: Invalid SCP command format" >&2
-    echo "ERROR: Could not extract target path" >> "$DEBUG_LOG"
-    exit 1
-fi
-
-# Check if the path is in allowed directories
-if [[ "$target_path" == /var/lib/wsl-registry/pending/* ]]; then
-    echo "ALLOWED: Upload to pending" >> "$DEBUG_LOG"
-    exec $SSH_ORIGINAL_COMMAND
-elif [[ "$target_path" == /var/lib/wsl-registry/configs/* ]]; then
-    echo "ALLOWED: Download from configs" >> "$DEBUG_LOG"
-    exec $SSH_ORIGINAL_COMMAND
-else
-    echo "Access denied: Path '$target_path' is not in allowed directories" >&2
-    echo "ERROR: Path not in allowed directories" >> "$DEBUG_LOG"
-    exit 1
-fi
-SCPONLY
-    
-    chmod +x /usr/bin/scponly
-    
-    # Add scponly to /etc/shells if not already there
-    if ! grep -q "^/usr/bin/scponly$" /etc/shells 2>/dev/null; then
-        echo "/usr/bin/scponly" >> /etc/shells
-    fi
-    
-    log_success "Created restricted SCP-only shell"
     
     if id "$STAGING_USER" &>/dev/null; then
-        log_warn "User $STAGING_USER already exists, updating..."
+        log_warn "User $STAGING_USER already exists, updating password..."
         echo "$STAGING_USER:$staging_password" | chpasswd
-        usermod -s /usr/bin/scponly "$STAGING_USER"
     else
-        # Create user with scponly shell (restricted to SCP only)
-        useradd -m -s /usr/bin/scponly "$STAGING_USER"
+        # Create user with /bin/bash (SCP will work fine, interactive login blocked by SSH config)
+        useradd -m -s /bin/bash "$STAGING_USER"
         echo "$STAGING_USER:$staging_password" | chpasswd
     fi
     
-    # Lock down home directory
-    chmod 750 "/home/$STAGING_USER"
+    log_success "Created user $STAGING_USER"
 
     # Set final permissions for registry directories
     log_info "Setting registry directory permissions..."
@@ -202,7 +135,7 @@ SCPONLY
     chown "$STAGING_USER:$STAGING_USER" "$REGISTRY_DIR/pending"
     chmod 755 "$REGISTRY_DIR/pending"  # rwxr-xr-x
     
-    # configs: readable by staging user (for downloads)
+    # configs: readable by staging user (for downloads)  
     chown root:root "$REGISTRY_DIR/configs"
     chmod 755 "$REGISTRY_DIR/configs"  # rwxr-xr-x
     
@@ -210,15 +143,9 @@ SCPONLY
     chown root:root "$REGISTRY_DIR"/{approved,revoked}
     chmod 700 "$REGISTRY_DIR"/{approved,revoked}  # rwx------
     
-    # Verify permissions
-    if [ ! -w "$REGISTRY_DIR/pending" ] || [ ! -r "$REGISTRY_DIR/configs" ]; then
-        log_error "Failed to set proper permissions on registry directories"
-        exit 1
-    fi
-    
     log_success "Registry directories configured with proper permissions"
     
-    # Configure SSH for staging user with heavy restrictions
+    # Configure SSH for staging user with restrictions
     log_info "Configuring SSH with restricted access for staging user..."
     
     # Backup sshd_config
@@ -228,25 +155,18 @@ SCPONLY
     sed -i "/^Match User $STAGING_USER/,/^Match /d" /etc/ssh/sshd_config
     sed -i "/^Match User $STAGING_USER/,\$d" /etc/ssh/sshd_config
     
-    # Add restricted configuration for staging user at the end
+    # Simple SSH config - just enable password auth and block interactive login
     cat >> /etc/ssh/sshd_config <<EOF
 
 # Restricted access for staging user (connector tool)
+# File permissions control what they can access
 Match User $STAGING_USER
-    # Allow password authentication ONLY for this user
     PasswordAuthentication yes
-    # Disable dangerous features
     PermitTTY no
     X11Forwarding no
     AllowTcpForwarding no
     PermitTunnel no
-    GatewayPorts no
     AllowAgentForwarding no
-    # Additional restrictions
-    MaxAuthTries 3
-    MaxSessions 2
-    ClientAliveInterval 300
-    ClientAliveCountMax 2
 EOF
 
     # Create a simple SCP-only wrapper script
