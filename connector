@@ -727,7 +727,7 @@ EOF
     fi
 
     # Extract assigned IP from config
-    local assigned_ip=$(grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
+    local assigned_ip=$(sudo grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
 
     # Test connectivity
     log_info "Testing VPS connectivity..."
@@ -744,19 +744,33 @@ EOF
         log_warn "Cannot ping VPS yet (may need to wait for handshake)"
     fi
 
+    # Get VPS public endpoint from config
+    local vps_endpoint=$(sudo grep "^Endpoint" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d':' -f1)
+    
     echo
     echo "=================================================="
     echo "Setup Complete!"
     echo
     echo "  Machine ID: $token"
     echo "  WireGuard IP: $assigned_ip"
-    echo "  VPS IP: $VPS_WG_IP"
+    echo "  VPS WireGuard IP: $VPS_WG_IP"
+    echo "  VPS Public IP: $vps_endpoint"
     echo
     echo "Connection Status:"
     sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
     echo
     echo "SSH Access:"
-    echo "  From VPS: ssh $(whoami)@$assigned_ip"
+    echo "  From VPS directly:"
+    echo "    ssh $(whoami)@$assigned_ip"
+    echo
+    echo "  From your main machine (through VPS):"
+    echo "    ssh -J root@$vps_endpoint $(whoami)@$assigned_ip"
+    echo
+    echo "  Or add to ~/.ssh/config on main machine:"
+    echo "    Host wsl-$(hostname)"
+    echo "      HostName $assigned_ip"
+    echo "      User $(whoami)"
+    echo "      ProxyJump root@$vps_endpoint"
     echo
     echo "  Check status: ./connector status"
     echo "=================================================="
