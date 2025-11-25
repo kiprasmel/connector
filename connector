@@ -12,7 +12,7 @@ WG_PORT="51820"
 WG_INTERFACE="wg0"
 VPS_WG_IP="10.0.0.1"
 WG_SUBNET="10.0.0.0/24"
-STAGING_USER="wsl-staging"
+STAGING_USER="connector"
 
 # Colors
 RED='\033[0;31m'
