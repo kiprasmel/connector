@@ -1,0 +1,41 @@
+# WireGuard private keys
+*.key
+*.conf.tmp
+
+# Local state files
+.config/
+machine-id
+wg-private-key
+registration.json
+.local
+AGENTS.md
+
+# SSH keys
+wsl-to-vps
+wsl-to-vps.pub
+id_*
+*.pem
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Registry data (should not be in git)
+registry/
+pending/
+approved/
+configs/
+revoked/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
