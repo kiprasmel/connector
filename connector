@@ -1072,11 +1072,12 @@ cmd_hop() {
     local target="$2"
     
     if [ -z "$vps_host" ]; then
-        log_error "Usage: connector hop <vps-host> [machine-id|ip]"
-        log_error "Examples:"
-        log_error "  connector hop root@203.0.113.1              # List available machines"
-        log_error "  connector hop root@203.0.113.1 wsl-abc123  # Connect to specific machine"
-        log_error "  connector hop root@203.0.113.1 10.0.0.2    # Connect by IP"
+        echo "Usage: connector hop <vps-host> [user@ip|machine-id]"
+        echo
+        echo "Examples:"
+        echo "  connector hop root@203.0.113.1                   # List available machines"
+        echo "  connector hop root@203.0.113.1 kipras@10.0.0.2  # Connect by user@ip"
+        echo "  connector hop root@203.0.113.1 wsl-abc12345     # Connect by machine ID"
         exit 1
     fi
     
@@ -1114,11 +1115,10 @@ cmd_hop() {
             local username=$(echo "$machine_data" | jq -r '.username' 2>/dev/null || echo "unknown")
             local ip=$(echo "$machine_data" | jq -r '.wg_ip' 2>/dev/null || echo "unknown")
             
-            echo "$count. $machine_id"
+            echo "$count. $username@$ip"
+            echo "   Machine ID: $machine_id"
             echo "   Hostname: $hostname"
-            echo "   User: $username"
-            echo "   IP: $ip"
-            echo "   Command: ./connector hop $vps_host $machine_id"
+            echo "   Command: ./connector hop $vps_host $username@$ip"
             echo
         done < /tmp/hop-machines.txt
         
@@ -1129,16 +1129,12 @@ cmd_hop() {
     # Target specified - connect to it
     log_info "Connecting to $target through $vps_host..."
     
-    # Check if target looks like an IP or machine ID
     local ssh_target=""
-    if [[ "$target" =~ ^10\.0\.0\.[0-9]+$ ]]; then
-        # It's an IP - need to get username from VPS
-        local username=$(ssh "$vps_host" "cd /var/lib/wsl-registry/approved && grep -l '\"wg_ip\": \"$target\"' *.json 2>/dev/null | xargs cat 2>/dev/null | jq -r '.username' 2>/dev/null")
-        if [ -z "$username" ] || [ "$username" = "null" ]; then
-            log_error "Could not find machine with IP $target on VPS"
-            exit 1
-        fi
-        ssh_target="$username@$target"
+    
+    # Check if target is in user@ip format or machine-id format
+    if [[ "$target" =~ @ ]]; then
+        # Already in user@ip format
+        ssh_target="$target"
     else
         # It's a machine ID - fetch details from VPS
         local machine_data=$(ssh "$vps_host" "cat /var/lib/wsl-registry/approved/$target.json 2>/dev/null")
@@ -1157,10 +1153,10 @@ cmd_hop() {
         fi
         
         ssh_target="$username@$ip"
+        log_info "Resolved $target to $ssh_target"
     fi
     
     # Connect using nested SSH (VPS does the authentication to WSL)
-    log_info "Connecting to $ssh_target..."
     ssh -t "$vps_host" ssh "$ssh_target"
 }
 
@@ -1273,9 +1269,9 @@ WSL Commands (run on WSL):
   cleanup-wsl                     Remove all local configuration
 
 Client Commands (run from any machine):
-  hop <vps-host> [target]         Connect to WSL through VPS
+  hop <vps-host> [user@ip]        Connect to WSL through VPS
                                   - No target: list available machines
-                                  - With target: connect to machine
+                                  - With target: connect to user@ip
 
 General:
   help                    Show this help message
@@ -1306,8 +1302,8 @@ Examples:
   ./connector hop root@203.0.113.1
 
   # From any machine - connect to specific WSL:
+  ./connector hop root@203.0.113.1 kipras@10.0.0.2
   ./connector hop root@203.0.113.1 wsl-abc12345
-  ./connector hop root@203.0.113.1 10.0.0.2
 
 For more information, see README.md
 EOF
