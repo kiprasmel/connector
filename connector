@@ -1012,8 +1012,8 @@ cmd_status() {
     log_info "WireGuard Connection Status:"
     echo
 
-    if [ ! -f "$WG_CONFIG_DIR/$WG_INTERFACE.conf" ]; then
-        log_error "WireGuard not configured. Run 'connector register' first."
+    if [ ! -f "/etc/wireguard/$WG_INTERFACE.conf" ]; then
+        log_error "WireGuard not configured. Run 'connector register' and 'connector finalize' first."
         exit 1
     fi
 
@@ -1026,8 +1026,12 @@ cmd_status() {
     fi
 
     # Show assigned IP
-    local assigned_ip=$(grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}')
-    echo "  Assigned IP: $assigned_ip"
+    local assigned_ip=$(sudo grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | awk '{print $3}')
+    if [ -n "$assigned_ip" ]; then
+        echo "  Assigned IP: $assigned_ip"
+    else
+        echo "  Assigned IP: (unable to read config)"
+    fi
 
     # Show WireGuard details
     echo
