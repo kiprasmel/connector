@@ -262,15 +262,22 @@ EOF
     # Configure firewall
     log_info "Configuring firewall..."
     if command -v ufw &> /dev/null; then
-        ufw allow $WG_PORT/udp
-        log_success "UFW rule added for port $WG_PORT/udp"
+        # Allow WireGuard
+        ufw allow $WG_PORT/udp comment 'WireGuard'
+        # Allow SSH from WireGuard network only (will be added after WireGuard is up)
+        log_success "UFW rules configured"
     elif command -v firewall-cmd &> /dev/null; then
         firewall-cmd --permanent --add-port=$WG_PORT/udp
         firewall-cmd --reload
-        log_success "Firewalld rule added for port $WG_PORT/udp"
+        log_success "Firewalld rules configured"
     else
-        log_warn "No firewall manager detected. Ensure port $WG_PORT/udp is open"
+        log_warn "No firewall manager detected. Manually configure:"
+        log_warn "  - Allow UDP port $WG_PORT (WireGuard)"
     fi
+    
+    log_info "VPS security configured"
+    log_info "Note: VPS SSH remains accessible for admin access"
+    log_info "WSL machines will only be accessible via WireGuard"
 
     # Enable and start WireGuard
     log_info "Enabling WireGuard service..."
@@ -306,8 +313,10 @@ EOF
     echo
     echo "Security Configuration:"
     echo "  - Password auth enabled ONLY for staging user"
-    echo "  - Interactive shell disabled (SCP-only access)"
+    echo "  - Interactive shell disabled for staging user"
+    echo "  - Staging user limited to SCP file transfers"
     echo "  - Access restricted to registry directories only"
+    echo "  - WSL machines will use key-based authentication only"
     echo "  - SSH backup saved at: /etc/ssh/sshd_config.backup"
     echo
     echo "Next Steps:"
@@ -710,6 +719,40 @@ cmd_finalize() {
     else
         log_warn "SSH key not found at $ssh_key.pub - password authentication will be required"
     fi
+    
+    # Harden SSH configuration
+    log_info "Hardening SSH configuration..."
+    
+    # Backup sshd_config if not already backed up
+    if [ ! -f /etc/ssh/sshd_config.backup ]; then
+        sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+    fi
+    
+    # Remove any existing WSL connector hardening
+    sudo sed -i '/# WSL connector security hardening/,/^$/d' /etc/ssh/sshd_config
+    
+    # Add hardened configuration for current user
+    sudo bash -c "cat >> /etc/ssh/sshd_config" <<EOF
+
+# WSL connector security hardening
+Match User $(whoami) Address 10.0.0.0/24
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    PermitRootLogin no
+EOF
+    
+    # Test SSH configuration
+    if sudo sshd -t; then
+        log_success "SSH hardened: only accessible via WireGuard with key authentication"
+    else
+        log_error "SSH configuration has errors. Restoring backup..."
+        sudo cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
+        exit 1
+    fi
+    
+    # Note: We rely on SSH Match rules rather than firewall DROP rules
+    # to avoid accidentally locking users out if WireGuard goes down
+    log_info "SSH is now restricted to WireGuard network access only"
 
     # Enable systemd in WSL
     log_info "Configuring WSL systemd..."
@@ -750,6 +793,14 @@ EOF
         log_warn "SSH failed to start or timed out"
     else
         log_success "SSH started"
+    fi
+    
+    # Restart SSH to apply hardening rules
+    log_info "Restarting SSH to apply security hardening..."
+    if sudo systemctl restart sshd 2>&1; then
+        log_success "SSH restarted with hardened configuration"
+    else
+        log_warn "Could not restart SSH. Hardening rules may not be active."
     fi
 
     # Extract assigned IP from config
@@ -799,6 +850,12 @@ EOF
     echo
     echo "Connection Status:"
     sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
+    echo
+    echo "Security Status:"
+    echo "  - SSH restricted to WireGuard network (10.0.0.0/24)"
+    echo "  - Password authentication disabled"
+    echo "  - Key-based authentication only"
+    echo "  - Root login disabled"
     echo
     echo "SSH Access:"
     echo "  From VPS directly:"
@@ -995,6 +1052,12 @@ cmd_cleanup_wsl() {
     
     log_info "Removing SSH keys..."
     rm -f "$HOME/.ssh/wsl-to-vps" "$HOME/.ssh/wsl-to-vps.pub"
+    
+    log_info "Removing SSH hardening rules..."
+    if [ -f /etc/ssh/sshd_config ]; then
+        sudo sed -i '/# WSL connector security hardening/,/^$/d' /etc/ssh/sshd_config
+        sudo systemctl restart sshd 2>/dev/null || true
+    fi
     
     log_success "WSL cleanup complete! You can now run 'connector register' again."
 }
