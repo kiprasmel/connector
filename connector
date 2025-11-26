@@ -1066,6 +1066,104 @@ cmd_status() {
     fi
 }
 
+# HOP: Connect to WSL machine through VPS
+cmd_hop() {
+    local vps_host="$1"
+    local target="$2"
+    
+    if [ -z "$vps_host" ]; then
+        log_error "Usage: connector hop <vps-host> [machine-id|ip]"
+        log_error "Examples:"
+        log_error "  connector hop root@203.0.113.1              # List available machines"
+        log_error "  connector hop root@203.0.113.1 wsl-abc123  # Connect to specific machine"
+        log_error "  connector hop root@203.0.113.1 10.0.0.2    # Connect by IP"
+        exit 1
+    fi
+    
+    # If no target specified, list available machines
+    if [ -z "$target" ]; then
+        log_info "Fetching available machines from $vps_host..."
+        
+        # Get list of approved machines from VPS
+        ssh -o ConnectTimeout=10 "$vps_host" "cd /var/lib/wsl-registry/approved 2>/dev/null && ls *.json 2>/dev/null" > /tmp/hop-machines.txt 2>/dev/null || {
+            log_error "Failed to connect to VPS or no approved machines found"
+            log_error "Make sure you can SSH to the VPS and machines are approved"
+            rm -f /tmp/hop-machines.txt
+            exit 1
+        }
+        
+        if [ ! -s /tmp/hop-machines.txt ]; then
+            log_warn "No approved machines found on VPS"
+            rm -f /tmp/hop-machines.txt
+            exit 0
+        fi
+        
+        echo
+        echo "Available machines:"
+        echo "=================="
+        
+        local count=0
+        while read -r json_file; do
+            [ -z "$json_file" ] && continue
+            count=$((count + 1))
+            
+            # Fetch machine details
+            local machine_data=$(ssh "$vps_host" "cat /var/lib/wsl-registry/approved/$json_file 2>/dev/null")
+            local machine_id=$(echo "$json_file" | sed 's/.json$//')
+            local hostname=$(echo "$machine_data" | jq -r '.hostname' 2>/dev/null || echo "unknown")
+            local username=$(echo "$machine_data" | jq -r '.username' 2>/dev/null || echo "unknown")
+            local ip=$(echo "$machine_data" | jq -r '.wg_ip' 2>/dev/null || echo "unknown")
+            
+            echo "$count. $machine_id"
+            echo "   Hostname: $hostname"
+            echo "   User: $username"
+            echo "   IP: $ip"
+            echo "   Command: ./connector hop $vps_host $machine_id"
+            echo
+        done < /tmp/hop-machines.txt
+        
+        rm -f /tmp/hop-machines.txt
+        exit 0
+    fi
+    
+    # Target specified - connect to it
+    log_info "Connecting to $target through $vps_host..."
+    
+    # Check if target looks like an IP or machine ID
+    local ssh_target=""
+    if [[ "$target" =~ ^10\.0\.0\.[0-9]+$ ]]; then
+        # It's an IP - need to get username from VPS
+        local username=$(ssh "$vps_host" "cd /var/lib/wsl-registry/approved && grep -l '\"wg_ip\": \"$target\"' *.json 2>/dev/null | xargs cat 2>/dev/null | jq -r '.username' 2>/dev/null")
+        if [ -z "$username" ] || [ "$username" = "null" ]; then
+            log_error "Could not find machine with IP $target on VPS"
+            exit 1
+        fi
+        ssh_target="$username@$target"
+    else
+        # It's a machine ID - fetch details from VPS
+        local machine_data=$(ssh "$vps_host" "cat /var/lib/wsl-registry/approved/$target.json 2>/dev/null")
+        if [ -z "$machine_data" ]; then
+            log_error "Machine $target not found on VPS"
+            log_error "Run './connector hop $vps_host' to see available machines"
+            exit 1
+        fi
+        
+        local username=$(echo "$machine_data" | jq -r '.username')
+        local ip=$(echo "$machine_data" | jq -r '.wg_ip')
+        
+        if [ -z "$username" ] || [ -z "$ip" ] || [ "$username" = "null" ] || [ "$ip" = "null" ]; then
+            log_error "Invalid machine data for $target"
+            exit 1
+        fi
+        
+        ssh_target="$username@$ip"
+    fi
+    
+    # Connect using nested SSH (VPS does the authentication to WSL)
+    log_info "Connecting to $ssh_target..."
+    ssh -t "$vps_host" ssh "$ssh_target"
+}
+
 # CLEANUP-WSL: Clean up WSL-side configuration
 cmd_cleanup_wsl() {
     log_warn "This will remove ALL WireGuard and connector configuration on this WSL machine"
@@ -1174,6 +1272,11 @@ WSL Commands (run on WSL):
   status                          Show connection status
   cleanup-wsl                     Remove all local configuration
 
+Client Commands (run from any machine):
+  hop <vps-host> [target]         Connect to WSL through VPS
+                                  - No target: list available machines
+                                  - With target: connect to machine
+
 General:
   help                    Show this help message
 
@@ -1198,6 +1301,13 @@ Examples:
 
   # Check status:
   ./connector status
+
+  # From any machine - list WSL machines available through VPS:
+  ./connector hop root@203.0.113.1
+
+  # From any machine - connect to specific WSL:
+  ./connector hop root@203.0.113.1 wsl-abc12345
+  ./connector hop root@203.0.113.1 10.0.0.2
 
 For more information, see README.md
 EOF
@@ -1228,6 +1338,9 @@ main() {
             ;;
         status)
             cmd_status "${@:2}"
+            ;;
+        hop)
+            cmd_hop "${@:2}"
             ;;
         cleanup-wsl)
             cmd_cleanup_wsl "${@:2}"
