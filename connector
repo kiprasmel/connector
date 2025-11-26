@@ -601,10 +601,14 @@ EOF
     echo
     echo "  Machine ID: $machine_id"
     echo "  Hostname: $hostname"
+    echo "  Username: $username"
     echo "  Assigned IP: $client_ip"
     echo
     echo "Client Instructions:"
     echo "  Have the client run: ./connector finalize $machine_id"
+    echo
+    echo "After finalization, SSH access:"
+    echo "  ssh $username@$client_ip"
     echo "=================================================="
 }
 
@@ -720,8 +724,8 @@ cmd_finalize() {
     # Setup SSH authorized_keys for VPS to connect
     log_info "Configuring SSH access from VPS..."
     
-    # Extract VPS SSH public key from config file
-    local vps_ssh_key=$(grep "^# VPS_SSH_KEY=" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | sed 's/^# VPS_SSH_KEY=//')
+    # Extract VPS SSH public key from config file (need sudo to read)
+    local vps_ssh_key=$(sudo grep "^# VPS_SSH_KEY=" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | sed 's/^# VPS_SSH_KEY=//')
     
     if [ -n "$vps_ssh_key" ]; then
         mkdir -p "$HOME/.ssh"
@@ -732,13 +736,15 @@ cmd_finalize() {
             echo "$vps_ssh_key" >> "$HOME/.ssh/authorized_keys"
             chmod 600 "$HOME/.ssh/authorized_keys"
             log_success "VPS SSH key added to authorized_keys"
+            log_info "VPS can now SSH as: $(whoami)@<wsl-ip>"
         else
             log_info "VPS SSH key already in authorized_keys"
         fi
     else
         log_error "Could not find VPS SSH key in configuration"
-        log_error "VPS will not be able to SSH to this machine"
-        log_warn "You may need to manually add VPS root's SSH public key to ~/.ssh/authorized_keys"
+        log_error "VPS will not be able to SSH to this machine without password"
+        log_warn "Manual fix: On VPS run: cat /root/.ssh/id_ed25519.pub"
+        log_warn "Then add that key to ~/.ssh/authorized_keys on this WSL machine"
     fi
     
     # Harden SSH configuration
@@ -911,14 +917,15 @@ cmd_list() {
 
     log_info "Approved Machines:"
     echo
-    printf "%-15s %-20s %-15s %-10s %-20s\n" "MACHINE ID" "HOSTNAME" "IP ADDRESS" "STATUS" "LAST HANDSHAKE"
-    printf "%-15s %-20s %-15s %-10s %-20s\n" "----------" "--------" "----------" "------" "--------------"
+    printf "%-15s %-20s %-12s %-15s %-10s %-20s\n" "MACHINE ID" "HOSTNAME" "USER" "IP ADDRESS" "STATUS" "SSH COMMAND"
+    printf "%-15s %-20s %-12s %-15s %-10s %-20s\n" "----------" "--------" "----" "----------" "------" "-----------"
 
     for file in "$REGISTRY_DIR/approved"/*.json; do
         [ -f "$file" ] || continue
         
         local machine_id=$(basename "$file" .json)
         local hostname=$(jq -r '.hostname' "$file")
+        local username=$(jq -r '.username' "$file")
         local ip=$(jq -r '.wg_ip' "$file")
         local pubkey=$(jq -r '.wg_pubkey' "$file")
         
@@ -935,12 +942,15 @@ cmd_list() {
             fi
         fi
         
-        printf "%-15s %-20s %-15s %-10s %-20s\n" \
+        local ssh_cmd="ssh $username@$ip"
+        
+        printf "%-15s %-20s %-12s %-15s %-10s %-20s\n" \
             "${machine_id:0:15}" \
             "${hostname:0:20}" \
+            "${username:0:12}" \
             "$ip" \
             "$status" \
-            "${last_handshake:0:20}"
+            "${ssh_cmd:0:20}"
     done
     echo
 }
