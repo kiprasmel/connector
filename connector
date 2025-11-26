@@ -684,6 +684,7 @@ finalize_provider() {
     local token="$1"
     local assigned_ip="$2"
     local vps_endpoint="$3"
+    local ssh_port="${4:-22}"
     
     # Setup SSH authorized_keys for VPS to connect
     log_info "Configuring SSH access from VPS..."
@@ -779,6 +780,12 @@ EOF
         log_warn "Could not restart SSH. Hardening rules may not be active."
     fi
     
+    # Build ProxyJump command with proper port
+    local proxyjump_host="root@$vps_endpoint"
+    if [ "$ssh_port" != "22" ]; then
+        proxyjump_host="root@$vps_endpoint:$ssh_port"
+    fi
+    
     echo
     echo "=================================================="
     echo "Provider Setup Complete!"
@@ -787,6 +794,9 @@ EOF
     echo "  WireGuard IP: $assigned_ip"
     echo "  VPS WireGuard IP: $VPS_WG_IP"
     echo "  VPS Public IP: $vps_endpoint"
+    if [ "$ssh_port" != "22" ]; then
+        echo "  VPS SSH Port: $ssh_port"
+    fi
     echo
     echo "Connection Status:"
     sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
@@ -802,7 +812,7 @@ EOF
     echo "    ssh $(whoami)@$assigned_ip"
     echo
     echo "  From your main machine (through VPS):"
-    echo "    ssh -J root@$vps_endpoint $(whoami)@$assigned_ip"
+    echo "    ssh -J $proxyjump_host $(whoami)@$assigned_ip"
     echo
     # Get hostname safely
     local wsl_hostname=$(cat /etc/hostname 2>/dev/null || echo "wsl")
@@ -811,7 +821,9 @@ EOF
     echo "    Host wsl-$wsl_hostname"
     echo "      HostName $assigned_ip"
     echo "      User $(whoami)"
-    echo "      ProxyJump root@$vps_endpoint"
+    echo "      ProxyJump $proxyjump_host"
+    echo
+    echo "  Then simply: ssh wsl-$wsl_hostname"
     echo
     echo "  Check status: ./connector status"
     echo "=================================================="
@@ -822,8 +834,20 @@ finalize_consumer() {
     local token="$1"
     local assigned_ip="$2"
     local vps_endpoint="$3"
+    local ssh_port="$4"
     
     log_info "Consumer setup - skipping SSH configuration (not needed)"
+    
+    # Build SSH command with proper key and port
+    local ssh_key="$HOME/.ssh/wsl-to-vps"
+    local ssh_cmd="ssh -i $ssh_key"
+    if [ "$ssh_port" != "22" ]; then
+        ssh_cmd="$ssh_cmd -p $ssh_port"
+    fi
+    ssh_cmd="$ssh_cmd root@$vps_endpoint"
+    
+    # Get hostname for SSH config
+    local consumer_hostname=$(cat /etc/hostname 2>/dev/null || hostname 2>/dev/null || echo "consumer")
     
     echo
     echo "=================================================="
@@ -833,15 +857,30 @@ finalize_consumer() {
     echo "  WireGuard IP: $assigned_ip"
     echo "  VPS WireGuard IP: $VPS_WG_IP"
     echo "  VPS Public IP: $vps_endpoint"
+    if [ "$ssh_port" != "22" ]; then
+        echo "  VPS SSH Port: $ssh_port"
+    fi
+    echo "  SSH Key: $ssh_key"
     echo
     echo "Connection Status:"
     sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
     echo
     echo "SSH Access to VPS:"
-    echo "  ssh root@$vps_endpoint"
+    echo "  $ssh_cmd"
     echo
     echo "  Then from VPS, SSH to any provider machine:"
     echo "  ssh <user>@<provider-ip>"
+    echo
+    echo "Or add to ~/.ssh/config on this consumer machine:"
+    echo "  Host vps-$consumer_hostname"
+    echo "    HostName $vps_endpoint"
+    if [ "$ssh_port" != "22" ]; then
+        echo "    Port $ssh_port"
+    fi
+    echo "    User root"
+    echo "    IdentityFile $ssh_key"
+    echo
+    echo "  Then simply: ssh vps-$consumer_hostname"
     echo
     echo "  Check WireGuard status: sudo wg show"
     echo "=================================================="
@@ -1030,9 +1069,9 @@ cmd_finalize() {
     
     # Call type-specific finalize helper
     if [ "$fin_type" = "provider" ]; then
-        finalize_provider "$token" "$assigned_ip" "$vps_endpoint"
+        finalize_provider "$token" "$assigned_ip" "$vps_endpoint" "$ssh_port"
     else
-        finalize_consumer "$token" "$assigned_ip" "$vps_endpoint"
+        finalize_consumer "$token" "$assigned_ip" "$vps_endpoint" "$ssh_port"
     fi
 }
 
