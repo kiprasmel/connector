@@ -538,14 +538,6 @@ EOF
     wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE")
     log_success "WireGuard configuration updated"
 
-    # Add SSH key to authorized_keys
-    log_info "Adding SSH key to authorized_keys..."
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-    echo "$ssh_pubkey" >> /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-    log_success "SSH key added"
-
     # Generate client config
     log_info "Generating client configuration..."
     local server_public=$(cat "$WG_CONFIG_DIR/server_public.key")
@@ -930,14 +922,6 @@ cmd_revoke() {
     wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE")
     log_success "WireGuard peer removed"
 
-    # Remove SSH key
-    log_info "Removing SSH key..."
-    if [ -f /root/.ssh/authorized_keys ]; then
-        grep -v "$ssh_pubkey" /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp || true
-        mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys
-        log_success "SSH key removed"
-    fi
-
     # Move to revoked
     mv "$approved_file" "$REGISTRY_DIR/revoked/"
     rm -f "$REGISTRY_DIR/configs/${machine_id}.conf"
@@ -1034,20 +1018,6 @@ cmd_cleanup_vps() {
     
     log_info "Stopping WireGuard..."
     systemctl stop wg-quick@$WG_INTERFACE 2>/dev/null || true
-    
-    log_info "Removing connector-managed SSH keys..."
-    # Remove SSH keys before deleting the registry files
-    if [ -f /root/.ssh/authorized_keys ]; then
-        for file in "$REGISTRY_DIR/approved"/*.json "$REGISTRY_DIR/revoked"/*.json; do
-            [ -f "$file" ] || continue
-            local ssh_pubkey=$(jq -r '.ssh_pubkey' "$file" 2>/dev/null)
-            if [ -n "$ssh_pubkey" ] && [ "$ssh_pubkey" != "null" ]; then
-                grep -v -F "$ssh_pubkey" /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp 2>/dev/null || true
-                mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys 2>/dev/null || true
-            fi
-        done
-        chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
-    fi
     
     log_info "Removing connector-managed peers from WireGuard..."
     # Only remove peers that have machine-id comments (wsl-xxxxxxxx)
