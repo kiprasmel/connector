@@ -279,12 +279,23 @@ EOF
 
     # Get VPS public IP
     local vps_ip=$(curl -s ifconfig.me || echo "YOUR_VPS_IP")
+    
+    # Detect SSH port
+    local ssh_port=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}' || echo "22")
+    ssh_port=${ssh_port:-22}  # Default to 22 if not found
+    
+    # Build register command
+    local register_cmd="./connector register $vps_ip"
+    if [ "$ssh_port" != "22" ]; then
+        register_cmd="$register_cmd -p $ssh_port"
+    fi
 
     log_success "VPS initialization complete!"
     echo
     echo "=================================================="
     echo "Server Details:"
     echo "  VPS Public IP: $vps_ip"
+    echo "  SSH Port: $ssh_port"
     echo "  WireGuard IP: $VPS_WG_IP"
     echo "  WireGuard Port: $WG_PORT"
     echo "  Server Public Key: $server_public"
@@ -300,7 +311,7 @@ EOF
     echo "  - SSH backup saved at: /etc/ssh/sshd_config.backup"
     echo
     echo "Next Steps:"
-    echo "  1. On WSL machines, run: ./connector register $vps_ip"
+    echo "  1. On WSL machines, run: $register_cmd"
     echo "  2. Approve machines with: ./connector approve"
     echo "=================================================="
 }
