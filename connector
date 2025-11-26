@@ -700,6 +700,25 @@ cmd_finalize() {
     sudo chmod 600 "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
     rm -f "$temp_config"
 
+    # Setup SSH authorized_keys for password-less login
+    log_info "Configuring SSH access..."
+    local ssh_key="$HOME/.ssh/wsl-to-vps"
+    if [ -f "$ssh_key.pub" ]; then
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+        
+        # Add public key to authorized_keys if not already present
+        if [ ! -f "$HOME/.ssh/authorized_keys" ] || ! grep -q -F "$(cat "$ssh_key.pub")" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+            cat "$ssh_key.pub" >> "$HOME/.ssh/authorized_keys"
+            chmod 600 "$HOME/.ssh/authorized_keys"
+            log_success "SSH key added to authorized_keys"
+        else
+            log_info "SSH key already in authorized_keys"
+        fi
+    else
+        log_warn "SSH key not found at $ssh_key.pub - password authentication will be required"
+    fi
+
     # Enable systemd in WSL
     log_info "Configuring WSL systemd..."
     if [ ! -f /etc/wsl.conf ] || ! grep -q "systemd=true" /etc/wsl.conf; then
