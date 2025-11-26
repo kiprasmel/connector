@@ -325,13 +325,33 @@ EOF
     echo "=================================================="
 }
 
-# REGISTER: Register WSL machine to VPS
+# REGISTER: Register machine to VPS
 cmd_register() {
+    local reg_type=""
     local vps_ip=""
     local staging_password=""
     local ssh_port="22"
     
-    # Parse arguments
+    # First argument must be type
+    if [ -z "$1" ]; then
+        log_error "Usage: connector register <provider|consumer> <vps-ip> [staging-password] [-p|--port <port>]"
+        log_error "Example: connector register provider 203.0.113.1 -p 2222"
+        log_error "Example: connector register consumer 203.0.113.1 -p 2222"
+        exit 1
+    fi
+    
+    reg_type="$1"
+    shift
+    
+    # Validate type
+    if [ "$reg_type" != "provider" ] && [ "$reg_type" != "consumer" ]; then
+        log_error "Invalid registration type: $reg_type"
+        log_error "Type must be either 'provider' or 'consumer'"
+        log_error "Usage: connector register <provider|consumer> <vps-ip> [staging-password] [-p|--port <port>]"
+        exit 1
+    fi
+    
+    # Parse remaining arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
             -p|--port)
@@ -350,12 +370,13 @@ cmd_register() {
     done
 
     if [ -z "$vps_ip" ]; then
-        log_error "Usage: connector register <vps-ip> [staging-password] [-p|--port <port>]"
-        log_error "Example: connector register 203.0.113.1 -p 2222"
+        log_error "Usage: connector register <provider|consumer> <vps-ip> [staging-password] [-p|--port <port>]"
+        log_error "Example: connector register provider 203.0.113.1 -p 2222"
+        log_error "Example: connector register consumer 203.0.113.1 -p 2222"
         exit 1
     fi
 
-    log_info "Registering WSL machine to VPS $vps_ip..."
+    log_info "Registering $reg_type machine to VPS $vps_ip..."
 
     # Install dependencies on Arch Linux
     if is_arch; then
@@ -400,12 +421,13 @@ cmd_register() {
     local reg_json=$(cat <<EOF
 {
   "machine_id": "$machine_id",
+  "type": "$reg_type",
   "timestamp": "$timestamp",
   "hostname": "$hostname",
   "username": "$username",
   "wg_pubkey": "$wg_public",
   "ssh_pubkey": "$ssh_pubkey",
-  "request_note": "WSL machine registration"
+  "request_note": "Machine registration ($reg_type)"
 }
 EOF
 )
@@ -468,12 +490,13 @@ EOF
     echo "Registration Complete!"
     echo
     echo "  Machine ID: $machine_id"
+    echo "  Type: $reg_type"
     echo "  Status: Waiting for approval"
     echo
     echo "Next Steps:"
     echo "  1. Contact VPS admin to approve this machine"
     echo "  2. Provide them with machine ID: $machine_id"
-    echo "  3. After approval, run: ./connector finalize $machine_id"
+    echo "  3. After approval, run: ./connector finalize $reg_type $machine_id"
     echo "=================================================="
 }
 
@@ -501,7 +524,12 @@ cmd_approve() {
             local hostname=$(jq -r '.hostname' "$file")
             local username=$(jq -r '.username' "$file")
             local timestamp=$(jq -r '.timestamp' "$file")
-            echo "  [$count] $mid"
+            local reg_type=$(jq -r '.type // "provider"' "$file")
+            local type_label="COMPUTE PROVIDER"
+            if [ "$reg_type" = "consumer" ]; then
+                type_label="COMPUTE CONSUMER"
+            fi
+            echo "  [$count] $mid ($type_label)"
             echo "      Host: $hostname | User: $username | Time: $timestamp"
             echo
         done
@@ -528,6 +556,7 @@ cmd_approve() {
     local username=$(jq -r '.username' "$reg_file")
     local wg_pubkey=$(jq -r '.wg_pubkey' "$reg_file")
     local ssh_pubkey=$(jq -r '.ssh_pubkey' "$reg_file")
+    local reg_type=$(jq -r '.type // "provider"' "$reg_file")
 
     # Allocate IP
     local client_ip=$(get_next_ip)
@@ -551,23 +580,25 @@ EOF
     log_info "Generating client configuration..."
     local server_public=$(cat "$WG_CONFIG_DIR/server_public.key")
     local server_endpoint=$(curl -s ifconfig.me || echo "YOUR_VPS_IP")
-    local client_private=$(jq -r '.wg_pubkey' "$reg_file")  # We need to get this from registration
     
-    # Get VPS root SSH public key (so VPS can SSH to WSL)
-    local vps_ssh_pubkey=""
-    if [ -f /root/.ssh/id_rsa.pub ]; then
-        vps_ssh_pubkey=$(cat /root/.ssh/id_rsa.pub)
-    elif [ -f /root/.ssh/id_ed25519.pub ]; then
-        vps_ssh_pubkey=$(cat /root/.ssh/id_ed25519.pub)
-    else
-        # Generate SSH key for VPS if it doesn't exist
-        log_info "Generating SSH keypair for VPS root..."
-        ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -C "root@vps-connector"
-        vps_ssh_pubkey=$(cat /root/.ssh/id_ed25519.pub)
-    fi
+    # Handle SSH key configuration based on type
+    if [ "$reg_type" = "provider" ]; then
+        # For providers: Get VPS root SSH public key (so VPS can SSH to provider)
+        log_info "Configuring provider access (VPS -> provider)..."
+        local vps_ssh_pubkey=""
+        if [ -f /root/.ssh/id_rsa.pub ]; then
+            vps_ssh_pubkey=$(cat /root/.ssh/id_rsa.pub)
+        elif [ -f /root/.ssh/id_ed25519.pub ]; then
+            vps_ssh_pubkey=$(cat /root/.ssh/id_ed25519.pub)
+        else
+            # Generate SSH key for VPS if it doesn't exist
+            log_info "Generating SSH keypair for VPS root..."
+            ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -C "root@vps-connector"
+            vps_ssh_pubkey=$(cat /root/.ssh/id_ed25519.pub)
+        fi
 
-    # Get VPS public endpoint and create config with VPS SSH key
-    cat > "$REGISTRY_DIR/configs/${machine_id}.conf" <<EOF
+        # Create config with VPS SSH key for provider to add
+        cat > "$REGISTRY_DIR/configs/${machine_id}.conf" <<EOF
 [Interface]
 Address = $client_ip/32
 PrivateKey = PLACEHOLDER_PRIVATE_KEY
@@ -578,9 +609,38 @@ Endpoint = ${server_endpoint}:${WG_PORT}
 AllowedIPs = ${WG_SUBNET}
 PersistentKeepalive = 25
 
-# VPS SSH Public Key (add this to ~/.ssh/authorized_keys on WSL)
+# VPS SSH Public Key (add this to ~/.ssh/authorized_keys on provider)
 # VPS_SSH_KEY=$vps_ssh_pubkey
 EOF
+    else
+        # For consumers: Add consumer SSH key to VPS authorized_keys
+        log_info "Configuring consumer access (consumer -> VPS)..."
+        mkdir -p /root/.ssh
+        chmod 700 /root/.ssh
+        touch /root/.ssh/authorized_keys
+        chmod 600 /root/.ssh/authorized_keys
+        
+        # Add consumer key to VPS if not already present
+        if ! grep -q -F "$ssh_pubkey" /root/.ssh/authorized_keys 2>/dev/null; then
+            echo "$ssh_pubkey" >> /root/.ssh/authorized_keys
+            log_success "Consumer SSH key added to VPS authorized_keys"
+        else
+            log_info "Consumer SSH key already in VPS authorized_keys"
+        fi
+
+        # Create config without VPS SSH key (consumer doesn't accept SSH)
+        cat > "$REGISTRY_DIR/configs/${machine_id}.conf" <<EOF
+[Interface]
+Address = $client_ip/32
+PrivateKey = PLACEHOLDER_PRIVATE_KEY
+
+[Peer]
+PublicKey = $server_public
+Endpoint = ${server_endpoint}:${WG_PORT}
+AllowedIPs = ${WG_SUBNET}
+PersistentKeepalive = 25
+EOF
+    fi
 
     chmod 644 "$REGISTRY_DIR/configs/${machine_id}.conf"
 
@@ -600,26 +660,221 @@ EOF
     echo "Approval Complete!"
     echo
     echo "  Machine ID: $machine_id"
+    echo "  Type: $reg_type"
     echo "  Hostname: $hostname"
     echo "  Username: $username"
     echo "  Assigned IP: $client_ip"
     echo
     echo "Client Instructions:"
-    echo "  Have the client run: ./connector finalize $machine_id"
+    echo "  Have the client run: ./connector finalize $reg_type $machine_id"
     echo
-    echo "After finalization, SSH access:"
-    echo "  ssh $username@$client_ip"
+    if [ "$reg_type" = "provider" ]; then
+        echo "After finalization, SSH access from VPS:"
+        echo "  ssh $username@$client_ip"
+    else
+        echo "After finalization, consumer can SSH to VPS:"
+        echo "  ssh root@<vps-public-ip>"
+        echo "  Then SSH to any provider: ssh <user>@<provider-ip>"
+    fi
     echo "=================================================="
 }
 
-# FINALIZE: Complete WSL setup after approval
+# Helper function: Finalize provider setup (with SSH hardening)
+finalize_provider() {
+    local token="$1"
+    local assigned_ip="$2"
+    local vps_endpoint="$3"
+    
+    # Setup SSH authorized_keys for VPS to connect
+    log_info "Configuring SSH access from VPS..."
+    
+    # Extract VPS SSH public key from config file (need sudo to read)
+    local vps_ssh_key=$(sudo grep "^# VPS_SSH_KEY=" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | sed 's/^# VPS_SSH_KEY=//')
+    
+    if [ -n "$vps_ssh_key" ]; then
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+        
+        # Add VPS public key to authorized_keys if not already present
+        if [ ! -f "$HOME/.ssh/authorized_keys" ] || ! grep -q -F "$vps_ssh_key" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+            echo "$vps_ssh_key" >> "$HOME/.ssh/authorized_keys"
+            chmod 600 "$HOME/.ssh/authorized_keys"
+            log_success "VPS SSH key added to authorized_keys"
+            log_info "VPS can now SSH as: $(whoami)@<provider-ip>"
+        else
+            log_info "VPS SSH key already in authorized_keys"
+        fi
+    else
+        log_error "Could not find VPS SSH key in configuration"
+        log_error "VPS will not be able to SSH to this machine without password"
+        log_warn "Manual fix: On VPS run: cat /root/.ssh/id_ed25519.pub"
+        log_warn "Then add that key to ~/.ssh/authorized_keys on this provider machine"
+    fi
+    
+    # Harden SSH configuration
+    log_info "Hardening SSH configuration..."
+    
+    # Backup sshd_config if not already backed up
+    if [ ! -f /etc/ssh/sshd_config.backup ]; then
+        sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+    fi
+    
+    # Remove any existing WSL connector hardening
+    sudo sed -i '/# WSL connector security hardening/,/^$/d' /etc/ssh/sshd_config
+    
+    # Add hardened configuration for current user
+    sudo bash -c "cat >> /etc/ssh/sshd_config" <<EOF
+
+# WSL connector security hardening
+Match User $(whoami) Address 10.0.0.0/24
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    PermitRootLogin no
+EOF
+    
+    # Test SSH configuration
+    if sudo sshd -t; then
+        log_success "SSH hardened: only accessible via WireGuard with key authentication"
+    else
+        log_error "SSH configuration has errors. Restoring backup..."
+        sudo cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
+        exit 1
+    fi
+    
+    # Note: We rely on SSH Match rules rather than firewall DROP rules
+    # to avoid accidentally locking users out if WireGuard goes down
+    log_info "SSH is now restricted to WireGuard network access only"
+
+    # Enable systemd in WSL
+    log_info "Configuring WSL systemd..."
+    if [ ! -f /etc/wsl.conf ] || ! grep -q "systemd=true" /etc/wsl.conf; then
+        sudo bash -c 'cat > /etc/wsl.conf' <<'EOF'
+[boot]
+systemd=true
+
+[network]
+generateResolvConf = true
+EOF
+        log_warn "WSL systemd enabled. You need to restart WSL: run 'wsl --shutdown' in Windows"
+        log_warn "After restarting WSL, run this command again to complete setup"
+        exit 0
+    fi
+    
+    # Enable SSH service
+    log_info "Enabling SSH service..."
+    sudo systemctl enable sshd 2>&1 || log_warn "Could not enable SSH service"
+    
+    log_info "Starting SSH..."
+    if ! timeout 5 sudo systemctl start sshd 2>&1; then
+        log_warn "SSH failed to start or timed out"
+    else
+        log_success "SSH started"
+    fi
+    
+    # Restart SSH to apply hardening rules
+    log_info "Restarting SSH to apply security hardening..."
+    if sudo systemctl restart sshd 2>&1; then
+        log_success "SSH restarted with hardened configuration"
+    else
+        log_warn "Could not restart SSH. Hardening rules may not be active."
+    fi
+    
+    echo
+    echo "=================================================="
+    echo "Provider Setup Complete!"
+    echo
+    echo "  Machine ID: $token"
+    echo "  WireGuard IP: $assigned_ip"
+    echo "  VPS WireGuard IP: $VPS_WG_IP"
+    echo "  VPS Public IP: $vps_endpoint"
+    echo
+    echo "Connection Status:"
+    sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
+    echo
+    echo "Security Status:"
+    echo "  - SSH restricted to WireGuard network (10.0.0.0/24)"
+    echo "  - Password authentication disabled"
+    echo "  - Key-based authentication only"
+    echo "  - Root login disabled"
+    echo
+    echo "SSH Access:"
+    echo "  From VPS directly:"
+    echo "    ssh $(whoami)@$assigned_ip"
+    echo
+    echo "  From your main machine (through VPS):"
+    echo "    ssh -J root@$vps_endpoint $(whoami)@$assigned_ip"
+    echo
+    # Get hostname safely
+    local wsl_hostname=$(cat /etc/hostname 2>/dev/null || echo "wsl")
+    
+    echo "  Or add to ~/.ssh/config on main machine:"
+    echo "    Host wsl-$wsl_hostname"
+    echo "      HostName $assigned_ip"
+    echo "      User $(whoami)"
+    echo "      ProxyJump root@$vps_endpoint"
+    echo
+    echo "  Check status: ./connector status"
+    echo "=================================================="
+}
+
+# Helper function: Finalize consumer setup (without SSH hardening)
+finalize_consumer() {
+    local token="$1"
+    local assigned_ip="$2"
+    local vps_endpoint="$3"
+    
+    log_info "Consumer setup - skipping SSH configuration (not needed)"
+    
+    echo
+    echo "=================================================="
+    echo "Consumer Setup Complete!"
+    echo
+    echo "  Machine ID: $token"
+    echo "  WireGuard IP: $assigned_ip"
+    echo "  VPS WireGuard IP: $VPS_WG_IP"
+    echo "  VPS Public IP: $vps_endpoint"
+    echo
+    echo "Connection Status:"
+    sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
+    echo
+    echo "SSH Access to VPS:"
+    echo "  ssh root@$vps_endpoint"
+    echo
+    echo "  Then from VPS, SSH to any provider machine:"
+    echo "  ssh <user>@<provider-ip>"
+    echo
+    echo "  Check WireGuard status: sudo wg show"
+    echo "=================================================="
+}
+
+# FINALIZE: Complete setup after approval
 cmd_finalize() {
+    local fin_type=""
     local token=""
     local vps_ip=""
     local staging_password=""
     local ssh_port="22"
     
-    # Parse arguments
+    # First argument must be type
+    if [ -z "$1" ]; then
+        log_error "Usage: connector finalize <provider|consumer> <token> [staging-password] [-p|--port <port>]"
+        log_error "Example: connector finalize provider wsl-abc12345 -p 2222"
+        log_error "Example: connector finalize consumer wsl-xyz78910 -p 2222"
+        exit 1
+    fi
+    
+    fin_type="$1"
+    shift
+    
+    # Validate type
+    if [ "$fin_type" != "provider" ] && [ "$fin_type" != "consumer" ]; then
+        log_error "Invalid finalization type: $fin_type"
+        log_error "Type must be either 'provider' or 'consumer'"
+        log_error "Usage: connector finalize <provider|consumer> <token> [staging-password] [-p|--port <port>]"
+        exit 1
+    fi
+    
+    # Parse remaining arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
             -p|--port)
@@ -644,12 +899,12 @@ cmd_finalize() {
     fi
 
     if [ -z "$token" ]; then
-        log_error "Usage: connector finalize <token> [staging-password] [-p|--port <port>]"
-        log_error "Or run after successful registration (token auto-detected)"
+        log_error "Usage: connector finalize <provider|consumer> <token> [staging-password] [-p|--port <port>]"
+        log_error "Example: connector finalize provider wsl-abc12345"
         exit 1
     fi
 
-    log_info "Finalizing setup for machine: $token"
+    log_info "Finalizing $fin_type setup for machine: $token"
 
     # Read VPS IP from registration
     if [ ! -f "$WSL_CONNECTOR_DIR/registration.json" ]; then
@@ -721,86 +976,11 @@ cmd_finalize() {
     sudo chmod 600 "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
     rm -f "$temp_config"
 
-    # Setup SSH authorized_keys for VPS to connect
-    log_info "Configuring SSH access from VPS..."
-    
-    # Extract VPS SSH public key from config file (need sudo to read)
-    local vps_ssh_key=$(sudo grep "^# VPS_SSH_KEY=" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | sed 's/^# VPS_SSH_KEY=//')
-    
-    if [ -n "$vps_ssh_key" ]; then
-        mkdir -p "$HOME/.ssh"
-        chmod 700 "$HOME/.ssh"
-        
-        # Add VPS public key to authorized_keys if not already present
-        if [ ! -f "$HOME/.ssh/authorized_keys" ] || ! grep -q -F "$vps_ssh_key" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
-            echo "$vps_ssh_key" >> "$HOME/.ssh/authorized_keys"
-            chmod 600 "$HOME/.ssh/authorized_keys"
-            log_success "VPS SSH key added to authorized_keys"
-            log_info "VPS can now SSH as: $(whoami)@<wsl-ip>"
-        else
-            log_info "VPS SSH key already in authorized_keys"
-        fi
-    else
-        log_error "Could not find VPS SSH key in configuration"
-        log_error "VPS will not be able to SSH to this machine without password"
-        log_warn "Manual fix: On VPS run: cat /root/.ssh/id_ed25519.pub"
-        log_warn "Then add that key to ~/.ssh/authorized_keys on this WSL machine"
-    fi
-    
-    # Harden SSH configuration
-    log_info "Hardening SSH configuration..."
-    
-    # Backup sshd_config if not already backed up
-    if [ ! -f /etc/ssh/sshd_config.backup ]; then
-        sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-    fi
-    
-    # Remove any existing WSL connector hardening
-    sudo sed -i '/# WSL connector security hardening/,/^$/d' /etc/ssh/sshd_config
-    
-    # Add hardened configuration for current user
-    sudo bash -c "cat >> /etc/ssh/sshd_config" <<EOF
-
-# WSL connector security hardening
-Match User $(whoami) Address 10.0.0.0/24
-    PasswordAuthentication no
-    PubkeyAuthentication yes
-    PermitRootLogin no
-EOF
-    
-    # Test SSH configuration
-    if sudo sshd -t; then
-        log_success "SSH hardened: only accessible via WireGuard with key authentication"
-    else
-        log_error "SSH configuration has errors. Restoring backup..."
-        sudo cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
-        exit 1
-    fi
-    
-    # Note: We rely on SSH Match rules rather than firewall DROP rules
-    # to avoid accidentally locking users out if WireGuard goes down
-    log_info "SSH is now restricted to WireGuard network access only"
-
-    # Enable systemd in WSL
-    log_info "Configuring WSL systemd..."
-    if [ ! -f /etc/wsl.conf ] || ! grep -q "systemd=true" /etc/wsl.conf; then
-        sudo bash -c 'cat > /etc/wsl.conf' <<'EOF'
-[boot]
-systemd=true
-
-[network]
-generateResolvConf = true
-EOF
-        log_warn "WSL systemd enabled. You need to restart WSL: run 'wsl --shutdown' in Windows"
-        log_warn "After restarting WSL, run this command again to complete setup"
-        exit 0
-    fi
-
     # Verify the IP in the config before starting
     local config_ip=$(sudo grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
     log_info "Configured WireGuard IP: $config_ip"
     
-    # Enable and start services
+    # Enable and start WireGuard service
     log_info "Enabling WireGuard service..."
     sudo systemctl enable wg-quick@$WG_INTERFACE 2>&1 || log_warn "Could not enable WireGuard service"
     
@@ -810,24 +990,6 @@ EOF
         log_warn "You may need to start it manually: sudo systemctl start wg-quick@wg0"
     else
         log_success "WireGuard started"
-    fi
-
-    log_info "Enabling SSH service..."
-    sudo systemctl enable sshd 2>&1 || log_warn "Could not enable SSH service"
-    
-    log_info "Starting SSH..."
-    if ! timeout 5 sudo systemctl start sshd 2>&1; then
-        log_warn "SSH failed to start or timed out"
-    else
-        log_success "SSH started"
-    fi
-    
-    # Restart SSH to apply hardening rules
-    log_info "Restarting SSH to apply security hardening..."
-    if sudo systemctl restart sshd 2>&1; then
-        log_success "SSH restarted with hardened configuration"
-    else
-        log_warn "Could not restart SSH. Hardening rules may not be active."
     fi
 
     # Extract assigned IP from config
@@ -866,42 +1028,12 @@ EOF
     # Get VPS public endpoint from config
     local vps_endpoint=$(sudo grep "^Endpoint" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d':' -f1)
     
-    echo
-    echo "=================================================="
-    echo "Setup Complete!"
-    echo
-    echo "  Machine ID: $token"
-    echo "  WireGuard IP: $assigned_ip"
-    echo "  VPS WireGuard IP: $VPS_WG_IP"
-    echo "  VPS Public IP: $vps_endpoint"
-    echo
-    echo "Connection Status:"
-    sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
-    echo
-    echo "Security Status:"
-    echo "  - SSH restricted to WireGuard network (10.0.0.0/24)"
-    echo "  - Password authentication disabled"
-    echo "  - Key-based authentication only"
-    echo "  - Root login disabled"
-    echo
-    echo "SSH Access:"
-    echo "  From VPS directly:"
-    echo "    ssh $(whoami)@$assigned_ip"
-    echo
-    echo "  From your main machine (through VPS):"
-    echo "    ssh -J root@$vps_endpoint $(whoami)@$assigned_ip"
-    echo
-    # Get hostname safely
-    local wsl_hostname=$(cat /etc/hostname 2>/dev/null || echo "wsl")
-    
-    echo "  Or add to ~/.ssh/config on main machine:"
-    echo "    Host wsl-$wsl_hostname"
-    echo "      HostName $assigned_ip"
-    echo "      User $(whoami)"
-    echo "      ProxyJump root@$vps_endpoint"
-    echo
-    echo "  Check status: ./connector status"
-    echo "=================================================="
+    # Call type-specific finalize helper
+    if [ "$fin_type" = "provider" ]; then
+        finalize_provider "$token" "$assigned_ip" "$vps_endpoint"
+    else
+        finalize_consumer "$token" "$assigned_ip" "$vps_endpoint"
+    fi
 }
 
 # LIST: List all approved machines
@@ -917,8 +1049,8 @@ cmd_list() {
 
     log_info "Approved Machines:"
     echo
-    printf "%-15s %-20s %-12s %-15s %-10s %-20s\n" "MACHINE ID" "HOSTNAME" "USER" "IP ADDRESS" "STATUS" "SSH COMMAND"
-    printf "%-15s %-20s %-12s %-15s %-10s %-20s\n" "----------" "--------" "----" "----------" "------" "-----------"
+    printf "%-15s %-18s %-20s %-12s %-15s %-10s\n" "MACHINE ID" "TYPE" "HOSTNAME" "USER" "IP ADDRESS" "STATUS"
+    printf "%-15s %-18s %-20s %-12s %-15s %-10s\n" "----------" "----" "--------" "----" "----------" "------"
 
     for file in "$REGISTRY_DIR/approved"/*.json; do
         [ -f "$file" ] || continue
@@ -928,6 +1060,13 @@ cmd_list() {
         local username=$(jq -r '.username' "$file")
         local ip=$(jq -r '.wg_ip' "$file")
         local pubkey=$(jq -r '.wg_pubkey' "$file")
+        local reg_type=$(jq -r '.type // "provider"' "$file")
+        
+        # Convert type to display label
+        local type_label="COMPUTE PROVIDER"
+        if [ "$reg_type" = "consumer" ]; then
+            type_label="COMPUTE CONSUMER"
+        fi
         
         # Get WireGuard status
         local wg_status=$(wg show "$WG_INTERFACE" | grep -A 5 "$pubkey" || echo "")
@@ -942,15 +1081,13 @@ cmd_list() {
             fi
         fi
         
-        local ssh_cmd="ssh $username@$ip"
-        
-        printf "%-15s %-20s %-12s %-15s %-10s %-20s\n" \
+        printf "%-15s %-18s %-20s %-12s %-15s %-10s\n" \
             "${machine_id:0:15}" \
+            "${type_label:0:18}" \
             "${hostname:0:20}" \
             "${username:0:12}" \
             "$ip" \
-            "$status" \
-            "${ssh_cmd:0:20}"
+            "$status"
     done
     echo
 }
@@ -1256,52 +1393,68 @@ connector v${VERSION} - WireGuard VPS-WSL Management Tool
 Usage: connector <command> [arguments]
 
 VPS Commands (run on VPS):
-  vps-init                Initialize VPS as WireGuard server
-  approve [machine-id]    Approve pending WSL machine
-  list                    List all approved machines
-  revoke <machine-id>     Revoke machine access
-  cleanup-vps             Remove all registrations (keeps VPS config)
+  vps-init                     Initialize VPS as WireGuard server
+  approve [machine-id]         Approve pending machine (provider or consumer)
+  list                         List all approved machines with type
+  revoke <machine-id>          Revoke machine access
+  cleanup-vps                  Remove all registrations (keeps VPS config)
 
-WSL Commands (run on WSL):
-  register <vps-ip> [-p port]     Register WSL machine to VPS
-  finalize [token] [-p port]      Complete setup after approval
-  status                          Show connection status
-  cleanup-wsl                     Remove all local configuration
+Machine Registration Commands:
+  register <provider|consumer> <vps-ip> [-p port]
+                               Register machine to VPS
+                               - provider: WSL/compute machine (accepts SSH from VPS)
+                               - consumer: Main machine (can SSH to VPS as root)
+
+  finalize <provider|consumer> [token] [-p port]
+                               Complete setup after approval
+                               - provider: Configures SSH hardening for WSL
+                               - consumer: Skips SSH setup (not needed)
+
+  status                       Show WireGuard connection status
+  cleanup-wsl                  Remove all local configuration
 
 Client Commands (run from any machine):
-  hop <vps-host> [user@ip]        Connect to WSL through VPS
-                                  - No target: list available machines
-                                  - With target: connect to user@ip
+  hop <vps-host> [user@ip]     Connect to provider through VPS
+                               - No target: list available machines
+                               - With target: connect to user@ip
 
 General:
-  help                    Show this help message
+  help                         Show this help message
 
 Examples:
   # On VPS (first time setup):
   sudo ./connector vps-init
 
-  # On WSL machine (default SSH port 22):
-  ./connector register 1.2.3.4
+  # On WSL/provider machine (register as compute provider):
+  ./connector register provider 1.2.3.4
+  ./connector register provider 1.2.3.4 -p 2222
 
-  # On WSL machine (custom SSH port):
-  ./connector register 1.2.3.4 -p 2222
+  # On main/consumer machine (register as compute consumer):
+  ./connector register consumer 1.2.3.4
+  ./connector register consumer 1.2.3.4 -p 2222
 
-  # On VPS (approve machine):
+  # On VPS (approve machine - shows type):
   sudo ./connector approve
 
-  # On WSL (after approval, auto-detects saved port):
-  ./connector finalize wsl-abc12345
+  # On provider machine (after approval):
+  ./connector finalize provider wsl-abc12345
+  ./connector finalize provider wsl-abc12345 -p 2222
 
-  # On WSL (specify port manually):
-  ./connector finalize wsl-abc12345 -p 2222
+  # On consumer machine (after approval):
+  ./connector finalize consumer wsl-xyz78910
+  ./connector finalize consumer wsl-xyz78910 -p 2222
 
-  # Check status:
+  # Check connection status:
   ./connector status
 
-  # From any machine - list WSL machines available through VPS:
+  # From consumer machine - SSH to VPS, then to any provider:
+  ssh root@vps-ip
+  ssh user@provider-ip
+
+  # From any machine - list machines available through VPS:
   ./connector hop root@203.0.113.1
 
-  # From any machine - connect to specific WSL:
+  # From any machine - connect to specific provider:
   ./connector hop root@203.0.113.1 kipras@10.0.0.2
   ./connector hop root@203.0.113.1 wsl-abc12345
 
