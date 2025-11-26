@@ -114,7 +114,7 @@ cmd_vps_init() {
     
     # Create staging user (simple approach - let file permissions do the work)
     log_info "Creating staging user with restricted access..."
-    read -sp "Enter password for staging user '$STAGING_USER': " staging_password
+    read -sp "Enter new password for staging user '$STAGING_USER': " staging_password
     echo
     
     if id "$STAGING_USER" &>/dev/null; then
