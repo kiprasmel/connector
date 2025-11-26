@@ -960,6 +960,82 @@ cmd_status() {
     fi
 }
 
+# CLEANUP-WSL: Clean up WSL-side configuration
+cmd_cleanup_wsl() {
+    log_warn "This will remove ALL WireGuard and connector configuration on this WSL machine"
+    read -p "Are you sure? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        log_info "Cleanup cancelled"
+        exit 0
+    fi
+    
+    log_info "Stopping services..."
+    sudo systemctl stop wg-quick@$WG_INTERFACE 2>/dev/null || true
+    sudo systemctl disable wg-quick@$WG_INTERFACE 2>/dev/null || true
+    
+    log_info "Removing WireGuard configuration..."
+    sudo rm -f "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+    
+    log_info "Removing connector data..."
+    rm -rf "$WSL_CONNECTOR_DIR"
+    
+    log_info "Removing SSH keys..."
+    rm -f "$HOME/.ssh/wsl-to-vps" "$HOME/.ssh/wsl-to-vps.pub"
+    
+    log_success "WSL cleanup complete! You can now run 'connector register' again."
+}
+
+# CLEANUP-VPS: Clean up VPS-side configuration
+cmd_cleanup_vps() {
+    require_root
+    
+    if ! is_vps; then
+        log_error "This command must be run on the VPS"
+        exit 1
+    fi
+    
+    log_warn "This will remove ALL machine registrations and WireGuard peer configurations"
+    log_warn "The VPS WireGuard server and staging user will remain configured"
+    read -p "Are you sure? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        log_info "Cleanup cancelled"
+        exit 0
+    fi
+    
+    log_info "Stopping WireGuard..."
+    systemctl stop wg-quick@$WG_INTERFACE 2>/dev/null || true
+    
+    log_info "Clearing all machine registrations..."
+    rm -f "$REGISTRY_DIR/pending"/*.json
+    rm -f "$REGISTRY_DIR/approved"/*.json
+    rm -f "$REGISTRY_DIR/configs"/*.conf
+    rm -f "$REGISTRY_DIR/revoked"/*.json
+    
+    log_info "Resetting WireGuard server configuration..."
+    # Keep only the [Interface] section
+    local server_private=$(cat "$WG_CONFIG_DIR/server_private.key")
+    cat > "$WG_CONFIG_DIR/$WG_INTERFACE.conf" <<EOF
+[Interface]
+Address = $VPS_WG_IP/24
+ListenPort = $WG_PORT
+PrivateKey = $server_private
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+# Peers will be added below this line
+EOF
+    chmod 600 "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
+    
+    log_info "Clearing authorized SSH keys..."
+    > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    
+    log_info "Starting WireGuard..."
+    systemctl start wg-quick@$WG_INTERFACE
+    
+    log_success "VPS cleanup complete! Ready to approve new machines."
+}
+
 # HELP: Show usage information
 cmd_help() {
     cat <<EOF
@@ -972,11 +1048,13 @@ VPS Commands (run on VPS):
   approve [machine-id]    Approve pending WSL machine
   list                    List all approved machines
   revoke <machine-id>     Revoke machine access
+  cleanup-vps             Remove all registrations (keeps VPS config)
 
 WSL Commands (run on WSL):
   register <vps-ip> [-p port]     Register WSL machine to VPS
   finalize [token] [-p port]      Complete setup after approval
   status                          Show connection status
+  cleanup-wsl                     Remove all local configuration
 
 General:
   help                    Show this help message
@@ -1032,6 +1110,12 @@ main() {
             ;;
         status)
             cmd_status "${@:2}"
+            ;;
+        cleanup-wsl)
+            cmd_cleanup_wsl "${@:2}"
+            ;;
+        cleanup-vps)
+            cmd_cleanup_vps "${@:2}"
             ;;
         help|--help|-h)
             cmd_help
