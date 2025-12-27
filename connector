@@ -9,7 +9,7 @@ REGISTRY_DIR="/var/lib/wsl-registry"
 WG_CONFIG_DIR="/etc/wireguard"
 WSL_CONNECTOR_DIR="${HOME}/.config/wsl-connector"
 WG_PORT="51820"
-WG_INTERFACE="wg0"
+WG_INTERFACE="wg-connector"
 VPS_WG_IP="10.0.0.1"
 WG_SUBNET="10.0.0.0/24"
 STAGING_USER="connector"
@@ -1025,8 +1025,8 @@ cmd_finalize() {
     
     log_info "Starting WireGuard..."
     if ! timeout 10 sudo systemctl start wg-quick@$WG_INTERFACE 2>&1; then
-        log_warn "WireGuard failed to start or timed out. Check logs with: sudo journalctl -u wg-quick@wg0"
-        log_warn "You may need to start it manually: sudo systemctl start wg-quick@wg0"
+        log_warn "WireGuard failed to start or timed out. Check logs with: sudo journalctl -u wg-quick@$WG_INTERFACE"
+        log_warn "You may need to start it manually: sudo systemctl start wg-quick@$WG_INTERFACE"
     else
         log_success "WireGuard started"
     fi
@@ -1037,7 +1037,7 @@ cmd_finalize() {
     # Verify the actual IP assigned
     log_info "Verifying WireGuard interface..."
     sleep 2
-    local actual_ip=$(ip addr show wg0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+    local actual_ip=$(ip addr show $WG_INTERFACE 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
     if [ -n "$actual_ip" ]; then
         log_success "WireGuard interface has IP: $actual_ip"
         if [ "$actual_ip" != "$assigned_ip" ]; then

@@ -89,7 +89,7 @@ Special user account `connector`:
 
 ### 4. WireGuard Configuration
 
-**Server Config** (`/etc/wireguard/wg0.conf`):
+**Server Config** (`/etc/wireguard/wg-connector.conf`):
 ```ini
 [Interface]
 Address = 10.0.0.1/24
@@ -103,7 +103,7 @@ PublicKey = <client_public_key>
 AllowedIPs = 10.0.0.X/32
 ```
 
-**Client Config** (`/etc/wireguard/wg0.conf` on WSL):
+**Client Config** (`/etc/wireguard/wg-connector.conf` on WSL):
 ```ini
 [Interface]
 Address = 10.0.0.X/32
@@ -152,7 +152,7 @@ VPS Admin                     VPS Server
     │                             │
     │                             │  3. Allocate IP (10.0.0.X)
     │                             │
-    │                             │  4. Add [Peer] to wg0.conf
+    │                             │  4. Add [Peer] to wg-connector.conf
     │                             │
     │                             │  5. Reload WireGuard
     │                             │
@@ -177,14 +177,14 @@ WSL Machine                    VPS Server
     │  (using staging user + token)│
     │                              │  2. Validate token
     │                              │
-    │  3. Download wg0.conf        │
+    │  3. Download wg-connector.conf        │
     │<─────────────────────────────┤
     │                              │
     │  4. Install config           │
     │  to /etc/wireguard/          │
     │                              │
     │  5. Enable systemd services  │
-    │  (wg-quick@wg0, sshd)        │
+    │  (wg-quick@wg-connector, sshd)        │
     │                              │
     │  6. Start WireGuard          │
     │                              │
@@ -284,13 +284,13 @@ WSL Machine                    VPS Server
 
 ### VPS Services
 
-- `wg-quick@wg0.service`: WireGuard server
+- `wg-quick@wg-connector.service`: WireGuard server
   - Enabled: Auto-start on boot
   - Manages interface and routing
 
 ### WSL Services
 
-- `wg-quick@wg0.service`: WireGuard client
+- `wg-quick@wg-connector.service`: WireGuard client
   - Enabled: Auto-start when systemd initializes
   - Connects to VPS automatically
 
@@ -313,7 +313,7 @@ systemd enabled? ──No──> Traditional init
        ▼
 systemd starts
        │
-       ├─> wg-quick@wg0.service
+       ├─> wg-quick@wg-connector.service
        │   └─> Establishes WireGuard tunnel
        │
        └─> sshd.service
