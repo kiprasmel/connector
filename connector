@@ -8,11 +8,18 @@ VERSION="1.0.0"
 REGISTRY_DIR="/var/lib/wsl-registry"
 WG_CONFIG_DIR="/etc/wireguard"
 WSL_CONNECTOR_DIR="${HOME}/.config/wsl-connector"
+ALIASES_FILE="${WSL_CONNECTOR_DIR}/aliases.conf"
+SSH_CONFIG_FILE="${HOME}/.ssh/config"
 WG_PORT="51820"
 WG_INTERFACE="wg-connector"
 VPS_WG_IP="10.0.0.1"
 WG_SUBNET="10.0.0.0/24"
 STAGING_USER="connector"
+
+RESERVED_COMMANDS=(
+    vps-init approve list revoke register finalize status
+    hop cleanup-wsl cleanup-vps help alias --help -h
+)
 
 # Helper functions
 log_info() { echo "[INFO] $*"; }
@@ -1444,6 +1451,262 @@ cmd_cleanup_vps() {
     log_success "VPS cleanup complete! Ready to approve new machines."
 }
 
+# Alias helpers
+
+ensure_aliases_file() {
+    mkdir -p "$WSL_CONNECTOR_DIR"
+    chmod 700 "$WSL_CONNECTOR_DIR" 2>/dev/null || true
+    if [ ! -f "$ALIASES_FILE" ]; then
+        cat > "$ALIASES_FILE" <<'EOF'
+# connector aliases - one per line
+# format: name|vps_host|target
+EOF
+        chmod 600 "$ALIASES_FILE"
+    fi
+}
+
+is_reserved_command() {
+    local name="$1"
+    local cmd
+    for cmd in "${RESERVED_COMMANDS[@]}"; do
+        if [ "$name" = "$cmd" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+alias_lookup() {
+    local name="$1"
+    [ -f "$ALIASES_FILE" ] || return 1
+    local line
+    line=$(grep -E "^${name}\|" "$ALIASES_FILE" 2>/dev/null | head -n1)
+    [ -n "$line" ] || return 1
+    echo "$line"
+}
+
+ssh_config_block_exists() {
+    local name="$1"
+    [ -f "$SSH_CONFIG_FILE" ] || return 1
+    grep -qF "# BEGIN connector alias ${name}" "$SSH_CONFIG_FILE" 2>/dev/null
+}
+
+ssh_config_add_block() {
+    local name="$1"
+    local target="$2"
+    local vps_host="$3"
+
+    local user="${target%@*}"
+    local host="${target##*@}"
+
+    if [ -z "$user" ] || [ -z "$host" ] || [ "$user" = "$target" ]; then
+        log_error "Cannot derive user@host from target: $target"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$SSH_CONFIG_FILE")"
+    chmod 700 "$(dirname "$SSH_CONFIG_FILE")" 2>/dev/null || true
+
+    if [ ! -f "$SSH_CONFIG_FILE" ]; then
+        touch "$SSH_CONFIG_FILE"
+        chmod 600 "$SSH_CONFIG_FILE"
+    fi
+
+    if ssh_config_block_exists "$name"; then
+        log_warn "SSH config already has a connector block for '$name'"
+        log_warn "Run: connector alias rm $name  (then re-add) to replace it"
+        return 1
+    fi
+
+    [ -s "$SSH_CONFIG_FILE" ] && [ "$(tail -c1 "$SSH_CONFIG_FILE")" != "" ] && echo >> "$SSH_CONFIG_FILE"
+
+    cat >> "$SSH_CONFIG_FILE" <<EOF
+
+# BEGIN connector alias ${name}
+Host ${name}
+    HostName ${host}
+    User ${user}
+    ProxyJump ${vps_host}
+# END connector alias ${name}
+EOF
+
+    log_success "Added Host '$name' to $SSH_CONFIG_FILE"
+    log_info "You can now run: ssh $name"
+}
+
+ssh_config_remove_block() {
+    local name="$1"
+    [ -f "$SSH_CONFIG_FILE" ] || return 0
+    if ! ssh_config_block_exists "$name"; then
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    awk -v marker="connector alias ${name}" '
+        $0 ~ "^# BEGIN " marker "$" { skip=1; next }
+        skip && $0 ~ "^# END " marker "$" { skip=0; next }
+        !skip { print }
+    ' "$SSH_CONFIG_FILE" > "$tmp"
+
+    awk 'BEGIN{blank=0} /^$/{blank++; if(blank<=2)print; next} {blank=0; print}' "$tmp" > "${tmp}.2"
+    mv "${tmp}.2" "$SSH_CONFIG_FILE"
+    rm -f "$tmp"
+    chmod 600 "$SSH_CONFIG_FILE"
+    log_success "Removed Host '$name' from $SSH_CONFIG_FILE"
+}
+
+resolve_machine_id() {
+    local vps_host="$1"
+    local machine_id="$2"
+
+    log_info "Resolving machine ID '$machine_id' via $vps_host..."
+    local machine_data
+    machine_data=$(ssh -o ConnectTimeout=10 "$vps_host" "cat ${REGISTRY_DIR}/approved/${machine_id}.json 2>/dev/null") || {
+        log_error "Failed to SSH to $vps_host to resolve machine ID"
+        return 1
+    }
+
+    if [ -z "$machine_data" ]; then
+        log_error "Machine '$machine_id' not found on VPS"
+        return 1
+    fi
+
+    local reg_type username ip
+    reg_type=$(echo "$machine_data" | jq -r '.type // "provider"')
+    username=$(echo "$machine_data" | jq -r '.username')
+    ip=$(echo "$machine_data" | jq -r '.wg_ip')
+
+    if [ "$reg_type" = "consumer" ]; then
+        log_error "'$machine_id' is a consumer machine - cannot SSH to consumers"
+        return 1
+    fi
+
+    if [ -z "$username" ] || [ -z "$ip" ] || [ "$username" = "null" ] || [ "$ip" = "null" ]; then
+        log_error "Invalid machine data for '$machine_id'"
+        return 1
+    fi
+
+    echo "${username}@${ip}"
+}
+
+# ALIAS: Manage hop shortcuts
+cmd_alias() {
+    local sub="${1:-list}"
+
+    case "$sub" in
+        ""|list|ls)
+            ensure_aliases_file
+            log_info "Saved aliases:"
+            echo
+            printf "%-20s %-30s %s\n" "NAME" "VPS HOST" "TARGET"
+            printf "%-20s %-30s %s\n" "----" "--------" "------"
+            local count=0
+            while IFS='|' read -r name vps_host target; do
+                [ -z "$name" ] && continue
+                [[ "$name" =~ ^# ]] && continue
+                printf "%-20s %-30s %s\n" "$name" "$vps_host" "$target"
+                count=$((count + 1))
+            done < "$ALIASES_FILE"
+            if [ $count -eq 0 ]; then
+                echo "  (none)"
+                echo
+                echo "Create one with: connector alias <name> <vps-host> <user@ip|machine-id>"
+            fi
+            echo
+            ;;
+        rm|remove|delete)
+            local name="$2"
+            if [ -z "$name" ]; then
+                log_error "Usage: connector alias rm <name>"
+                exit 1
+            fi
+            ensure_aliases_file
+            if ! alias_lookup "$name" >/dev/null; then
+                log_error "Alias not found: $name"
+                exit 1
+            fi
+            local tmp
+            tmp=$(mktemp)
+            grep -vE "^${name}\|" "$ALIASES_FILE" > "$tmp" || true
+            mv "$tmp" "$ALIASES_FILE"
+            chmod 600 "$ALIASES_FILE"
+            log_success "Removed alias: $name"
+
+            if ssh_config_block_exists "$name"; then
+                read -p "Also remove matching ~/.ssh/config Host entry? [Y/n]: " confirm
+                if [ -z "$confirm" ] || [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+                    ssh_config_remove_block "$name"
+                fi
+            fi
+            ;;
+        *)
+            local force=0
+            local args=()
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    -f|--force) force=1; shift ;;
+                    *) args+=("$1"); shift ;;
+                esac
+            done
+
+            local name="${args[0]}"
+            local vps_host="${args[1]}"
+            local target="${args[2]}"
+
+            if [ -z "$name" ] || [ -z "$vps_host" ] || [ -z "$target" ]; then
+                log_error "Usage: connector alias <name> <vps-host> <user@ip|machine-id>"
+                log_error "       connector alias list"
+                log_error "       connector alias rm <name>"
+                exit 1
+            fi
+
+            if ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+                log_error "Invalid alias name: '$name'"
+                log_error "Names must start with alphanumeric and contain only [a-zA-Z0-9._-]"
+                exit 1
+            fi
+
+            if is_reserved_command "$name"; then
+                log_error "Alias name '$name' conflicts with a built-in command"
+                exit 1
+            fi
+
+            ensure_aliases_file
+
+            if alias_lookup "$name" >/dev/null; then
+                if [ $force -eq 0 ]; then
+                    log_error "Alias '$name' already exists. Use -f to overwrite, or 'connector alias rm $name'."
+                    exit 1
+                fi
+                local tmp
+                tmp=$(mktemp)
+                grep -vE "^${name}\|" "$ALIASES_FILE" > "$tmp" || true
+                mv "$tmp" "$ALIASES_FILE"
+                chmod 600 "$ALIASES_FILE"
+            fi
+
+            local resolved_target="$target"
+            if [[ "$target" != *"@"* ]]; then
+                require_package jq
+                resolved_target=$(resolve_machine_id "$vps_host" "$target") || exit 1
+                log_success "Resolved '$target' to '$resolved_target'"
+            fi
+
+            echo "${name}|${vps_host}|${resolved_target}" >> "$ALIASES_FILE"
+            chmod 600 "$ALIASES_FILE"
+            log_success "Saved alias: $name -> hop $vps_host $resolved_target"
+            log_info "Run with: connector $name"
+
+            echo
+            read -p "Add matching ~/.ssh/config Host entry so you can run 'ssh $name'? [y/N]: " confirm
+            if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+                ssh_config_add_block "$name" "$resolved_target" "$vps_host"
+            fi
+            ;;
+    esac
+}
+
 # HELP: Show usage information
 cmd_help() {
     cat <<EOF
@@ -1477,6 +1740,15 @@ Client Commands (run from any machine):
                                - No target: list available providers
                                - With target: connect to user@ip or machine-id
                                - Note: Only works for providers, not consumers
+
+Alias Commands (saved hop shortcuts):
+  alias <name> <vps-host> <user@ip|machine-id>
+                               Save a hop shortcut. After saving, run with
+                               'connector <name>'. Prompts to optionally add a
+                               matching Host entry to ~/.ssh/config.
+  alias list                   List all saved aliases
+  alias rm <name>              Remove an alias (and matching ~/.ssh/config block)
+  <alias-name>                 Run a saved alias (equivalent to its 'hop' form)
 
 General:
   help                         Show this help message
@@ -1518,6 +1790,20 @@ Examples:
   ./connector hop root@203.0.113.1 kipras@10.0.0.2
   ./connector hop root@203.0.113.1 wsl-abc12345
 
+  # Save a hop as an alias (prompts to also add ~/.ssh/config entry):
+  ./connector alias kipras-nyc nyc kipras@10.0.0.2
+  ./connector alias kipras-nyc nyc wsl-abc12345    # machine-id is resolved at create time
+
+  # Use the alias - runs the saved hop:
+  ./connector kipras-nyc
+
+  # If you accepted the SSH config prompt, you can also just:
+  ssh kipras-nyc
+
+  # List or remove aliases:
+  ./connector alias list
+  ./connector alias rm kipras-nyc
+
 For more information, see README.md
 EOF
 }
@@ -1557,10 +1843,21 @@ main() {
         cleanup-vps)
             cmd_cleanup_vps "${@:2}"
             ;;
+        alias)
+            cmd_alias "${@:2}"
+            ;;
         help|--help|-h)
             cmd_help
             ;;
         *)
+            local alias_line
+            if alias_line=$(alias_lookup "$cmd"); then
+                local alias_name alias_vps alias_target
+                IFS='|' read -r alias_name alias_vps alias_target <<< "$alias_line"
+                log_info "Running alias '$alias_name' -> hop $alias_vps $alias_target"
+                cmd_hop "$alias_vps" "$alias_target" "${@:2}"
+                exit $?
+            fi
             log_error "Unknown command: $cmd"
             echo
             cmd_help
