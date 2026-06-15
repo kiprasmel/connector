@@ -1,1861 +1,1014 @@
 #!/bin/bash
-# connector - Universal WireGuard VPS-WSL management tool
-# Manages registration and approval of WSL machines to a central VPS
+# connector - headscale/tailscale mesh management tool
+set -euo pipefail
 
-set -e
+VERSION="2.0.0"
 
-VERSION="1.0.0"
-REGISTRY_DIR="/var/lib/wsl-registry"
-WG_CONFIG_DIR="/etc/wireguard"
-WSL_CONNECTOR_DIR="${HOME}/.config/wsl-connector"
-ALIASES_FILE="${WSL_CONNECTOR_DIR}/aliases.conf"
+# --- Constants ---------------------------------------------------------------
+HEADSCALE_USER="mesh"
+HEADSCALE_CONFIG="/etc/headscale/config.yaml"
+HEADSCALE_ACL="/etc/headscale/acl.hujson"
+HEADSCALE_LIB="/var/lib/headscale"
+HEADSCALE_BIN="/usr/local/bin/headscale"
+CONNECTOR_BIN="/usr/local/bin/connector"
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/connector"
+CNC_LINK_FILE="${STATE_DIR}/cnc"
+ROLE_FILE="${STATE_DIR}/role"
+ALIASES_FILE="${STATE_DIR}/aliases.conf"
 SSH_CONFIG_FILE="${HOME}/.ssh/config"
-WG_PORT="51820"
-WG_INTERFACE="wg-connector"
-VPS_WG_IP="10.0.0.1"
-WG_SUBNET="10.0.0.0/24"
-STAGING_USER="connector"
+KEY_EXPIRY="${CONNECTOR_KEY_EXPIRY:-1h}"
+WSL_MTU="1280"
+TS_INSTALL_URL="https://tailscale.com/install.sh"
 
 RESERVED_COMMANDS=(
-    vps-init approve list revoke register finalize status
-    hop cleanup-wsl cleanup-vps help alias --help -h
+    cnc-init link invite commander-key register approve list revoke
+    status whoami hop alias cleanup cleanup-cnc help --help -h
 )
 
-# Helper functions
-log_info() { echo "[INFO] $*"; }
-log_success() { echo "[SUCCESS] $*"; }
-log_warn() { echo "[WARN] $*"; }
-log_error() { echo "[ERROR] $*" >&2; }
+# --- Logging -----------------------------------------------------------------
+log_info()    { echo "[INFO] $*"; }
+log_success() { echo "[OK] $*"; }
+log_warn()    { echo "[WARN] $*"; }
+log_error()   { echo "[ERROR] $*" >&2; }
+die()         { log_error "$*"; exit 1; }
+
+# --- Small helpers -----------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+    # confirm "question" [y]  -> returns 0 on yes; ASSUME_YES=1 auto-confirms
+    local prompt="$1" default="${2:-n}" reply
+    [ "${ASSUME_YES:-0}" = "1" ] && return 0
+    if [ "$default" = "y" ]; then
+        read -r -p "$prompt [Y/n]: " reply || true
+        reply="${reply:-y}"
+    else
+        read -r -p "$prompt [y/N]: " reply || true
+        reply="${reply:-n}"
+    fi
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
 
 require_root() {
-    if [ "$EUID" -ne 0 ]; then
-        log_error "This command must be run as root"
-        exit 1
-    fi
+    [ "$(id -u)" -eq 0 ] || die "This command must be run as root (try: sudo connector $*)"
 }
 
-require_package() {
-    if ! command -v "$1" &> /dev/null; then
-        log_error "Required package '$1' is not installed"
-        exit 1
-    fi
+# Run a command as root locally (no-op prefix when already root).
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
 }
 
-is_vps() {
-    [ -d "$REGISTRY_DIR" ]
-}
-
-is_arch() {
-    [ -f /etc/arch-release ]
-}
-
-generate_machine_id() {
-    echo "wsl-$(head /dev/urandom | tr -dc a-z0-9 | head -c 8)"
-}
-
-get_next_ip() {
-    local max_ip=1
-    if [ -d "$REGISTRY_DIR/approved" ]; then
-        for file in "$REGISTRY_DIR/approved"/*.json; do
-            [ -f "$file" ] || continue
-            local ip=$(jq -r '.wg_ip' "$file" 2>/dev/null | cut -d'.' -f4)
-            if [ -n "$ip" ] && [ "$ip" -gt "$max_ip" ]; then
-                max_ip=$ip
-            fi
-        done
-    fi
-    echo "10.0.0.$((max_ip + 1))"
-}
-
-# VPS-INIT: Initialize VPS as WireGuard server
-cmd_vps_init() {
-    log_info "Initializing VPS as WireGuard server..."
-    require_root
-
-    # Detect package manager
-    if command -v apt &> /dev/null; then
-        PKG_INSTALL="apt update && apt install -y"
-    elif command -v yum &> /dev/null; then
-        PKG_INSTALL="yum install -y"
-    elif command -v pacman &> /dev/null; then
-        PKG_INSTALL="pacman -Sy --noconfirm"
-    else
-        log_error "No supported package manager found (apt/yum/pacman)"
-        exit 1
-    fi
-
-    # Install required packages
-    log_info "Installing required packages..."
-    eval "$PKG_INSTALL wireguard-tools jq openssh-server"
-
-    # Generate WireGuard server keys
-    log_info "Generating WireGuard server keys..."
-    mkdir -p "$WG_CONFIG_DIR"
-    wg genkey | tee "$WG_CONFIG_DIR/server_private.key" | wg pubkey > "$WG_CONFIG_DIR/server_public.key"
-    chmod 600 "$WG_CONFIG_DIR/server_private.key"
-    local server_private=$(cat "$WG_CONFIG_DIR/server_private.key")
-    local server_public=$(cat "$WG_CONFIG_DIR/server_public.key")
-
-    # Create registry directories
-    log_info "Creating registry directories..."
-    mkdir -p "$REGISTRY_DIR"/{pending,approved,configs,revoked}
-    
-    # Verify directories were created
-    for dir in pending approved configs revoked; do
-        if [ ! -d "$REGISTRY_DIR/$dir" ]; then
-            log_error "Failed to create directory: $REGISTRY_DIR/$dir"
-            exit 1
-        fi
+# Resolve the absolute path of this script, following symlinks.
+self_path() {
+    local s="${BASH_SOURCE[0]}" d
+    while [ -h "$s" ]; do
+        d=$(cd -P "$(dirname "$s")" >/dev/null 2>&1 && pwd)
+        s=$(readlink "$s")
+        case "$s" in /*) ;; *) s="$d/$s" ;; esac
     done
-    
-    # Set initial ownership (will be refined after user creation)
-    chown -R root:root "$REGISTRY_DIR"
-    chmod 755 "$REGISTRY_DIR"
-
-    # Clean up old scponly script if it exists
-    if [ -f /usr/bin/scponly ]; then
-        log_info "Removing old scponly script..."
-        rm -f /usr/bin/scponly
-        sed -i '\|^/usr/bin/scponly$|d' /etc/shells 2>/dev/null || true
-    fi
-    
-    # Create staging user (simple approach - let file permissions do the work)
-    log_info "Creating staging user with restricted access..."
-    read -sp "Enter new password for staging user '$STAGING_USER': " staging_password
-    echo
-    
-    if id "$STAGING_USER" &>/dev/null; then
-        log_warn "User $STAGING_USER already exists, updating..."
-        echo "$STAGING_USER:$staging_password" | chpasswd
-        # Ensure shell is /bin/bash (not old scponly)
-        usermod -s /bin/bash "$STAGING_USER"
-    else
-        # Create user with /bin/bash (SCP will work fine, interactive login blocked by SSH config)
-        useradd -m -s /bin/bash "$STAGING_USER"
-        echo "$STAGING_USER:$staging_password" | chpasswd
-    fi
-    
-    log_success "Created user $STAGING_USER"
-
-    # Set final permissions for registry directories
-    log_info "Setting registry directory permissions..."
-    
-    # pending: writable by staging user (for uploads)
-    chown "$STAGING_USER:$STAGING_USER" "$REGISTRY_DIR/pending"
-    chmod 755 "$REGISTRY_DIR/pending"  # rwxr-xr-x
-    
-    # configs: readable by staging user (for downloads)  
-    chown root:root "$REGISTRY_DIR/configs"
-    chmod 755 "$REGISTRY_DIR/configs"  # rwxr-xr-x
-    
-    # approved and revoked: root only
-    chown root:root "$REGISTRY_DIR"/{approved,revoked}
-    chmod 700 "$REGISTRY_DIR"/{approved,revoked}  # rwx------
-    
-    log_success "Registry directories configured with proper permissions"
-    
-    # Configure SSH for staging user with restrictions
-    log_info "Configuring SSH with restricted access for staging user..."
-    
-    # Backup sshd_config
-    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-    
-    # Remove any existing Match User configuration for staging user
-    sed -i "/^Match User $STAGING_USER/,/^Match /d" /etc/ssh/sshd_config
-    sed -i "/^Match User $STAGING_USER/,\$d" /etc/ssh/sshd_config
-    
-    # Simple SSH config - just enable password auth and block interactive login
-    cat >> /etc/ssh/sshd_config <<EOF
-
-# Restricted access for staging user (connector tool)
-# File permissions control what they can access
-Match User $STAGING_USER
-    PasswordAuthentication yes
-    PermitTTY no
-    X11Forwarding no
-    AllowTcpForwarding no
-    PermitTunnel no
-    AllowAgentForwarding no
-EOF
-
-    # Create a simple SCP-only wrapper script
-    cat > /usr/bin/scponly <<'SCPONLY'
-#!/bin/bash
-# SCP-only restricted shell for staging user
-# Only allows scp file transfers, no interactive commands
-
-# Log the command for debugging (optional, can be disabled in production)
-# echo "DEBUG: SSH_ORIGINAL_COMMAND=$SSH_ORIGINAL_COMMAND" >> /tmp/scponly.log
-
-# Extract the actual path from the SCP command
-# SCP commands come in two forms:
-# - Upload: scp [options] -t /path/to/file
-# - Download: scp [options] -f /path/to/file
-
-if [[ -z "$SSH_ORIGINAL_COMMAND" ]]; then
-    echo "Access denied: No command specified" >&2
-    exit 1
-fi
-
-# Check if this is an SCP command
-if [[ ! "$SSH_ORIGINAL_COMMAND" =~ ^scp[[:space:]] ]]; then
-    echo "Access denied: Only SCP file transfers are allowed" >&2
-    exit 1
-fi
-
-# Extract the target path (last argument after -t or -f flag)
-if [[ "$SSH_ORIGINAL_COMMAND" =~ -t[[:space:]]+(/[^[:space:]]+) ]] || \
-   [[ "$SSH_ORIGINAL_COMMAND" =~ -f[[:space:]]+(/[^[:space:]]+) ]]; then
-    target_path="${BASH_REMATCH[1]}"
-    
-    # Check if the path is in allowed directories
-    if [[ "$target_path" == /var/lib/wsl-registry/pending/* ]]; then
-        # Allow uploads to pending directory
-        exec $SSH_ORIGINAL_COMMAND
-    elif [[ "$target_path" == /var/lib/wsl-registry/configs/* ]]; then
-        # Allow downloads from configs directory
-        exec $SSH_ORIGINAL_COMMAND
-    else
-        echo "Access denied: Path '$target_path' is not in allowed directories" >&2
-        echo "Allowed paths: /var/lib/wsl-registry/pending/* (upload), /var/lib/wsl-registry/configs/* (download)" >&2
-        exit 1
-    fi
-else
-    echo "Access denied: Invalid SCP command format" >&2
-    echo "Command received: $SSH_ORIGINAL_COMMAND" >&2
-    exit 1
-fi
-SCPONLY
-    
-    chmod +x /usr/bin/scponly
-    log_success "Created restricted SCP-only shell"
-    
-    # Test SSH configuration
-    if sshd -t; then
-        log_success "SSH configuration is valid"
-    else
-        log_error "SSH configuration has errors. Restoring backup..."
-        cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
-        exit 1
-    fi
-    
-    # Restart SSH service
-    if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null; then
-        log_success "SSH service restarted"
-    else
-        log_warn "Could not restart SSH service automatically. Please restart manually: sudo systemctl restart sshd"
-    fi
-
-    # Create WireGuard server config
-    log_info "Creating WireGuard server configuration..."
-    cat > "$WG_CONFIG_DIR/$WG_INTERFACE.conf" <<EOF
-[Interface]
-Address = $VPS_WG_IP/24
-ListenPort = $WG_PORT
-PrivateKey = $server_private
-PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
-
-# Peers will be added below this line
-EOF
-
-    chmod 600 "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
-
-    # Enable IP forwarding
-    log_info "Enabling IP forwarding..."
-    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard.conf
-    sysctl -p /etc/sysctl.d/99-wireguard.conf
-
-    # Configure firewall
-    log_info "Configuring firewall..."
-    if command -v ufw &> /dev/null; then
-        # Allow WireGuard
-        ufw allow $WG_PORT/udp comment 'WireGuard'
-        # Allow SSH from WireGuard network only (will be added after WireGuard is up)
-        log_success "UFW rules configured"
-    elif command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --permanent --add-port=$WG_PORT/udp
-        firewall-cmd --reload
-        log_success "Firewalld rules configured"
-    else
-        log_warn "No firewall manager detected. Manually configure:"
-        log_warn "  - Allow UDP port $WG_PORT (WireGuard)"
-    fi
-    
-    log_info "VPS security configured"
-    log_info "Note: VPS SSH remains accessible for admin access"
-    log_info "WSL machines will only be accessible via WireGuard"
-
-    # Enable and start WireGuard
-    log_info "Enabling WireGuard service..."
-    systemctl enable wg-quick@$WG_INTERFACE
-    systemctl start wg-quick@$WG_INTERFACE
-
-    # Get VPS public IP
-    local vps_ip=$(curl -s ifconfig.me || echo "YOUR_VPS_IP")
-    
-    # Detect SSH port
-    local ssh_port=$(grep -E "^Port " /etc/ssh/sshd_config | awk '{print $2}' || echo "22")
-    ssh_port=${ssh_port:-22}  # Default to 22 if not found
-    
-    # Build register command
-    local register_cmd="./connector register $vps_ip"
-    if [ "$ssh_port" != "22" ]; then
-        register_cmd="$register_cmd -p $ssh_port"
-    fi
-
-    log_success "VPS initialization complete!"
-    echo
-    echo "=================================================="
-    echo "Server Details:"
-    echo "  VPS Public IP: $vps_ip"
-    echo "  SSH Port: $ssh_port"
-    echo "  WireGuard IP: $VPS_WG_IP"
-    echo "  WireGuard Port: $WG_PORT"
-    echo "  Server Public Key: $server_public"
-    echo
-    echo "Staging User:"
-    echo "  Username: $STAGING_USER"
-    echo "  Password: $staging_password"
-    echo
-    echo "Security Configuration:"
-    echo "  - Password auth enabled ONLY for staging user"
-    echo "  - Interactive shell disabled for staging user"
-    echo "  - Staging user limited to SCP file transfers"
-    echo "  - Access restricted to registry directories only"
-    echo "  - WSL machines will use key-based authentication only"
-    echo "  - SSH backup saved at: /etc/ssh/sshd_config.backup"
-    echo
-    echo "Next Steps:"
-    echo "  1. On WSL machines, run: $register_cmd"
-    echo "  2. Approve machines with: ./connector approve"
-    echo "=================================================="
+    d=$(cd -P "$(dirname "$s")" >/dev/null 2>&1 && pwd)
+    printf '%s/%s\n' "$d" "$(basename "$s")"
 }
 
-# REGISTER: Register machine to VPS
-cmd_register() {
-    local reg_type=""
-    local vps_ip=""
-    local staging_password=""
-    local ssh_port="22"
-    
-    # First argument must be type
-    if [ -z "$1" ]; then
-        log_error "Usage: connector register <provider|consumer> <vps-ip> [staging-password] [-p|--port <port>]"
-        log_error "Example: connector register provider 203.0.113.1 -p 2222"
-        log_error "Example: connector register consumer 203.0.113.1 -p 2222"
-        exit 1
-    fi
-    
-    reg_type="$1"
-    shift
-    
-    # Validate type
-    if [ "$reg_type" != "provider" ] && [ "$reg_type" != "consumer" ]; then
-        log_error "Invalid registration type: $reg_type"
-        log_error "Type must be either 'provider' or 'consumer'"
-        log_error "Usage: connector register <provider|consumer> <vps-ip> [staging-password] [-p|--port <port>]"
-        exit 1
-    fi
-    
-    # Parse remaining arguments
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -p|--port)
-                ssh_port="$2"
-                shift 2
-                ;;
-            *)
-                if [ -z "$vps_ip" ]; then
-                    vps_ip="$1"
-                elif [ -z "$staging_password" ]; then
-                    staging_password="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
+# Extract a top-level JSON string field ("field":"value") from stdin.
+json_str() {
+    sed -n 's/.*"'"$1"'":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+}
 
-    if [ -z "$vps_ip" ]; then
-        log_error "Usage: connector register <provider|consumer> <vps-ip> [staging-password] [-p|--port <port>]"
-        log_error "Example: connector register provider 203.0.113.1 -p 2222"
-        log_error "Example: connector register consumer 203.0.113.1 -p 2222"
-        exit 1
+# --- Role detection ----------------------------------------------------------
+is_cnc()        { have headscale && [ -f "$HEADSCALE_CONFIG" ]; }
+is_controller() { [ -f "$CNC_LINK_FILE" ]; }
+is_admin()      { is_cnc || is_controller; }
+
+node_role()   { [ -f "$ROLE_FILE" ] && cat "$ROLE_FILE" 2>/dev/null || true; }
+is_provider() { case "$(node_role)" in provider|both) return 0 ;; *) return 1 ;; esac; }
+is_consumer() { case "$(node_role)" in consumer|both) return 0 ;; *) return 1 ;; esac; }
+is_node()     { have tailscale && tailscale status >/dev/null 2>&1; }
+
+current_roles() {
+    local roles=()
+    is_cnc        && roles+=("cnc")
+    is_controller && roles+=("controller")
+    is_provider   && roles+=("provider")
+    is_consumer   && roles+=("consumer")
+    if [ "${#roles[@]}" -eq 0 ]; then
+        if is_node; then roles+=("node (untagged)"); else roles+=("unconfigured"); fi
     fi
+    echo "${roles[*]}"
+}
 
-    log_info "Registering $reg_type machine to VPS $vps_ip..."
+# --- CNC link state ----------------------------------------------------------
+CNC_SSH=""; CNC_URL=""; CNC_PORT=""; CNC_USER=""
 
-    # Install dependencies on Arch Linux
-    if is_arch; then
-        log_info "Detected Arch Linux, installing dependencies..."
-        if ! command -v wg &> /dev/null || ! command -v ssh &> /dev/null; then
-            sudo pacman -Sy --noconfirm wireguard-tools openssh
+load_cnc_link() {
+    [ -f "$CNC_LINK_FILE" ] || die "No CNC linked. Run: connector link <user@host> --url https://..."
+    # shellcheck disable=SC1090
+    . "$CNC_LINK_FILE"
+    CNC_USER="${CNC_SSH%@*}"
+    [ "$CNC_USER" = "$CNC_SSH" ] && CNC_USER="$(id -un)"
+}
+
+save_cnc_link() {
+    local ssh_target="$1" url="$2" port="${3:-}"
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+    {
+        echo "CNC_SSH=\"$ssh_target\""
+        echo "CNC_URL=\"$url\""
+        echo "CNC_PORT=\"$port\""
+    } > "$CNC_LINK_FILE"
+    chmod 600 "$CNC_LINK_FILE"
+}
+
+_ssh_port_flag() { [ -n "${CNC_PORT:-}" ] && printf -- '-p %s' "$CNC_PORT" || true; }
+_scp_port_flag() { [ -n "${CNC_PORT:-}" ] && printf -- '-P %s' "$CNC_PORT" || true; }
+
+# Run an arbitrary command on the CNC over SSH (as the linked admin user).
+ssh_cnc() {
+    load_cnc_link
+    # shellcheck disable=SC2046,SC2086
+    ssh -o ConnectTimeout=10 $(_ssh_port_flag) "$CNC_SSH" "$@"
+}
+
+# Run a headscale command against the CNC: locally if we are it, else over SSH.
+hs() {
+    if is_cnc; then
+        as_root headscale "$@"
+    elif is_controller; then
+        load_cnc_link
+        if [ "$CNC_USER" = "root" ]; then
+            ssh_cnc headscale "$@"
+        else
+            ssh_cnc sudo headscale "$@"
         fi
     else
-        log_warn "Non-Arch Linux detected. Ensure wireguard-tools and openssh are installed."
+        die "Not a CNC and no CNC linked. Run 'connector cnc-init <host> --url ...' or 'connector link <host> --url ...'."
     fi
+}
 
-    # Create local config directory
-    mkdir -p "$WSL_CONNECTOR_DIR"
-    chmod 700 "$WSL_CONNECTOR_DIR"
-
-    # Generate machine ID
-    local machine_id=$(generate_machine_id)
-    echo "$machine_id" > "$WSL_CONNECTOR_DIR/machine-id"
-    log_success "Generated machine ID: $machine_id"
-
-    # Generate WireGuard keys
-    log_info "Generating WireGuard keypair..."
-    local wg_private=$(wg genkey)
-    local wg_public=$(echo "$wg_private" | wg pubkey)
-    echo "$wg_private" > "$WSL_CONNECTOR_DIR/wg-private-key"
-    chmod 600 "$WSL_CONNECTOR_DIR/wg-private-key"
-
-    # Generate SSH key if not exists
-    local ssh_key="$HOME/.ssh/wsl-to-vps"
-    if [ ! -f "$ssh_key" ]; then
-        log_info "Generating SSH keypair..."
-        ssh-keygen -t ed25519 -f "$ssh_key" -N "" -C "$machine_id@wsl"
+# Print the CNC's server_url (from local config or the saved link).
+cnc_server_url() {
+    if is_cnc; then
+        sed -n 's/^server_url:[[:space:]]*//p' "$HEADSCALE_CONFIG" 2>/dev/null | head -n1
+    elif is_controller; then
+        load_cnc_link; printf '%s\n' "$CNC_URL"
     fi
-    local ssh_pubkey=$(cat "$ssh_key.pub")
+}
 
-    # Collect machine info
-    local hostname=$(cat /etc/hostname 2>/dev/null || echo "${HOSTNAME:-unknown}")
-    local username=$(whoami)
-    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# Resolve a node name (or numeric id) to a headscale node id.
+resolve_node_id() {
+    local node="$1" out id
+    case "$node" in
+        ''|*[!0-9]*) ;;                 # not purely numeric -> look up by name
+        *) printf '%s\n' "$node"; return 0 ;;
+    esac
+    out="$(hs nodes list --output json 2>/dev/null)" || return 1
+    id="$(printf '%s' "$out" | tr '{}' '\n\n' \
+         | grep -E "\"(name|given_name)\":\"$node\"" | head -n1 \
+         | sed -n 's/.*"id":[[:space:]]*"\{0,1\}\([0-9]\+\).*/\1/p')"
+    [ -n "$id" ] && printf '%s\n' "$id"
+}
 
-    # Create registration JSON
-    local reg_json=$(cat <<EOF
+# --- CNC: install + configure headscale -------------------------------------
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv6l) echo "arm" ;;
+        *) die "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+
+install_headscale() {
+    if have headscale; then
+        log_info "headscale already installed"
+        return 0
+    fi
+    local ver="${HEADSCALE_VERSION:-}"
+    if [ -z "$ver" ]; then
+        log_info "Resolving latest headscale release..."
+        ver="$(curl -fsSL https://api.github.com/repos/juanfont/headscale/releases/latest | json_str tag_name)"
+    fi
+    [ -n "$ver" ] || die "Could not determine headscale version (set HEADSCALE_VERSION=vX.Y.Z)"
+    local arch num tmp
+    arch="$(detect_arch)"; num="${ver#v}"; tmp="$(mktemp -d)"
+    if have apt-get; then
+        log_info "Installing headscale ${ver} (.deb, ${arch})..."
+        curl -fsSL -o "$tmp/headscale.deb" \
+            "https://github.com/juanfont/headscale/releases/download/${ver}/headscale_${num}_linux_${arch}.deb"
+        as_root apt-get update -y
+        as_root apt-get install -y "$tmp/headscale.deb"
+    else
+        log_info "Installing headscale ${ver} (binary, ${arch})..."
+        curl -fsSL -o "$tmp/headscale" \
+            "https://github.com/juanfont/headscale/releases/download/${ver}/headscale_${num}_linux_${arch}"
+        as_root install -m 0755 "$tmp/headscale" "$HEADSCALE_BIN"
+        install_headscale_service
+    fi
+    rm -rf "$tmp"
+}
+
+install_headscale_service() {
+    log_info "Creating headscale systemd unit..."
+    as_root mkdir -p "$HEADSCALE_LIB" /etc/headscale
+    as_root tee /etc/systemd/system/headscale.service >/dev/null <<EOF
+[Unit]
+Description=headscale controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${HEADSCALE_BIN} serve
+Restart=always
+RestartSec=5
+WorkingDirectory=${HEADSCALE_LIB}
+RuntimeDirectory=headscale
+StateDirectory=headscale
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    as_root systemctl daemon-reload
+}
+
+write_headscale_config() {
+    local url="$1" base_domain="$2" host scheme listen_addr tls_block
+    host="${url#*://}"; host="${host%%/*}"; host="${host%%:*}"
+    scheme="${url%%://*}"
+    if [ "$scheme" = "https" ]; then
+        listen_addr="0.0.0.0:443"
+        tls_block=$(printf 'tls_letsencrypt_hostname: "%s"\ntls_letsencrypt_cache_dir: %s/cache\ntls_letsencrypt_challenge_type: TLS-ALPN-01' "$host" "$HEADSCALE_LIB")
+    else
+        listen_addr="0.0.0.0:8080"
+        tls_block='tls_letsencrypt_hostname: ""'
+        log_warn "URL is not https; headscale will serve plain HTTP on :8080 (clients need an https endpoint or a TLS proxy)."
+    fi
+    as_root mkdir -p /etc/headscale "$HEADSCALE_LIB"
+    as_root tee "$HEADSCALE_CONFIG" >/dev/null <<EOF
+# Generated by connector $(date -u +%Y-%m-%dT%H:%M:%SZ)
+server_url: ${url}
+listen_addr: ${listen_addr}
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+
+noise:
+  private_key_path: ${HEADSCALE_LIB}/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: "headscale"
+    region_name: "Connector Embedded DERP"
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: ${HEADSCALE_LIB}/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 24h
+
+disable_check_updates: true
+
+database:
+  type: sqlite
+  sqlite:
+    path: ${HEADSCALE_LIB}/db.sqlite
+
+${tls_block}
+
+log:
+  level: info
+  format: text
+
+policy:
+  mode: file
+  path: ${HEADSCALE_ACL}
+
+dns:
+  magic_dns: true
+  base_domain: ${base_domain}
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 1.0.0.1
+  search_domains: []
+
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+EOF
+    as_root chmod 644 "$HEADSCALE_CONFIG"
+}
+
+write_acl() {
+    as_root mkdir -p /etc/headscale
+    as_root tee "$HEADSCALE_ACL" >/dev/null <<EOF
 {
-  "machine_id": "$machine_id",
-  "type": "$reg_type",
-  "timestamp": "$timestamp",
-  "hostname": "$hostname",
-  "username": "$username",
-  "wg_pubkey": "$wg_public",
-  "ssh_pubkey": "$ssh_pubkey",
-  "request_note": "Machine registration ($reg_type)"
+  "tagOwners": {
+    "tag:provider": ["${HEADSCALE_USER}"],
+    "tag:consumer": ["${HEADSCALE_USER}"]
+  },
+  "acls": [
+    { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider:*"] }
+  ],
+  "ssh": [
+    {
+      "action": "accept",
+      "src": ["tag:consumer"],
+      "dst": ["tag:provider"],
+      "users": ["autogroup:nonroot"]
+    }
+  ]
 }
 EOF
-)
-
-    # Save registration locally
-    echo "$reg_json" > "$WSL_CONNECTOR_DIR/registration.json"
-    
-    # Save VPS connection info for finalize
-    cat > "$WSL_CONNECTOR_DIR/vps-info" <<EOF
-VPS_IP=$vps_ip
-SSH_PORT=$ssh_port
-EOF
-    chmod 600 "$WSL_CONNECTOR_DIR/vps-info"
-
-    # Upload registration to VPS
-    log_info "Uploading registration to VPS (port $ssh_port)..."
-    local temp_file="/tmp/${machine_id}.json"
-    echo "$reg_json" > "$temp_file"
-    
-    # Check if sshpass is available
-    if command -v sshpass &> /dev/null; then
-        # Prompt for staging password if not provided and sshpass is available
-        if [ -z "$staging_password" ]; then
-            read -sp "Enter staging user password: " staging_password
-            echo
-        fi
-        
-        log_info "Using sshpass for authentication..."
-        local scp_output
-        if scp_output=$(sshpass -p "$staging_password" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>&1); then
-            rm "$temp_file"
-            log_success "Registration uploaded successfully!"
-        else
-            log_error "Upload failed. Error details:"
-            echo "$scp_output" >&2
-            log_error "Check VPS IP, port ($ssh_port), password, and network connectivity."
-            rm "$temp_file"
-            exit 1
-        fi
-    else
-        # Fallback to interactive SCP
-        log_info "sshpass not installed. Using interactive SCP..."
-        log_info "You will be prompted for the staging user password."
-        
-        local scp_output
-        if scp_output=$(scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$temp_file" "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/pending/${machine_id}.json" 2>&1); then
-            rm "$temp_file"
-            log_success "Registration uploaded successfully!"
-        else
-            log_error "Upload failed. Error details:"
-            echo "$scp_output" >&2
-            log_error "Check VPS IP, port ($ssh_port), and network connectivity."
-            rm "$temp_file"
-            exit 1
-        fi
-    fi
-
-    echo
-    echo "=================================================="
-    echo "Registration Complete!"
-    echo
-    echo "  Machine ID: $machine_id"
-    echo "  Type: $reg_type"
-    echo "  Status: Waiting for approval"
-    echo
-    echo "Next Steps:"
-    echo "  1. Contact VPS admin to approve this machine"
-    echo "  2. Provide them with machine ID: $machine_id"
-    echo "  3. After approval, run: ./connector finalize $reg_type $machine_id"
-    echo "=================================================="
+    as_root chmod 644 "$HEADSCALE_ACL"
 }
 
-# APPROVE: Approve pending WSL machine
-cmd_approve() {
-    local machine_id="$1"
-    require_root
-
-    if ! is_vps; then
-        log_error "This command must be run on the VPS"
-        exit 1
-    fi
-
-    require_package jq
-
-    # List pending registrations if no machine_id provided
-    if [ -z "$machine_id" ]; then
-        log_info "Pending registrations:"
-        echo
-        local count=0
-        for file in "$REGISTRY_DIR/pending"/*.json; do
-            [ -f "$file" ] || continue
-            count=$((count + 1))
-            local mid=$(basename "$file" .json)
-            local hostname=$(jq -r '.hostname' "$file")
-            local username=$(jq -r '.username' "$file")
-            local timestamp=$(jq -r '.timestamp' "$file")
-            local reg_type=$(jq -r '.type // "provider"' "$file")
-            local type_label="COMPUTE PROVIDER"
-            if [ "$reg_type" = "consumer" ]; then
-                type_label="COMPUTE CONSUMER"
-            fi
-            echo "  [$count] $mid ($type_label)"
-            echo "      Host: $hostname | User: $username | Time: $timestamp"
-            echo
-        done
-
-        if [ $count -eq 0 ]; then
-            log_warn "No pending registrations found"
-            exit 0
-        fi
-
-        read -p "Enter machine ID to approve: " machine_id
-    fi
-
-    # Validate registration exists
-    local reg_file="$REGISTRY_DIR/pending/${machine_id}.json"
-    if [ ! -f "$reg_file" ]; then
-        log_error "Registration not found: $machine_id"
-        exit 1
-    fi
-
-    log_info "Approving machine: $machine_id"
-
-    # Parse registration
-    local hostname=$(jq -r '.hostname' "$reg_file")
-    local username=$(jq -r '.username' "$reg_file")
-    local wg_pubkey=$(jq -r '.wg_pubkey' "$reg_file")
-    local ssh_pubkey=$(jq -r '.ssh_pubkey' "$reg_file")
-    local reg_type=$(jq -r '.type // "provider"' "$reg_file")
-
-    # Allocate IP
-    local client_ip=$(get_next_ip)
-    log_success "Assigned IP: $client_ip"
-
-    # Add peer to WireGuard config
-    log_info "Adding WireGuard peer..."
-    cat >> "$WG_CONFIG_DIR/$WG_INTERFACE.conf" <<EOF
-
-# $machine_id ($hostname)
-[Peer]
-PublicKey = $wg_pubkey
-AllowedIPs = $client_ip/32
-EOF
-
-    # Reload WireGuard
-    wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE")
-    log_success "WireGuard configuration updated"
-
-    # Generate client config
-    log_info "Generating client configuration..."
-    local server_public=$(cat "$WG_CONFIG_DIR/server_public.key")
-    local server_endpoint=$(curl -s ifconfig.me || echo "YOUR_VPS_IP")
-    
-    # Handle SSH key configuration based on type
-    if [ "$reg_type" = "provider" ]; then
-        # For providers: Get VPS root SSH public key (so VPS can SSH to provider)
-        log_info "Configuring provider access (VPS -> provider)..."
-        local vps_ssh_pubkey=""
-        if [ -f /root/.ssh/id_rsa.pub ]; then
-            vps_ssh_pubkey=$(cat /root/.ssh/id_rsa.pub)
-        elif [ -f /root/.ssh/id_ed25519.pub ]; then
-            vps_ssh_pubkey=$(cat /root/.ssh/id_ed25519.pub)
-        else
-            # Generate SSH key for VPS if it doesn't exist
-            log_info "Generating SSH keypair for VPS root..."
-            ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -C "root@vps-connector"
-            vps_ssh_pubkey=$(cat /root/.ssh/id_ed25519.pub)
-        fi
-
-        # Create config with VPS SSH key for provider to add
-        cat > "$REGISTRY_DIR/configs/${machine_id}.conf" <<EOF
-[Interface]
-Address = $client_ip/32
-PrivateKey = PLACEHOLDER_PRIVATE_KEY
-
-[Peer]
-PublicKey = $server_public
-Endpoint = ${server_endpoint}:${WG_PORT}
-AllowedIPs = ${WG_SUBNET}
-PersistentKeepalive = 25
-
-# VPS SSH Public Key (add this to ~/.ssh/authorized_keys on provider)
-# VPS_SSH_KEY=$vps_ssh_pubkey
-EOF
+open_firewall() {
+    if have ufw; then
+        as_root ufw allow 443/tcp   >/dev/null 2>&1 || true
+        as_root ufw allow 3478/udp  >/dev/null 2>&1 || true
+        as_root ufw allow 41641/udp >/dev/null 2>&1 || true
+        log_success "ufw rules added (443/tcp, 3478/udp, 41641/udp)"
+    elif have firewall-cmd; then
+        as_root firewall-cmd --permanent --add-port=443/tcp   >/dev/null 2>&1 || true
+        as_root firewall-cmd --permanent --add-port=3478/udp  >/dev/null 2>&1 || true
+        as_root firewall-cmd --permanent --add-port=41641/udp >/dev/null 2>&1 || true
+        as_root firewall-cmd --reload >/dev/null 2>&1 || true
+        log_success "firewalld rules added (443/tcp, 3478/udp, 41641/udp)"
     else
-        # For consumers: Add consumer SSH key to VPS authorized_keys
-        log_info "Configuring consumer access (consumer -> VPS)..."
-        mkdir -p /root/.ssh
-        chmod 700 /root/.ssh
-        touch /root/.ssh/authorized_keys
-        chmod 600 /root/.ssh/authorized_keys
-        
-        # Add consumer key to VPS if not already present
-        if ! grep -q -F "$ssh_pubkey" /root/.ssh/authorized_keys 2>/dev/null; then
-            echo "$ssh_pubkey" >> /root/.ssh/authorized_keys
-            log_success "Consumer SSH key added to VPS authorized_keys"
-        else
-            log_info "Consumer SSH key already in VPS authorized_keys"
-        fi
-
-        # Create config without VPS SSH key (consumer doesn't accept SSH)
-        cat > "$REGISTRY_DIR/configs/${machine_id}.conf" <<EOF
-[Interface]
-Address = $client_ip/32
-PrivateKey = PLACEHOLDER_PRIVATE_KEY
-
-[Peer]
-PublicKey = $server_public
-Endpoint = ${server_endpoint}:${WG_PORT}
-AllowedIPs = ${WG_SUBNET}
-PersistentKeepalive = 25
-EOF
+        log_warn "No ufw/firewalld found. Open manually: 443/tcp, 3478/udp, 41641/udp"
     fi
-
-    chmod 644 "$REGISTRY_DIR/configs/${machine_id}.conf"
-
-    # Create approval record
-    local approved_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    jq --arg ip "$client_ip" \
-       --arg approved "$approved_at" \
-       '. + {wg_ip: $ip, approved_at: $approved}' \
-       "$reg_file" > "$REGISTRY_DIR/approved/${machine_id}.json"
-
-    # Move from pending to approved
-    rm "$reg_file"
-    log_success "Machine approved and moved to approved registry"
-
-    echo
-    echo "=================================================="
-    echo "Approval Complete!"
-    echo
-    echo "  Machine ID: $machine_id"
-    echo "  Type: $reg_type"
-    echo "  Hostname: $hostname"
-    echo "  Username: $username"
-    echo "  Assigned IP: $client_ip"
-    echo
-    echo "Client Instructions:"
-    echo "  Have the client run: ./connector finalize $reg_type $machine_id"
-    echo
-    if [ "$reg_type" = "provider" ]; then
-        echo "After finalization, SSH access from VPS:"
-        echo "  ssh $username@$client_ip"
-    else
-        echo "After finalization, consumer can SSH to VPS:"
-        echo "  ssh root@<vps-public-ip>"
-        echo "  Then SSH to any provider: ssh <user>@<provider-ip>"
-    fi
-    echo "=================================================="
 }
 
-# Helper function: Finalize provider setup (with SSH hardening)
-finalize_provider() {
-    local token="$1"
-    local assigned_ip="$2"
-    local vps_endpoint="$3"
-    local ssh_port="${4:-22}"
-    
-    # Setup SSH authorized_keys for VPS to connect
-    log_info "Configuring SSH access from VPS..."
-    
-    # Extract VPS SSH public key from config file (need sudo to read)
-    local vps_ssh_key=$(sudo grep "^# VPS_SSH_KEY=" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | sed 's/^# VPS_SSH_KEY=//')
-    
-    if [ -n "$vps_ssh_key" ]; then
-        mkdir -p "$HOME/.ssh"
-        chmod 700 "$HOME/.ssh"
-        
-        # Add VPS public key to authorized_keys if not already present
-        if [ ! -f "$HOME/.ssh/authorized_keys" ] || ! grep -q -F "$vps_ssh_key" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
-            echo "$vps_ssh_key" >> "$HOME/.ssh/authorized_keys"
-            chmod 600 "$HOME/.ssh/authorized_keys"
-            log_success "VPS SSH key added to authorized_keys"
-            log_info "VPS can now SSH as: $(whoami)@<provider-ip>"
-        else
-            log_info "VPS SSH key already in authorized_keys"
-        fi
+ensure_headscale_user() {
+    if as_root headscale users list 2>/dev/null | grep -qw "$HEADSCALE_USER"; then
+        log_info "headscale user '$HEADSCALE_USER' already exists"
     else
-        log_error "Could not find VPS SSH key in configuration"
-        log_error "VPS will not be able to SSH to this machine without password"
-        log_warn "Manual fix: On VPS run: cat /root/.ssh/id_ed25519.pub"
-        log_warn "Then add that key to ~/.ssh/authorized_keys on this provider machine"
+        as_root headscale users create "$HEADSCALE_USER" >/dev/null 2>&1 \
+            || log_warn "Could not create headscale user '$HEADSCALE_USER' (may already exist)"
+        log_success "headscale user '$HEADSCALE_USER' ready"
     fi
-    
-    # Harden SSH configuration
-    log_info "Hardening SSH configuration..."
-    
-    # Backup sshd_config if not already backed up
-    if [ ! -f /etc/ssh/sshd_config.backup ]; then
-        sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-    fi
-    
-    # Remove any existing WSL connector hardening
-    sudo sed -i '/# WSL connector security hardening/,/^$/d' /etc/ssh/sshd_config
-    
-    # Add hardened configuration for current user
-    sudo bash -c "cat >> /etc/ssh/sshd_config" <<EOF
-
-# WSL connector security hardening
-Match User $(whoami) Address 10.0.0.0/24
-    PasswordAuthentication no
-    PubkeyAuthentication yes
-    PermitRootLogin no
-EOF
-    
-    # Test SSH configuration
-    if sudo sshd -t; then
-        log_success "SSH hardened: only accessible via WireGuard with key authentication"
-    else
-        log_error "SSH configuration has errors. Restoring backup..."
-        sudo cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
-        exit 1
-    fi
-    
-    # Note: We rely on SSH Match rules rather than firewall DROP rules
-    # to avoid accidentally locking users out if WireGuard goes down
-    log_info "SSH is now restricted to WireGuard network access only"
-
-    # Enable systemd in WSL
-    log_info "Configuring WSL systemd..."
-    if [ ! -f /etc/wsl.conf ] || ! grep -q "systemd=true" /etc/wsl.conf; then
-        sudo bash -c 'cat > /etc/wsl.conf' <<'EOF'
-[boot]
-systemd=true
-
-[network]
-generateResolvConf = true
-EOF
-        log_warn "WSL systemd enabled. You need to restart WSL: run 'wsl --shutdown' in Windows"
-        log_warn "After restarting WSL, run this command again to complete setup"
-        exit 0
-    fi
-    
-    # Enable SSH service
-    log_info "Enabling SSH service..."
-    sudo systemctl enable sshd 2>&1 || log_warn "Could not enable SSH service"
-    
-    log_info "Starting SSH..."
-    if ! timeout 5 sudo systemctl start sshd 2>&1; then
-        log_warn "SSH failed to start or timed out"
-    else
-        log_success "SSH started"
-    fi
-    
-    # Restart SSH to apply hardening rules
-    log_info "Restarting SSH to apply security hardening..."
-    if sudo systemctl restart sshd 2>&1; then
-        log_success "SSH restarted with hardened configuration"
-    else
-        log_warn "Could not restart SSH. Hardening rules may not be active."
-    fi
-    
-    # Build ProxyJump command with proper port
-    local proxyjump_host="root@$vps_endpoint"
-    if [ "$ssh_port" != "22" ]; then
-        proxyjump_host="root@$vps_endpoint:$ssh_port"
-    fi
-    
-    echo
-    echo "=================================================="
-    echo "Provider Setup Complete!"
-    echo
-    echo "  Machine ID: $token"
-    echo "  WireGuard IP: $assigned_ip"
-    echo "  VPS WireGuard IP: $VPS_WG_IP"
-    echo "  VPS Public IP: $vps_endpoint"
-    if [ "$ssh_port" != "22" ]; then
-        echo "  VPS SSH Port: $ssh_port"
-    fi
-    echo
-    echo "Connection Status:"
-    sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
-    echo
-    echo "Security Status:"
-    echo "  - SSH restricted to WireGuard network (10.0.0.0/24)"
-    echo "  - Password authentication disabled"
-    echo "  - Key-based authentication only"
-    echo "  - Root login disabled"
-    echo
-    echo "SSH Access:"
-    echo "  From VPS directly:"
-    echo "    ssh $(whoami)@$assigned_ip"
-    echo
-    echo "  From your main machine (through VPS):"
-    echo "    ssh -J $proxyjump_host $(whoami)@$assigned_ip"
-    echo
-    # Get hostname safely
-    local wsl_hostname=$(cat /etc/hostname 2>/dev/null || echo "wsl")
-    
-    echo "  Or add to ~/.ssh/config on main machine:"
-    echo "    Host wsl-$wsl_hostname"
-    echo "      HostName $assigned_ip"
-    echo "      User $(whoami)"
-    echo "      ProxyJump $proxyjump_host"
-    echo
-    echo "  Then simply: ssh wsl-$wsl_hostname"
-    echo
-    echo "  Check status: ./connector status"
-    echo "=================================================="
 }
 
-# Helper function: Finalize consumer setup (without SSH hardening)
-finalize_consumer() {
-    local token="$1"
-    local assigned_ip="$2"
-    local vps_endpoint="$3"
-    local ssh_port="$4"
-    
-    log_info "Consumer setup - skipping SSH configuration (not needed)"
-    
-    # Build SSH command with proper key and port
-    local ssh_key="$HOME/.ssh/wsl-to-vps"
-    local ssh_cmd="ssh -i $ssh_key"
-    if [ "$ssh_port" != "22" ]; then
-        ssh_cmd="$ssh_cmd -p $ssh_port"
-    fi
-    ssh_cmd="$ssh_cmd root@$vps_endpoint"
-    
-    # Get hostname for SSH config
-    local consumer_hostname=$(cat /etc/hostname 2>/dev/null || hostname 2>/dev/null || echo "consumer")
-    
+cnc_init_local() {
+    local url="$1" base_domain="$2"
+    require_root cnc-init
+    [ -n "$url" ] || die "Usage: connector cnc-init --url https://vpn.example.com"
+    [ -n "$base_domain" ] || base_domain="connector.mesh"
+
+    log_info "Initialising CNC (headscale) for ${url} (MagicDNS base: ${base_domain})"
+    have curl || as_root apt-get install -y curl >/dev/null 2>&1 || true
+    install_headscale
+    write_headscale_config "$url" "$base_domain"
+    write_acl
+    log_info "Enabling + starting headscale..."
+    as_root systemctl enable --now headscale >/dev/null 2>&1 || as_root systemctl restart headscale
+    sleep 2
+    ensure_headscale_user
+    open_firewall
+
     echo
-    echo "=================================================="
-    echo "Consumer Setup Complete!"
-    echo
-    echo "  Machine ID: $token"
-    echo "  WireGuard IP: $assigned_ip"
-    echo "  VPS WireGuard IP: $VPS_WG_IP"
-    echo "  VPS Public IP: $vps_endpoint"
-    if [ "$ssh_port" != "22" ]; then
-        echo "  VPS SSH Port: $ssh_port"
-    fi
-    echo "  SSH Key: $ssh_key"
-    echo
-    echo "Connection Status:"
-    sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "WireGuard not running"
-    echo
-    echo "SSH Access to VPS:"
-    echo "  $ssh_cmd"
-    echo
-    echo "  Then from VPS, SSH to any provider machine:"
-    echo "  ssh <user>@<provider-ip>"
-    echo
-    echo "Or add to ~/.ssh/config on this consumer machine:"
-    echo "  Host vps-$consumer_hostname"
-    echo "    HostName $vps_endpoint"
-    if [ "$ssh_port" != "22" ]; then
-        echo "    Port $ssh_port"
-    fi
-    echo "    User root"
-    echo "    IdentityFile $ssh_key"
-    echo
-    echo "  Then simply: ssh vps-$consumer_hostname"
-    echo
-    echo "  Check WireGuard status: sudo wg show"
-    echo "=================================================="
+    log_success "CNC ready at ${url}"
+    echo "Next: authorize a machine:"
+    echo "    connector invite            # choose provider/consumer; prints a register command"
 }
 
-# FINALIZE: Complete setup after approval
-cmd_finalize() {
-    local fin_type=""
-    local token=""
-    local vps_ip=""
-    local staging_password=""
-    local ssh_port="22"
-    
-    # First argument must be type
-    if [ -z "$1" ]; then
-        log_error "Usage: connector finalize <provider|consumer> <token> [staging-password] [-p|--port <port>]"
-        log_error "Example: connector finalize provider wsl-abc12345 -p 2222"
-        log_error "Example: connector finalize consumer wsl-xyz78910 -p 2222"
-        exit 1
+# --- cnc-init dispatcher + remote orchestration + link ----------------------
+cmd_cnc_init() {
+    local host="" url="" port="" base_domain=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --url)         url="$2"; shift 2 ;;
+            --base-domain) base_domain="$2"; shift 2 ;;
+            -p|--port)     port="$2"; shift 2 ;;
+            -*) die "Unknown option: $1" ;;
+            *) [ -z "$host" ] && host="$1" || die "Unexpected argument: $1"; shift ;;
+        esac
+    done
+    if [ -n "$host" ]; then
+        cnc_init_remote "$host" "$url" "$port"
+    else
+        cnc_init_local "$url" "$base_domain"
     fi
-    
-    fin_type="$1"
-    shift
-    
-    # Validate type
-    if [ "$fin_type" != "provider" ] && [ "$fin_type" != "consumer" ]; then
-        log_error "Invalid finalization type: $fin_type"
-        log_error "Type must be either 'provider' or 'consumer'"
-        log_error "Usage: connector finalize <provider|consumer> <token> [staging-password] [-p|--port <port>]"
-        exit 1
+}
+
+cnc_init_remote() {
+    local host="$1" url="$2" port="$3" sshflag scpflag self
+    [ -n "$url" ] || die "Usage: connector cnc-init <user@host> --url https://vpn.example.com [-p port]"
+    have ssh || die "ssh not found"; have scp || die "scp not found"
+    sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
+    scpflag="$([ -n "$port" ] && echo "-P $port" || true)"
+
+    log_info "Checking SSH access to $host..."
+    # shellcheck disable=SC2086
+    ssh -o ConnectTimeout=10 $sshflag "$host" true || die "Cannot SSH to $host"
+
+    # shellcheck disable=SC2086
+    if ssh $sshflag "$host" 'test -f /etc/headscale/config.yaml && systemctl is-active --quiet headscale' 2>/dev/null; then
+        log_info "CNC already configured on $host; skipping install."
+    else
+        log_info "Copying connector to $host and running cnc-init..."
+        self="$(self_path)"
+        # shellcheck disable=SC2086
+        scp $scpflag "$self" "$host:/tmp/connector.$$" >/dev/null
+        # shellcheck disable=SC2086
+        ssh $sshflag "$host" "sudo install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$"
+        # shellcheck disable=SC2086
+        ssh -t $sshflag "$host" "sudo ${CONNECTOR_BIN} cnc-init --url '$url'" || die "Remote cnc-init failed"
     fi
-    
-    # Parse remaining arguments
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -p|--port)
-                ssh_port="$2"
-                shift 2
-                ;;
-            *)
-                if [ -z "$token" ]; then
-                    token="$1"
-                elif [ -z "$staging_password" ]; then
-                    staging_password="$1"
-                fi
-                shift
-                ;;
+
+    save_cnc_link "$host" "$url" "$port"
+    log_success "Linked to CNC $host (this machine is now a controller)."
+
+    echo
+    echo "Register this machine on the tailnet?"
+    echo "  [1] provider   [2] consumer   (enter '1 2' for both)   [s] skip"
+    local choice; read -r -p "Choose: " choice || choice="s"
+    local type=""
+    case "$(echo "$choice" | tr -d ' ')" in
+        1)        type="provider" ;;
+        2)        type="consumer" ;;
+        12|21)    type="both" ;;
+        ''|s|S)   type="" ;;
+        *) log_warn "Unrecognised choice; skipping." ;;
+    esac
+    if [ -n "$type" ]; then
+        local key; key="$(mint_key "$type")"
+        cmd_register "$type" "$url" --authkey "$key" --yes
+    else
+        log_info "Skipped. Invite machines later with: connector invite"
+    fi
+}
+
+cmd_link() {
+    local host="" url="" port="" sshflag
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --url)     url="$2"; shift 2 ;;
+            -p|--port) port="$2"; shift 2 ;;
+            -*) die "Unknown option: $1" ;;
+            *) [ -z "$host" ] && host="$1" || die "Unexpected argument: $1"; shift ;;
+        esac
+    done
+    [ -n "$host" ] && [ -n "$url" ] || die "Usage: connector link <user@host> --url https://vpn.example.com [-p port]"
+    sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
+    log_info "Verifying CNC at $host..."
+    # shellcheck disable=SC2086
+    ssh -o ConnectTimeout=10 $sshflag "$host" 'test -f /etc/headscale/config.yaml' \
+        || die "$host is not a configured CNC (no /etc/headscale/config.yaml)"
+    save_cnc_link "$host" "$url" "$port"
+    log_success "Linked to CNC $host. This machine is now a controller."
+    echo "Try: connector list"
+}
+
+# --- Invite ------------------------------------------------------------------
+hs_user_id() {
+    local out id
+    out="$(hs users list --output json 2>/dev/null)" || return 1
+    id="$(printf '%s' "$out" | tr '{}' '\n\n' \
+         | grep "\"name\":\"$HEADSCALE_USER\"" | head -n1 \
+         | sed -n 's/.*"id":[[:space:]]*"\{0,1\}\([0-9]\+\).*/\1/p')"
+    [ -n "$id" ] && printf '%s\n' "$id"
+}
+
+# Mint a single-use, short-expiry pre-auth key for a type; echo the key.
+mint_key() {
+    local type="$1" tags user uid out key
+    case "$type" in
+        provider) tags="tag:provider" ;;
+        consumer) tags="tag:consumer" ;;
+        both)     tags="tag:provider,tag:consumer" ;;
+        *) die "Invalid type: $type" ;;
+    esac
+    user="$HEADSCALE_USER"
+    uid="$(hs_user_id 2>/dev/null || true)"
+    [ -n "$uid" ] && user="$uid"
+    out="$(hs preauthkeys create --user "$user" --tags "$tags" --expiration "$KEY_EXPIRY" --output json 2>/dev/null)" \
+        || die "Failed to create pre-auth key on CNC"
+    key="$(printf '%s' "$out" | json_str key)"
+    [ -n "$key" ] || die "Could not parse pre-auth key from headscale output"
+    printf '%s\n' "$key"
+}
+
+cmd_invite() {
+    is_admin || die "Only a CNC or controller can invite. Link one: connector link <host> --url ..."
+    local types=() name="" want_controller=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            provider) types+=("provider"); shift ;;
+            consumer) types+=("consumer"); shift ;;
+            controller|commander) want_controller=1; shift ;;
+            *) name="$1"; shift ;;
         esac
     done
 
-    # Try to read token from saved state if not provided
-    if [ -z "$token" ] && [ -f "$WSL_CONNECTOR_DIR/machine-id" ]; then
-        token=$(cat "$WSL_CONNECTOR_DIR/machine-id")
-        log_info "Using saved machine ID: $token"
+    if [ "${#types[@]}" -eq 0 ] && [ "$want_controller" -eq 0 ]; then
+        echo "Invite as:"
+        echo "  [1] provider"
+        echo "  [2] consumer"
+        echo "  [3] controller (C&C commander)"
+        local sel n
+        read -r -p 'Enter number(s) (e.g. 1, 2, or "1 2"): ' sel || sel=""
+        for n in $sel; do
+            case "$n" in
+                1) types+=("provider") ;;
+                2) types+=("consumer") ;;
+                3) want_controller=1 ;;
+                *) log_warn "Ignoring invalid choice: $n" ;;
+            esac
+        done
+    fi
+    [ "${#types[@]}" -eq 0 ] && [ "$want_controller" -eq 0 ] && die "Nothing selected."
+
+    if [ "$want_controller" -eq 1 ]; then
+        invite_controller
     fi
 
-    if [ -z "$token" ]; then
-        log_error "Usage: connector finalize <provider|consumer> <token> [staging-password] [-p|--port <port>]"
-        log_error "Example: connector finalize provider wsl-abc12345"
-        exit 1
-    fi
-
-    log_info "Finalizing $fin_type setup for machine: $token"
-
-    # Read VPS IP from registration
-    if [ ! -f "$WSL_CONNECTOR_DIR/registration.json" ]; then
-        log_error "Registration file not found. Run 'connector register' first."
-        exit 1
-    fi
-
-    # Try to load VPS connection info from saved state
-    if [ -f "$WSL_CONNECTOR_DIR/vps-info" ]; then
-        source "$WSL_CONNECTOR_DIR/vps-info"
-        if [ -z "$vps_ip" ]; then
-            vps_ip="$VPS_IP"
+    if [ "${#types[@]}" -gt 0 ]; then
+        local type url key hostarg=""
+        if printf '%s\n' "${types[@]}" | grep -qx provider && printf '%s\n' "${types[@]}" | grep -qx consumer; then
+            type="both"
+        else
+            type="${types[0]}"
         fi
-        if [ "$ssh_port" = "22" ] && [ -n "$SSH_PORT" ]; then
-            ssh_port="$SSH_PORT"
-        fi
-        log_info "Using saved VPS info: $vps_ip:$ssh_port"
-    fi
-
-    # Prompt for missing info
-    if [ -z "$vps_ip" ]; then
-        read -p "Enter VPS IP: " vps_ip
-    fi
-
-    # Download WireGuard config
-    log_info "Downloading WireGuard configuration from $vps_ip:$ssh_port..."
-    local temp_config="/tmp/${token}-wg.conf"
-    
-    # Check if sshpass is available
-    if command -v sshpass &> /dev/null; then
-        # Prompt for staging password if not provided and sshpass is available
-        if [ -z "$staging_password" ]; then
-            read -sp "Enter staging user password: " staging_password
-            echo
-        fi
-        
-        log_info "Using sshpass for authentication..."
-        local scp_output
-        if ! scp_output=$(sshpass -p "$staging_password" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>&1); then
-            log_error "Download failed. Error details:"
-            echo "$scp_output" >&2
-            log_error "Ensure machine has been approved by admin."
-            log_error "Check VPS IP ($vps_ip) and port ($ssh_port) are correct."
-            exit 1
-        fi
-    else
-        # Fallback to interactive SCP
-        log_info "sshpass not installed. Using interactive SCP..."
-        log_info "You will be prompted for the staging user password."
-        
-        local scp_output
-        if ! scp_output=$(scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${STAGING_USER}@${vps_ip}:${REGISTRY_DIR}/configs/${token}.conf" "$temp_config" 2>&1); then
-            log_error "Download failed. Error details:"
-            echo "$scp_output" >&2
-            log_error "Ensure machine has been approved by admin."
-            log_error "Check VPS IP ($vps_ip) and port ($ssh_port) are correct."
-            exit 1
-        fi
-    fi
-
-    # Replace placeholder with actual private key
-    local wg_private=$(cat "$WSL_CONNECTOR_DIR/wg-private-key")
-    sed "s|PLACEHOLDER_PRIVATE_KEY|$wg_private|g" "$temp_config" > "${temp_config}.final"
-
-    # Install WireGuard config
-    log_info "Installing WireGuard configuration..."
-    sudo mkdir -p "$WG_CONFIG_DIR"
-    sudo mv "${temp_config}.final" "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
-    sudo chmod 600 "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
-    rm -f "$temp_config"
-
-    # Verify the IP in the config before starting
-    local config_ip=$(sudo grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
-    log_info "Configured WireGuard IP: $config_ip"
-    
-    # Enable and start WireGuard service
-    log_info "Enabling WireGuard service..."
-    sudo systemctl enable wg-quick@$WG_INTERFACE 2>&1 || log_warn "Could not enable WireGuard service"
-    
-    log_info "Starting WireGuard..."
-    if ! timeout 10 sudo systemctl start wg-quick@$WG_INTERFACE 2>&1; then
-        log_warn "WireGuard failed to start or timed out. Check logs with: sudo journalctl -u wg-quick@$WG_INTERFACE"
-        log_warn "You may need to start it manually: sudo systemctl start wg-quick@$WG_INTERFACE"
-    else
-        log_success "WireGuard started"
-    fi
-
-    # Extract assigned IP from config
-    local assigned_ip=$(sudo grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d'/' -f1)
-
-    # Verify the actual IP assigned
-    log_info "Verifying WireGuard interface..."
-    sleep 2
-    local actual_ip=$(ip addr show $WG_INTERFACE 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
-    if [ -n "$actual_ip" ]; then
-        log_success "WireGuard interface has IP: $actual_ip"
-        if [ "$actual_ip" != "$assigned_ip" ]; then
-            log_warn "WARNING: IP mismatch detected!"
-            log_warn "  Expected: $assigned_ip"
-            log_warn "  Actual: $actual_ip"
-            log_warn "  The VPS may have a different IP in its config. Contact admin to verify."
-        fi
-    else
-        log_warn "Could not detect WireGuard IP address"
-    fi
-    
-    # Test connectivity
-    log_info "Testing VPS connectivity..."
-    if sudo wg show | grep -q "latest handshake"; then
-        log_success "WireGuard tunnel established!"
-    else
-        log_warn "WireGuard tunnel not yet established (may take a moment)"
-    fi
-
-    if ping -c 1 -W 2 "$VPS_WG_IP" &>/dev/null; then
-        log_success "VPS is reachable via WireGuard!"
-    else
-        log_warn "Cannot ping VPS yet (may need to wait for handshake)"
-    fi
-
-    # Get VPS public endpoint from config
-    local vps_endpoint=$(sudo grep "^Endpoint" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" | awk '{print $3}' | cut -d':' -f1)
-    
-    # Call type-specific finalize helper
-    if [ "$fin_type" = "provider" ]; then
-        finalize_provider "$token" "$assigned_ip" "$vps_endpoint" "$ssh_port"
-    else
-        finalize_consumer "$token" "$assigned_ip" "$vps_endpoint" "$ssh_port"
+        url="$(cnc_server_url)"; [ -n "$url" ] || url="<server-url>"
+        key="$(mint_key "$type")"
+        [ -n "$name" ] && hostarg=" --hostname $name"
+        echo
+        log_success "Single-use invite created (type: ${type}, expires in ${KEY_EXPIRY})."
+        echo "Run this on the new machine:"
+        echo
+        echo "    connector register ${type} ${url} --authkey ${key}${hostarg}"
+        echo
     fi
 }
 
-# LIST: List all approved machines
-cmd_list() {
-    require_root
+invite_controller() {
+    is_admin || die "Only a CNC or controller can invite a controller."
+    local url cnc_target pubkey
+    url="$(cnc_server_url)"
+    if is_controller; then load_cnc_link; cnc_target="$CNC_SSH"; else cnc_target="$(id -un)@$(hostname -f 2>/dev/null || hostname)"; fi
 
-    if ! is_vps; then
-        log_error "This command must be run on the VPS"
-        exit 1
-    fi
-
-    require_package jq
-
-    log_info "Approved Machines:"
     echo
-    printf "%-15s %-18s %-20s %-12s %-15s %-10s\n" "MACHINE ID" "TYPE" "HOSTNAME" "USER" "IP ADDRESS" "STATUS"
-    printf "%-15s %-18s %-20s %-12s %-15s %-10s\n" "----------" "----" "--------" "----" "----------" "------"
+    echo "== Invite a controller (C&C commander) =="
+    echo "A controller commands the CNC over SSH, so its key must be authorized"
+    echo "on the CNC admin account (${cnc_target})."
+    echo "On the NEW controller, run 'connector commander-key' and paste its output here."
+    echo
+    read -r -p "Paste SSH public key: " pubkey || true
+    [ -n "$pubkey" ] || die "No key provided."
+    case "$pubkey" in
+        ssh-*|ecdsa-*|sk-*) ;;
+        *) die "That does not look like an SSH public key." ;;
+    esac
+    authorize_commander "$pubkey"
+    log_success "Authorized the new controller's key on the CNC admin account."
+    echo
+    echo "Tell them to run:"
+    echo "    connector link ${cnc_target} --url ${url}${CNC_PORT:+ -p $CNC_PORT}"
+}
 
-    for file in "$REGISTRY_DIR/approved"/*.json; do
-        [ -f "$file" ] || continue
-        
-        local machine_id=$(basename "$file" .json)
-        local hostname=$(jq -r '.hostname' "$file")
-        local username=$(jq -r '.username' "$file")
-        local ip=$(jq -r '.wg_ip' "$file")
-        local pubkey=$(jq -r '.wg_pubkey' "$file")
-        local reg_type=$(jq -r '.type // "provider"' "$file")
-        
-        # Convert type to display label
-        local type_label="COMPUTE PROVIDER"
-        if [ "$reg_type" = "consumer" ]; then
-            type_label="COMPUTE CONSUMER"
-        fi
-        
-        # Get WireGuard status
-        local wg_status=$(wg show "$WG_INTERFACE" | grep -A 5 "$pubkey" || echo "")
-        local last_handshake="never"
-        local status="offline"
-        
-        if echo "$wg_status" | grep -q "latest handshake"; then
-            last_handshake=$(echo "$wg_status" | grep "latest handshake" | sed 's/.*latest handshake: //')
-            # Check if handshake is recent (within 3 minutes)
-            if echo "$last_handshake" | grep -qE "(second|minute).*ago"; then
-                status="online"
-            fi
-        fi
-        
-        printf "%-15s %-18s %-20s %-12s %-15s %-10s\n" \
-            "${machine_id:0:15}" \
-            "${type_label:0:18}" \
-            "${hostname:0:20}" \
-            "${username:0:12}" \
-            "$ip" \
-            "$status"
+# Append a public key to the CNC admin account's authorized_keys.
+authorize_commander() {
+    local pubkey="$1"
+    if is_cnc; then
+        mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+        printf '%s\n' "$pubkey" >> "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/authorized_keys"
+    else
+        load_cnc_link
+        printf '%s\n' "$pubkey" | ssh_cnc 'umask 077; mkdir -p "$HOME/.ssh"; cat >> "$HOME/.ssh/authorized_keys"'
+    fi
+}
+
+cmd_commander_key() {
+    local k key=""
+    for k in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub" "$HOME/.ssh/id_rsa.pub"; do
+        [ -f "$k" ] && { key="$k"; break; }
     done
-    echo
+    if [ -z "$key" ]; then
+        log_info "No SSH key found; generating an ed25519 key..."
+        ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" -C "connector-commander@$(hostname)" >/dev/null
+        key="$HOME/.ssh/id_ed25519.pub"
+    fi
+    echo "# Hand this public key to a CNC/controller running 'connector invite' -> controller:"
+    cat "$key"
 }
 
-# REVOKE: Revoke machine access
-cmd_revoke() {
-    local machine_id="$1"
-    require_root
+# --- Register (join the tailnet) --------------------------------------------
+is_wsl()        { grep -qiE "(microsoft|wsl)" /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; }
+systemd_active() { [ -d /run/systemd/system ]; }
 
-    if ! is_vps; then
-        log_error "This command must be run on the VPS"
-        exit 1
-    fi
-
-    if [ -z "$machine_id" ]; then
-        log_error "Usage: connector revoke <machine-id>"
-        exit 1
-    fi
-
-    local approved_file="$REGISTRY_DIR/approved/${machine_id}.json"
-    if [ ! -f "$approved_file" ]; then
-        log_error "Machine not found in approved registry: $machine_id"
-        exit 1
-    fi
-
-    log_warn "Revoking access for machine: $machine_id"
-    
-    # Get machine info
-    local hostname=$(jq -r '.hostname' "$approved_file")
-    local wg_pubkey=$(jq -r '.wg_pubkey' "$approved_file")
-    local ssh_pubkey=$(jq -r '.ssh_pubkey' "$approved_file")
-
-    # Remove from WireGuard config
-    log_info "Removing WireGuard peer..."
-    local temp_config="${WG_CONFIG_DIR}/${WG_INTERFACE}.conf.tmp"
-    awk -v pubkey="$wg_pubkey" '
-        /^\[Peer\]/ { in_peer=1; peer_content=$0"\n"; next }
-        in_peer && /^PublicKey/ { 
-            if ($3 == pubkey) { 
-                skip_peer=1 
-            }
-            peer_content=peer_content$0"\n"
-            next 
-        }
-        in_peer && /^$/ { 
-            if (!skip_peer) print peer_content
-            in_peer=0
-            skip_peer=0
-            peer_content=""
-            next
-        }
-        in_peer { peer_content=peer_content$0"\n"; next }
-        !in_peer { print }
-    ' "$WG_CONFIG_DIR/$WG_INTERFACE.conf" > "$temp_config"
-    
-    mv "$temp_config" "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
-    wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE")
-    log_success "WireGuard peer removed"
-
-    # Move to revoked
-    mv "$approved_file" "$REGISTRY_DIR/revoked/"
-    rm -f "$REGISTRY_DIR/configs/${machine_id}.conf"
-
-    log_success "Machine revoked: $machine_id ($hostname)"
+install_tailscale() {
+    have tailscale && return 0
+    log_info "Installing tailscale..."
+    curl -fsSL "$TS_INSTALL_URL" | sh
+    have tailscale || die "tailscale installation failed."
 }
 
-# STATUS: Show connection status
-cmd_status() {
-    log_info "WireGuard Connection Status:"
-    echo
-
-    if [ ! -f "/etc/wireguard/$WG_INTERFACE.conf" ]; then
-        log_error "WireGuard not configured. Run 'connector register' and 'connector finalize' first."
-        exit 1
+# Consent-gated, idempotent WSL systemd enablement. Returns non-zero to abort.
+ensure_wsl_systemd() {
+    is_wsl || return 0
+    systemd_active && return 0
+    if grep -qs "systemd=true" /etc/wsl.conf 2>/dev/null; then
+        log_warn "systemd is enabled in /etc/wsl.conf but not active yet."
+        log_warn "Run 'wsl --shutdown' in Windows, reopen this distro, then re-run register."
+        return 1
     fi
-
-    # Show WireGuard status
-    if sudo systemctl is-active --quiet wg-quick@$WG_INTERFACE; then
-        log_success "WireGuard service is running"
-    else
-        log_error "WireGuard service is not running"
-        echo "  Start with: sudo systemctl start wg-quick@$WG_INTERFACE"
-    fi
-
-    # Show assigned IP
-    local assigned_ip=$(sudo grep "^Address" "$WG_CONFIG_DIR/$WG_INTERFACE.conf" 2>/dev/null | awk '{print $3}')
-    if [ -n "$assigned_ip" ]; then
-        echo "  Assigned IP: $assigned_ip"
-    else
-        echo "  Assigned IP: (unable to read config)"
-    fi
-
-    # Show WireGuard details
-    echo
-    sudo wg show "$WG_INTERFACE" 2>/dev/null || log_warn "Cannot retrieve WireGuard stats"
-
-    # Test VPS connectivity
-    echo
-    log_info "Testing VPS connectivity..."
-    if ping -c 1 -W 2 "$VPS_WG_IP" &>/dev/null; then
-        log_success "VPS is reachable at $VPS_WG_IP"
-    else
-        log_error "Cannot reach VPS at $VPS_WG_IP"
-    fi
-
-    # Show SSH status
-    echo
-    if sudo systemctl is-active --quiet sshd; then
-        log_success "SSH service is running"
-    else
-        log_warn "SSH service is not running"
-        echo "  Start with: sudo systemctl start sshd"
-    fi
-}
-
-# HOP: Connect to WSL machine through VPS
-cmd_hop() {
-    local vps_host="$1"
-    local target="$2"
-    
-    if [ -z "$vps_host" ]; then
-        echo "Usage: connector hop <vps-host> [user@ip|machine-id]"
-        echo
-        echo "Connect to provider machines (WSL/compute) through VPS."
-        echo "Note: Only works for providers, not consumers."
-        echo
-        echo "Examples:"
-        echo "  connector hop root@203.0.113.1                   # List available provider machines"
-        echo "  connector hop root@203.0.113.1 kipras@10.0.0.2  # Connect by user@ip"
-        echo "  connector hop root@203.0.113.1 wsl-abc12345     # Connect by machine ID"
-        exit 1
-    fi
-    
-    # If no target specified, list available machines
-    if [ -z "$target" ]; then
-        log_info "Fetching available machines from $vps_host..."
-        
-        # Fetch all machine data in a single SSH call
-        # Use jq on remote side to extract and format fields as tab-separated values
-        # Format: machine_id<tab>type<tab>hostname<tab>username<tab>ip
-        local machines_data=$(ssh -o ConnectTimeout=10 "$vps_host" 'cd /var/lib/wsl-registry/approved 2>/dev/null && for f in *.json; do [ -f "$f" ] || continue; jq -r ". + {machine_id: \"$(basename "$f" .json)\"} | [.machine_id, (.type // \"provider\"), .hostname, .username, .wg_ip] | @tsv" "$f" 2>/dev/null; done' 2>/dev/null) || {
-            log_error "Failed to connect to VPS or no approved machines found"
-            log_error "Make sure you can SSH to the VPS and machines are approved"
-            exit 1
-        }
-        
-        if [ -z "$machines_data" ]; then
-            log_warn "No approved machines found on VPS"
-            exit 0
-        fi
-        
-        echo
-        echo "Available provider machines:"
-        echo "============================"
-        
-        local providers_found=0
-        while IFS=$'\t' read -r machine_id reg_type hostname username ip; do
-            # Skip empty lines
-            [ -z "$machine_id" ] && continue
-            
-            # Skip consumers - they don't accept SSH
-            if [ "$reg_type" = "consumer" ]; then
-                continue
-            fi
-            
-            providers_found=$((providers_found + 1))
-            echo "$providers_found. $username@$ip"
-            echo "   Machine ID: $machine_id"
-            echo "   Hostname: $hostname"
-            echo "   Command: ./connector hop $vps_host $username@$ip"
-            echo
-        done <<< "$machines_data"
-        
-        if [ $providers_found -eq 0 ]; then
-            echo "No provider machines found."
-            echo ""
-            echo "Possible reasons:"
-            echo "  - Only consumers are registered (consumers don't accept SSH)"
-            echo "  - No machines have been approved yet"
-            echo ""
-            echo "Providers are WSL/compute machines that accept SSH connections."
-        fi
-        
-        exit 0
-    fi
-    
-    # Target specified - connect to it
-    log_info "Connecting to $target through $vps_host..."
-    
-    local ssh_target=""
-    
-    # Check if target is in user@ip format or machine-id format
-    if [[ "$target" =~ @ ]]; then
-        # Already in user@ip format
-        ssh_target="$target"
-    else
-        # It's a machine ID - fetch details from VPS
-        local machine_data=$(ssh "$vps_host" "cat /var/lib/wsl-registry/approved/$target.json 2>/dev/null")
-        if [ -z "$machine_data" ]; then
-            log_error "Machine $target not found on VPS"
-            log_error "Run './connector hop $vps_host' to see available machines"
-            exit 1
-        fi
-        
-        # Check if this is a consumer (can't SSH to consumers)
-        local reg_type=$(echo "$machine_data" | jq -r '.type // "provider"')
-        if [ "$reg_type" = "consumer" ]; then
-            log_error "Cannot hop to $target - it's a consumer machine"
-            log_error "Consumers don't accept SSH connections (they connect TO the VPS)"
-            log_error "Run './connector hop $vps_host' to see available provider machines"
-            exit 1
-        fi
-        
-        local username=$(echo "$machine_data" | jq -r '.username')
-        local ip=$(echo "$machine_data" | jq -r '.wg_ip')
-        
-        if [ -z "$username" ] || [ -z "$ip" ] || [ "$username" = "null" ] || [ "$ip" = "null" ]; then
-            log_error "Invalid machine data for $target"
-            exit 1
-        fi
-        
-        ssh_target="$username@$ip"
-        log_info "Resolved $target to $ssh_target"
-    fi
-    
-    # Connect using nested SSH (VPS does the authentication to WSL)
-    ssh -t "$vps_host" ssh "$ssh_target"
-}
-
-# CLEANUP-WSL: Clean up WSL-side configuration
-cmd_cleanup_wsl() {
-    log_warn "This will remove ALL WireGuard and connector configuration on this WSL machine"
-    read -p "Are you sure? [y/n]: " confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-        log_info "Cleanup cancelled"
-        exit 0
-    fi
-    
-    log_info "Stopping services..."
-    sudo systemctl stop wg-quick@$WG_INTERFACE 2>/dev/null || true
-    sudo systemctl disable wg-quick@$WG_INTERFACE 2>/dev/null || true
-    
-    log_info "Removing WireGuard configuration..."
-    sudo rm -f "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
-    
-    log_info "Removing connector data..."
-    rm -rf "$WSL_CONNECTOR_DIR"
-    
-    log_info "Removing SSH keys..."
-    rm -f "$HOME/.ssh/wsl-to-vps" "$HOME/.ssh/wsl-to-vps.pub"
-    
-    log_info "Removing SSH hardening rules..."
-    if [ -f /etc/ssh/sshd_config ]; then
-        sudo sed -i '/# WSL connector security hardening/,/^$/d' /etc/ssh/sshd_config
-        sudo systemctl restart sshd 2>/dev/null || true
-    fi
-    
-    log_success "WSL cleanup complete! You can now run 'connector register' again."
-}
-
-# CLEANUP-VPS: Clean up VPS-side configuration
-cmd_cleanup_vps() {
-    require_root
-    
-    if ! is_vps; then
-        log_error "This command must be run on the VPS"
-        exit 1
-    fi
-    
-    log_warn "This will remove ALL machine registrations and WireGuard peer configurations"
-    log_warn "The VPS WireGuard server and staging user will remain configured"
-    read -p "Are you sure? [y/n]: " confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-        log_info "Cleanup cancelled"
-        exit 0
-    fi
-    
-    log_info "Stopping WireGuard..."
-    systemctl stop wg-quick@$WG_INTERFACE 2>/dev/null || true
-    
-    log_info "Removing connector-managed peers from WireGuard..."
-    # Only remove peers that have machine-id comments (wsl-xxxxxxxx)
-    # This preserves any manually added peers
-    local temp_config="${WG_CONFIG_DIR}/${WG_INTERFACE}.conf.tmp"
-    awk '
-        # Track if we are in a peer block
-        /^# wsl-[a-z0-9]+/ { 
-            skip_peer=1
-            next 
-        }
-        # Start of new peer or interface section ends skipping
-        /^(\[Peer\]|\[Interface\])/ && skip_peer {
-            skip_peer=0
-            if ($0 ~ /^\[Interface\]/) print
-            next
-        }
-        # Skip lines if we are in a connector-managed peer
-        skip_peer { next }
-        # Print everything else
-        { print }
-    ' "$WG_CONFIG_DIR/$WG_INTERFACE.conf" > "$temp_config"
-    
-    mv "$temp_config" "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
-    chmod 600 "$WG_CONFIG_DIR/$WG_INTERFACE.conf"
-    
-    log_info "Clearing all machine registrations..."
-    rm -f "$REGISTRY_DIR/pending"/*.json
-    rm -f "$REGISTRY_DIR/approved"/*.json
-    rm -f "$REGISTRY_DIR/configs"/*.conf
-    rm -f "$REGISTRY_DIR/revoked"/*.json
-    
-    log_info "Starting WireGuard..."
-    systemctl start wg-quick@$WG_INTERFACE
-    
-    log_success "VPS cleanup complete! Ready to approve new machines."
-}
-
-# Alias helpers
-
-ensure_aliases_file() {
-    mkdir -p "$WSL_CONNECTOR_DIR"
-    chmod 700 "$WSL_CONNECTOR_DIR" 2>/dev/null || true
-    if [ ! -f "$ALIASES_FILE" ]; then
-        cat > "$ALIASES_FILE" <<'EOF'
-# connector aliases - one per line
-# format: name|vps_host|target
-EOF
-        chmod 600 "$ALIASES_FILE"
-    fi
-}
-
-is_reserved_command() {
-    local name="$1"
-    local cmd
-    for cmd in "${RESERVED_COMMANDS[@]}"; do
-        if [ "$name" = "$cmd" ]; then
-            return 0
-        fi
-    done
+    log_warn "tailscale needs systemd, which is not enabled in this WSL distro."
+    confirm "Enable systemd in /etc/wsl.conf now?" || { log_error "Cannot continue without systemd."; return 1; }
+    as_root bash -c 'touch /etc/wsl.conf
+if ! grep -q "^\[boot\]" /etc/wsl.conf; then
+    printf "\n[boot]\nsystemd=true\n" >> /etc/wsl.conf
+elif ! grep -q "systemd=true" /etc/wsl.conf; then
+    sed -i "/^\[boot\]/a systemd=true" /etc/wsl.conf
+fi'
+    log_success "Enabled systemd in /etc/wsl.conf."
+    log_warn "Now run 'wsl --shutdown' in Windows PowerShell, reopen this distro, then re-run your connector register command."
     return 1
 }
 
-alias_lookup() {
-    local name="$1"
-    [ -f "$ALIASES_FILE" ] || return 1
-    local line
-    line=$(grep -E "^${name}\|" "$ALIASES_FILE" 2>/dev/null | head -n1)
-    [ -n "$line" ] || return 1
-    echo "$line"
+maybe_fix_wsl_mtu() {
+    is_wsl || return 0
+    have ip || return 0
+    local mtu
+    mtu="$(ip link show tailscale0 2>/dev/null | sed -n 's/.* mtu \([0-9]\+\).*/\1/p' | head -n1)"
+    if [ -n "$mtu" ] && [ "$mtu" -gt "$WSL_MTU" ]; then
+        log_info "Pinning tailscale0 MTU to ${WSL_MTU} (WSL large-packet fix)..."
+        as_root ip link set tailscale0 mtu "$WSL_MTU" 2>/dev/null || true
+    fi
 }
 
-ssh_config_block_exists() {
-    local name="$1"
-    [ -f "$SSH_CONFIG_FILE" ] || return 1
-    grep -qF "# BEGIN connector alias ${name}" "$SSH_CONFIG_FILE" 2>/dev/null
+cmd_register() {
+    local type="${1:-}"; shift || true
+    case "$type" in
+        provider|consumer|both) ;;
+        *) die "Usage: connector register <provider|consumer|both> <url> [--authkey KEY] [--hostname N] [--yes]" ;;
+    esac
+    local url="" key="" hostname=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --authkey)  key="$2"; shift 2 ;;
+            --hostname) hostname="$2"; shift 2 ;;
+            --yes|-y)   ASSUME_YES=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) [ -z "$url" ] && url="$1" || die "Unexpected argument: $1"; shift ;;
+        esac
+    done
+    [ -n "$url" ] || die "Usage: connector register <provider|consumer|both> <url> [--authkey KEY]"
+
+    ensure_wsl_systemd || return 0
+    install_tailscale
+    [ -n "$hostname" ] || hostname="$(hostname -s 2>/dev/null || hostname)"
+
+    local tags ssh_flag=""
+    case "$type" in
+        provider) tags="tag:provider"; ssh_flag="--ssh" ;;
+        consumer) tags="tag:consumer" ;;
+        both)     tags="tag:provider,tag:consumer"; ssh_flag="--ssh" ;;
+    esac
+
+    log_info "Bringing up tailscale (type: $type, hostname: $hostname)..."
+    local up_args=(--login-server "$url" --hostname "$hostname" --advertise-tags="$tags" --accept-dns=true)
+    [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
+    [ -n "$key" ] && up_args+=(--authkey "$key")
+
+    if ! as_root tailscale up "${up_args[@]}"; then
+        if [ -z "$key" ]; then
+            log_warn "No --authkey supplied; tailscale printed a login URL above."
+            log_warn "Ask the CNC admin to approve it:  connector approve"
+        fi
+        die "tailscale up did not complete."
+    fi
+
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+    printf '%s\n' "$type" > "$ROLE_FILE"
+    maybe_fix_wsl_mtu
+
+    local ts_ip ts_name
+    ts_ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+    ts_name="$(tailscale status --json 2>/dev/null | json_str DNSName)"; ts_name="${ts_name%.}"
+    [ -n "$ts_name" ] || ts_name="$hostname"
+
+    echo
+    log_success "Connected as ${type}."
+    [ -n "$ts_ip" ] && echo "  Tailnet IP: $ts_ip"
+    echo "  MagicDNS:   $ts_name"
+    case "$type" in
+        provider|both) echo "  Others reach you via:  ssh <user>@${ts_name}" ;;
+    esac
+    case "$type" in
+        consumer|both) echo "  Reach a provider via:  connector hop <provider-name>" ;;
+    esac
 }
 
-ssh_config_add_block() {
-    local name="$1"
-    local target="$2"
-    local vps_host="$3"
-
-    local user="${target%@*}"
-    local host="${target##*@}"
-
-    if [ -z "$user" ] || [ -z "$host" ] || [ "$user" = "$target" ]; then
-        log_error "Cannot derive user@host from target: $target"
-        return 1
-    fi
-
-    mkdir -p "$(dirname "$SSH_CONFIG_FILE")"
-    chmod 700 "$(dirname "$SSH_CONFIG_FILE")" 2>/dev/null || true
-
-    if [ ! -f "$SSH_CONFIG_FILE" ]; then
-        touch "$SSH_CONFIG_FILE"
-        chmod 600 "$SSH_CONFIG_FILE"
-    fi
-
-    if ssh_config_block_exists "$name"; then
-        log_warn "SSH config already has a connector block for '$name'"
-        log_warn "Run: connector alias rm $name  (then re-add) to replace it"
-        return 1
-    fi
-
-    [ -s "$SSH_CONFIG_FILE" ] && [ "$(tail -c1 "$SSH_CONFIG_FILE")" != "" ] && echo >> "$SSH_CONFIG_FILE"
-
-    cat >> "$SSH_CONFIG_FILE" <<EOF
-
-# BEGIN connector alias ${name}
-Host ${name}
-    HostName ${host}
-    User ${user}
-    ProxyJump ${vps_host}
-# END connector alias ${name}
-EOF
-
-    log_success "Added Host '$name' to $SSH_CONFIG_FILE"
-    log_info "You can now run: ssh $name"
+# --- Admin: list / approve / revoke -----------------------------------------
+cmd_list() {
+    is_admin || die "Only a CNC or controller can list nodes."
+    hs nodes list
 }
 
-ssh_config_remove_block() {
-    local name="$1"
-    [ -f "$SSH_CONFIG_FILE" ] || return 0
-    if ! ssh_config_block_exists "$name"; then
+approve_routes() {
+    local id="$1"
+    # Route-approval CLI differs across headscale versions; best-effort, never fatal.
+    hs nodes approve-routes --identifier "$id" --routes "" >/dev/null 2>&1 \
+        || hs routes enable --identifier "$id" >/dev/null 2>&1 \
+        || true
+}
+
+cmd_approve() {
+    is_admin || die "Only a CNC or controller can approve."
+    local node="${1:-}" type="${2:-}"
+    if [ -z "$node" ]; then
+        echo "Nodes:"
+        hs nodes list
+        echo
+        echo "Tag/approve a node that joined without a key:"
+        echo "    connector approve <node-name|id> <provider|consumer|both>"
+        echo
+        echo "(Simpler: 'connector invite' issues a single-use key so no approval step is needed.)"
         return 0
     fi
-
-    local tmp
-    tmp=$(mktemp)
-    awk -v marker="connector alias ${name}" '
-        $0 ~ "^# BEGIN " marker "$" { skip=1; next }
-        skip && $0 ~ "^# END " marker "$" { skip=0; next }
-        !skip { print }
-    ' "$SSH_CONFIG_FILE" > "$tmp"
-
-    awk 'BEGIN{blank=0} /^$/{blank++; if(blank<=2)print; next} {blank=0; print}' "$tmp" > "${tmp}.2"
-    mv "${tmp}.2" "$SSH_CONFIG_FILE"
-    rm -f "$tmp"
-    chmod 600 "$SSH_CONFIG_FILE"
-    log_success "Removed Host '$name' from $SSH_CONFIG_FILE"
+    local id; id="$(resolve_node_id "$node")" || die "Node not found: $node"
+    approve_routes "$id"
+    if [ -n "$type" ]; then
+        local tags
+        case "$type" in
+            provider) tags="tag:provider" ;;
+            consumer) tags="tag:consumer" ;;
+            both)     tags="tag:provider,tag:consumer" ;;
+            *) die "type must be provider|consumer|both" ;;
+        esac
+        hs nodes tag --identifier "$id" --tags "$tags"
+        log_success "Tagged node $node as $type."
+    fi
+    log_success "Approved node $node (id $id)."
 }
 
-resolve_machine_id() {
-    local vps_host="$1"
-    local machine_id="$2"
+cmd_revoke() {
+    is_admin || die "Only a CNC or controller can revoke nodes."
+    local node="${1:-}"
+    [ -n "$node" ] || die "Usage: connector revoke <node-name|node-id>"
+    local id; id="$(resolve_node_id "$node")" || die "Node not found: $node"
+    log_warn "Revoking node $node (id $id)..."
+    hs nodes delete --identifier "$id" --force 2>/dev/null || hs nodes delete --identifier "$id"
+    log_success "Revoked $node."
+}
 
-    log_info "Resolving machine ID '$machine_id' via $vps_host..."
-    local machine_data
-    machine_data=$(ssh -o ConnectTimeout=10 "$vps_host" "cat ${REGISTRY_DIR}/approved/${machine_id}.json 2>/dev/null") || {
-        log_error "Failed to SSH to $vps_host to resolve machine ID"
-        return 1
+# --- Status / whoami ---------------------------------------------------------
+cmd_status() {
+    echo "Roles: $(current_roles)"
+    if is_controller; then load_cnc_link; echo "Linked CNC: $CNC_SSH ($CNC_URL)"; fi
+    echo
+    if is_cnc; then
+        if systemctl is-active --quiet headscale 2>/dev/null; then
+            log_success "headscale service is running"
+        else
+            log_warn "headscale service is not running"
+        fi
+        echo
+        as_root headscale nodes list 2>/dev/null || true
+        return 0
+    fi
+    if have tailscale; then
+        tailscale status || log_warn "tailscale not connected"
+    else
+        log_warn "tailscale is not installed on this machine."
+    fi
+}
+
+cmd_whoami() {
+    echo "Roles: $(current_roles)"
+    if is_controller; then load_cnc_link; echo "Linked CNC: $CNC_SSH"; echo "Server URL: $CNC_URL"; fi
+    if is_cnc; then echo "Server URL: $(cnc_server_url)"; fi
+    if is_node; then
+        local ip; ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+        [ -n "$ip" ] && echo "Tailnet IP: $ip"
+    fi
+}
+
+# --- hop / alias -------------------------------------------------------------
+cmd_hop() {
+    local target="${1:-}"
+    if [ -z "$target" ]; then
+        log_info "Tailnet peers (providers accept SSH):"
+        have tailscale && tailscale status 2>/dev/null \
+            | awk 'NF>=2 && $1 !~ /^#/ {print "  " $2 "  (" $1 ")"}'
+        echo
+        echo "Connect with: connector hop <name>   (or: ssh <user>@<name>)"
+        return 0
+    fi
+    if [[ "$target" == *"@"* ]]; then
+        ssh "$target"
+    else
+        ssh "$(id -un)@${target}"
+    fi
+}
+
+is_reserved() { local n; for n in "${RESERVED_COMMANDS[@]}"; do [ "$1" = "$n" ] && return 0; done; return 1; }
+
+ensure_aliases_file() {
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+    [ -f "$ALIASES_FILE" ] || {
+        printf '# connector aliases\n# format: name|user@magicdns-name\n' > "$ALIASES_FILE"
+        chmod 600 "$ALIASES_FILE"
     }
-
-    if [ -z "$machine_data" ]; then
-        log_error "Machine '$machine_id' not found on VPS"
-        return 1
-    fi
-
-    local reg_type username ip
-    reg_type=$(echo "$machine_data" | jq -r '.type // "provider"')
-    username=$(echo "$machine_data" | jq -r '.username')
-    ip=$(echo "$machine_data" | jq -r '.wg_ip')
-
-    if [ "$reg_type" = "consumer" ]; then
-        log_error "'$machine_id' is a consumer machine - cannot SSH to consumers"
-        return 1
-    fi
-
-    if [ -z "$username" ] || [ -z "$ip" ] || [ "$username" = "null" ] || [ "$ip" = "null" ]; then
-        log_error "Invalid machine data for '$machine_id'"
-        return 1
-    fi
-
-    echo "${username}@${ip}"
 }
+alias_lookup() { [ -f "$ALIASES_FILE" ] && grep -E "^$1\|" "$ALIASES_FILE" 2>/dev/null | head -n1; }
 
-# ALIAS: Manage hop shortcuts
 cmd_alias() {
     local sub="${1:-list}"
-
     case "$sub" in
         ""|list|ls)
             ensure_aliases_file
-            log_info "Saved aliases:"
-            echo
-            printf "%-20s %-30s %s\n" "NAME" "VPS HOST" "TARGET"
-            printf "%-20s %-30s %s\n" "----" "--------" "------"
-            local count=0
-            while IFS='|' read -r name vps_host target; do
-                [ -z "$name" ] && continue
-                [[ "$name" =~ ^# ]] && continue
-                printf "%-20s %-30s %s\n" "$name" "$vps_host" "$target"
-                count=$((count + 1))
+            printf "%-20s %s\n" "NAME" "TARGET"
+            local n t c=0
+            while IFS='|' read -r n t; do
+                [ -z "$n" ] && continue
+                [[ "$n" == \#* ]] && continue
+                printf "%-20s %s\n" "$n" "$t"; c=$((c+1))
             done < "$ALIASES_FILE"
-            if [ $count -eq 0 ]; then
-                echo "  (none)"
-                echo
-                echo "Create one with: connector alias <name> <vps-host> <user@ip|machine-id>"
-            fi
-            echo
+            [ "$c" -eq 0 ] && echo "(none) - add one: connector alias <name> <user@magicdns-name>"
             ;;
         rm|remove|delete)
-            local name="$2"
-            if [ -z "$name" ]; then
-                log_error "Usage: connector alias rm <name>"
-                exit 1
-            fi
+            local name="${2:-}"; [ -n "$name" ] || die "Usage: connector alias rm <name>"
             ensure_aliases_file
-            if ! alias_lookup "$name" >/dev/null; then
-                log_error "Alias not found: $name"
-                exit 1
-            fi
-            local tmp
-            tmp=$(mktemp)
-            grep -vE "^${name}\|" "$ALIASES_FILE" > "$tmp" || true
-            mv "$tmp" "$ALIASES_FILE"
-            chmod 600 "$ALIASES_FILE"
-            log_success "Removed alias: $name"
-
-            if ssh_config_block_exists "$name"; then
-                read -p "Also remove matching ~/.ssh/config Host entry? [Y/n]: " confirm
-                if [ -z "$confirm" ] || [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                    ssh_config_remove_block "$name"
-                fi
-            fi
+            local tmp; tmp="$(mktemp)"
+            grep -vE "^$name\|" "$ALIASES_FILE" > "$tmp" 2>/dev/null || true
+            mv "$tmp" "$ALIASES_FILE"; chmod 600 "$ALIASES_FILE"
+            ssh_config_remove_block "$name"
+            log_success "Removed alias $name"
             ;;
         *)
-            local force=0
-            local args=()
-            while [[ $# -gt 0 ]]; do
-                case "$1" in
-                    -f|--force) force=1; shift ;;
-                    *) args+=("$1"); shift ;;
-                esac
-            done
-
-            local name="${args[0]}"
-            local vps_host="${args[1]}"
-            local target="${args[2]}"
-
-            if [ -z "$name" ] || [ -z "$vps_host" ] || [ -z "$target" ]; then
-                log_error "Usage: connector alias <name> <vps-host> <user@ip|machine-id>"
-                log_error "       connector alias list"
-                log_error "       connector alias rm <name>"
-                exit 1
-            fi
-
-            if ! [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
-                log_error "Invalid alias name: '$name'"
-                log_error "Names must start with alphanumeric and contain only [a-zA-Z0-9._-]"
-                exit 1
-            fi
-
-            if is_reserved_command "$name"; then
-                log_error "Alias name '$name' conflicts with a built-in command"
-                exit 1
-            fi
-
+            local name="$1" target="${2:-}"
+            [ -n "$name" ] && [ -n "$target" ] || die "Usage: connector alias <name> <user@magicdns-name>"
+            is_reserved "$name" && die "Alias '$name' conflicts with a built-in command."
             ensure_aliases_file
-
-            if alias_lookup "$name" >/dev/null; then
-                if [ $force -eq 0 ]; then
-                    log_error "Alias '$name' already exists. Use -f to overwrite, or 'connector alias rm $name'."
-                    exit 1
-                fi
-                local tmp
-                tmp=$(mktemp)
-                grep -vE "^${name}\|" "$ALIASES_FILE" > "$tmp" || true
-                mv "$tmp" "$ALIASES_FILE"
-                chmod 600 "$ALIASES_FILE"
-            fi
-
-            local resolved_target="$target"
-            if [[ "$target" != *"@"* ]]; then
-                require_package jq
-                resolved_target=$(resolve_machine_id "$vps_host" "$target") || exit 1
-                log_success "Resolved '$target' to '$resolved_target'"
-            fi
-
-            echo "${name}|${vps_host}|${resolved_target}" >> "$ALIASES_FILE"
-            chmod 600 "$ALIASES_FILE"
-            log_success "Saved alias: $name -> hop $vps_host $resolved_target"
-            log_info "Run with: connector $name"
-
-            echo
-            read -p "Add matching ~/.ssh/config Host entry so you can run 'ssh $name'? [y/N]: " confirm
-            if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-                ssh_config_add_block "$name" "$resolved_target" "$vps_host"
+            local tmp; tmp="$(mktemp)"
+            grep -vE "^$name\|" "$ALIASES_FILE" > "$tmp" 2>/dev/null || true
+            mv "$tmp" "$ALIASES_FILE"
+            printf '%s|%s\n' "$name" "$target" >> "$ALIASES_FILE"; chmod 600 "$ALIASES_FILE"
+            log_success "Saved alias $name -> $target   (run: connector $name)"
+            if confirm "Add a matching ~/.ssh/config Host entry so 'ssh $name' works?"; then
+                ssh_config_add_block "$name" "$target"
             fi
             ;;
     esac
 }
 
-# HELP: Show usage information
+ssh_config_add_block() {
+    local name="$1" target="$2" user host
+    if [[ "$target" == *"@"* ]]; then user="${target%@*}"; host="${target##*@}"; else user="$(id -un)"; host="$target"; fi
+    mkdir -p "$(dirname "$SSH_CONFIG_FILE")"; chmod 700 "$(dirname "$SSH_CONFIG_FILE")" 2>/dev/null || true
+    touch "$SSH_CONFIG_FILE"; chmod 600 "$SSH_CONFIG_FILE"
+    if grep -qF "# BEGIN connector alias $name" "$SSH_CONFIG_FILE" 2>/dev/null; then
+        log_warn "$SSH_CONFIG_FILE already has '$name'"; return 0
+    fi
+    cat >> "$SSH_CONFIG_FILE" <<EOF
+
+# BEGIN connector alias $name
+Host $name
+    HostName $host
+    User $user
+# END connector alias $name
+EOF
+    log_success "Added Host '$name' to $SSH_CONFIG_FILE"
+}
+
+ssh_config_remove_block() {
+    local name="$1" tmp
+    [ -f "$SSH_CONFIG_FILE" ] || return 0
+    grep -qF "# BEGIN connector alias $name" "$SSH_CONFIG_FILE" 2>/dev/null || return 0
+    tmp="$(mktemp)"
+    awk -v m="connector alias $name" '
+        $0 == "# BEGIN " m {s=1; next}
+        s && $0 == "# END " m {s=0; next}
+        !s {print}' "$SSH_CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$SSH_CONFIG_FILE"; chmod 600 "$SSH_CONFIG_FILE"
+    log_success "Removed Host '$name' from $SSH_CONFIG_FILE"
+}
+
+# --- Cleanup -----------------------------------------------------------------
+cmd_cleanup() {
+    log_warn "This will disconnect this machine from the tailnet."
+    confirm "Continue?" || { log_info "Cancelled."; exit 0; }
+    if have tailscale; then
+        as_root tailscale logout 2>/dev/null || true
+        as_root tailscale down 2>/dev/null || true
+    fi
+    rm -f "$ROLE_FILE"
+    if is_controller && confirm "Also forget the linked CNC?"; then
+        rm -f "$CNC_LINK_FILE"; log_success "Forgot CNC link."
+    fi
+    log_success "Cleanup complete."
+}
+
+cmd_cleanup_cnc() {
+    is_admin || die "Only a CNC or controller can run cleanup-cnc."
+    log_warn "This will delete ALL nodes and stop headscale on the CNC."
+    confirm "Continue?" || { log_info "Cancelled."; exit 0; }
+    local out ids id
+    out="$(hs nodes list --output json 2>/dev/null)" || out=""
+    ids="$(printf '%s' "$out" | tr '{}' '\n\n' \
+         | sed -n 's/.*"id":[[:space:]]*"\{0,1\}\([0-9]\+\).*/\1/p' | sort -un)"
+    for id in $ids; do
+        hs nodes delete --identifier "$id" --force >/dev/null 2>&1 || true
+    done
+    if is_cnc; then
+        as_root systemctl stop headscale 2>/dev/null || true
+        as_root systemctl disable headscale 2>/dev/null || true
+    else
+        ssh_cnc 'sudo systemctl stop headscale; sudo systemctl disable headscale' 2>/dev/null || true
+    fi
+    log_success "CNC cleaned up (nodes deleted, headscale stopped)."
+    echo
+    echo "Migrating from the old WireGuard connector? Tear down leftover state if present:"
+    echo "  sudo systemctl disable --now wg-quick@wg-connector"
+    echo "  sudo rm -f /etc/wireguard/wg-connector.conf"
+    echo "  sudo rm -rf /var/lib/wsl-registry; sudo userdel -r connector 2>/dev/null"
+    echo "  and remove any 'Match User connector' blocks from /etc/ssh/sshd_config"
+}
+
+# --- Help --------------------------------------------------------------------
 cmd_help() {
     cat <<EOF
-connector v${VERSION} - WireGuard VPS-WSL Management Tool
+connector v${VERSION} - headscale/tailscale mesh manager
 
-Usage: connector <command> [arguments]
+This machine: $(current_roles)
 
-VPS Commands (run on VPS):
-  vps-init                     Initialize VPS as WireGuard server
-  approve [machine-id]         Approve pending machine (provider or consumer)
-  list                         List all approved machines with type
-  revoke <machine-id>          Revoke machine access
-  cleanup-vps                  Remove all registrations (keeps VPS config)
+SETUP
+  cnc-init [user@host] --url https://HOST [-p PORT]
+                       Set up the CNC (headscale). With user@host it runs
+                       remotely over SSH and links this PC as a controller.
+  link <user@host> --url https://HOST [-p PORT]
+                       Attach to an existing CNC (become a controller).
 
-Machine Registration Commands:
-  register <provider|consumer> <vps-ip> [-p port]
-                               Register machine to VPS
-                               - provider: WSL/compute machine (accepts SSH from VPS)
-                               - consumer: Main machine (can SSH to VPS as root)
+ONBOARD                [admin: run on the CNC or a linked controller]
+  invite [provider] [consumer] [controller] [name]
+                       No args -> menu ([1] provider [2] consumer
+                       [3] controller). Enter "1 2" for both. Mints a
+                       single-use key and prints the register command.
+  commander-key        Print this machine's SSH public key (for a
+                       'controller' invite).
+  approve [node] [type]
+                       Tag/approve a node that joined without a key.
 
-  finalize <provider|consumer> [token] [-p port]
-                               Complete setup after approval
-                               - provider: Configures SSH hardening for WSL
-                               - consumer: Skips SSH setup (not needed)
+JOIN
+  register <provider|consumer|both> <url> [--authkey KEY] [--hostname N] [--yes]
+                       Join the tailnet. Auto-handles WSL systemd (asks first).
 
-  status                       Show WireGuard connection status
-  cleanup-wsl                  Remove all local configuration
+USE
+  status               Roles + tailscale/headscale status.
+  whoami               Detected role(s) + linked CNC.
+  list                 [admin] List nodes.
+  revoke <node>        [admin] Remove a node.
+  hop [user@name|name] SSH to a provider by MagicDNS name (no arg = list).
+  alias <name> <user@name> | alias list | alias rm <name>
+                       Save an SSH shortcut (optionally writes ~/.ssh/config).
+  cleanup              Disconnect this machine from the tailnet.
+  cleanup-cnc          [admin] Delete all nodes + stop headscale.
+  help                 This help.
 
-Client Commands (run from any machine):
-  hop <vps-host> [user@ip]     Connect to provider machines through VPS
-                               - No target: list available providers
-                               - With target: connect to user@ip or machine-id
-                               - Note: Only works for providers, not consumers
-
-Alias Commands (saved hop shortcuts):
-  alias <name> <vps-host> <user@ip|machine-id>
-                               Save a hop shortcut. After saving, run with
-                               'connector <name>'. Prompts to optionally add a
-                               matching Host entry to ~/.ssh/config.
-  alias list                   List all saved aliases
-  alias rm <name>              Remove an alias (and matching ~/.ssh/config block)
-  <alias-name>                 Run a saved alias (equivalent to its 'hop' form)
-
-General:
-  help                         Show this help message
-
-Examples:
-  # On VPS (first time setup):
-  sudo ./connector vps-init
-
-  # On WSL/provider machine (register as compute provider):
-  ./connector register provider 1.2.3.4
-  ./connector register provider 1.2.3.4 -p 2222
-
-  # On main/consumer machine (register as compute consumer):
-  ./connector register consumer 1.2.3.4
-  ./connector register consumer 1.2.3.4 -p 2222
-
-  # On VPS (approve machine - shows type):
-  sudo ./connector approve
-
-  # On provider machine (after approval):
-  ./connector finalize provider wsl-abc12345
-  ./connector finalize provider wsl-abc12345 -p 2222
-
-  # On consumer machine (after approval):
-  ./connector finalize consumer wsl-xyz78910
-  ./connector finalize consumer wsl-xyz78910 -p 2222
-
-  # Check connection status:
-  ./connector status
-
-  # From consumer machine - SSH to VPS, then to any provider:
-  ssh root@vps-ip
-  ssh user@provider-ip
-
-  # From any machine - list provider machines available through VPS:
-  ./connector hop root@203.0.113.1
-
-  # From any machine - connect to specific provider (by IP or machine ID):
-  ./connector hop root@203.0.113.1 kipras@10.0.0.2
-  ./connector hop root@203.0.113.1 wsl-abc12345
-
-  # Save a hop as an alias (prompts to also add ~/.ssh/config entry):
-  ./connector alias kipras-nyc nyc kipras@10.0.0.2
-  ./connector alias kipras-nyc nyc wsl-abc12345    # machine-id is resolved at create time
-
-  # Use the alias - runs the saved hop:
-  ./connector kipras-nyc
-
-  # If you accepted the SSH config prompt, you can also just:
-  ssh kipras-nyc
-
-  # List or remove aliases:
-  ./connector alias list
-  ./connector alias rm kipras-nyc
-
-For more information, see README.md
+Examples
+  connector cnc-init root@203.0.113.1 --url https://vpn.example.com
+  connector invite consumer
+  connector register consumer https://vpn.example.com --authkey hskey-xxxx
+  connector hop my-laptop
 EOF
 }
 
-# Main dispatcher
+# --- Dispatcher --------------------------------------------------------------
 main() {
-    local cmd="${1:-help}"
-    
+    local cmd="${1:-help}"; shift || true
     case "$cmd" in
-        vps-init)
-            cmd_vps_init "${@:2}"
-            ;;
-        approve)
-            cmd_approve "${@:2}"
-            ;;
-        list)
-            cmd_list "${@:2}"
-            ;;
-        revoke)
-            cmd_revoke "${@:2}"
-            ;;
-        register)
-            cmd_register "${@:2}"
-            ;;
-        finalize)
-            cmd_finalize "${@:2}"
-            ;;
-        status)
-            cmd_status "${@:2}"
-            ;;
-        hop)
-            cmd_hop "${@:2}"
-            ;;
-        cleanup-wsl)
-            cmd_cleanup_wsl "${@:2}"
-            ;;
-        cleanup-vps)
-            cmd_cleanup_vps "${@:2}"
-            ;;
-        alias)
-            cmd_alias "${@:2}"
-            ;;
-        help|--help|-h)
-            cmd_help
-            ;;
+        cnc-init)       cmd_cnc_init "$@" ;;
+        link)           cmd_link "$@" ;;
+        invite)         cmd_invite "$@" ;;
+        commander-key)  cmd_commander_key "$@" ;;
+        register)       cmd_register "$@" ;;
+        approve)        cmd_approve "$@" ;;
+        list)           cmd_list "$@" ;;
+        revoke)         cmd_revoke "$@" ;;
+        status)         cmd_status "$@" ;;
+        whoami)         cmd_whoami "$@" ;;
+        hop)            cmd_hop "$@" ;;
+        alias)          cmd_alias "$@" ;;
+        cleanup)        cmd_cleanup "$@" ;;
+        cleanup-cnc)    cmd_cleanup_cnc "$@" ;;
+        help|--help|-h) cmd_help ;;
         *)
-            local alias_line
-            if alias_line=$(alias_lookup "$cmd"); then
-                local alias_name alias_vps alias_target
-                IFS='|' read -r alias_name alias_vps alias_target <<< "$alias_line"
-                log_info "Running alias '$alias_name' -> hop $alias_vps $alias_target"
-                cmd_hop "$alias_vps" "$alias_target" "${@:2}"
+            local line target
+            line="$(alias_lookup "$cmd" || true)"
+            if [ -n "$line" ]; then
+                target="${line#*|}"
+                cmd_hop "$target"
                 exit $?
             fi
             log_error "Unknown command: $cmd"
