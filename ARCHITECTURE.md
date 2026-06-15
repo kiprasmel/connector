@@ -1,435 +1,187 @@
-# Architecture Documentation
+# Architecture
 
-## System Overview
+`connector` is a thin, role-aware bash wrapper around two tools that already do
+the hard parts reliably:
 
-The WireGuard VPS-WSL Connector is a self-service registration system that allows WSL (Windows Subsystem for Linux) machines to connect to a central VPS through WireGuard VPN tunnels.
+- **[headscale](https://github.com/juanfont/headscale)** — a self-hosted
+  implementation of the Tailscale control server. Runs on the VPS (the **CNC**).
+- **[tailscale](https://tailscale.com/)** — the client daemon that every other
+  machine runs to join the mesh.
 
-## Design Goals
+The wrapper's only jobs are: install/configure these tools, gate onboarding so
+new machines always need admin sign-off, and route admin commands to the CNC
+(locally or transparently over SSH). Everything else — IP allocation, key
+exchange, NAT traversal, DNS, SSH authz — is delegated to headscale/tailscale.
 
-1. **Simplicity**: Single executable handles all operations
-2. **Security**: Admin approval required, unique keys per machine
-3. **Self-Service**: WSL users can register without VPS access
-4. **Automation**: Minimal manual configuration required
-5. **Multi-Client**: Support multiple WSL instances simultaneously
+## Roles
 
-## Network Topology
+A machine can hold several roles at once (a laptop is usually controller +
+consumer). `connector` detects them from cheap, local state:
 
-```
-                         Internet
-                            │
-                            │
-                    ┌───────▼────────┐
-                    │   VPS Server   │
-                    │  10.0.0.1/24   │
-                    │  UDP:51820     │
-                    └───────┬────────┘
-                            │
-                    WireGuard Tunnel
-                            │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-   ┌────▼─────┐       ┌────▼─────┐       ┌────▼─────┐
-   │   WSL 1  │       │   WSL 2  │       │   WSL 3  │
-   │ 10.0.0.2 │       │ 10.0.0.3 │       │ 10.0.0.4 │
-   │  SSH:22  │       │  SSH:22  │       │  SSH:22  │
-   └──────────┘       └──────────┘       └──────────┘
-```
+| Role           | Detected by                                             | Can do                                  |
+|----------------|---------------------------------------------------------|-----------------------------------------|
+| **cnc**        | `headscale` binary present **and** `/etc/headscale/config.yaml` exists | runs admin commands locally |
+| **controller** | a saved link at `~/.config/connector/cnc`               | runs admin commands on the CNC over SSH |
+| **provider**   | local role file says `provider`/`both` (`tag:provider`) | accepts Tailscale SSH                   |
+| **consumer**   | local role file says `consumer`/`both` (`tag:consumer`) | initiates SSH to providers              |
 
-### IP Allocation
+`connector whoami` prints the detected set; `connector status` shows it too.
 
-- **VPS**: 10.0.0.1/24 (WireGuard server)
-- **Clients**: 10.0.0.2, 10.0.0.3, 10.0.0.4, ... (auto-assigned)
-- **Subnet**: 10.0.0.0/24 (256 addresses available)
+Only a **cnc or controller** may invite or approve machines, or promote a new
+controller. A plain provider/consumer has no admin authority.
 
-### Ports
-
-- **WireGuard**: UDP 51820 (VPS must be accessible from internet)
-- **SSH**: TCP 22 (accessible only via WireGuard tunnel)
-
-## Components
-
-### 1. Connector Tool
-
-Single bash script (`connector`) that handles all operations:
-
-**VPS Operations:**
-- `vps-init`: Initialize VPS as WireGuard server
-- `approve`: Approve pending machine registrations
-- `list`: List all connected machines
-- `revoke`: Revoke machine access
-
-**WSL Operations:**
-- `register`: Register WSL to VPS
-- `finalize`: Complete setup after approval
-- `status`: Check connection status
-
-### 2. Registry System
-
-Directory structure on VPS:
+## Topology
 
 ```
-/var/lib/wsl-registry/
-├── pending/              # Pending registrations (writable by staging user)
-│   └── wsl-abc123.json
-├── approved/             # Approved machines (root only)
-│   └── wsl-abc123.json
-├── configs/              # Client configs (readable for download)
-│   └── wsl-abc123.conf
-└── revoked/              # Revoked machines (audit trail)
-    └── wsl-xyz789.json
+        local controller (admin laptop)
+        drives the CNC over the admin's own SSH
+                       │
+                       │  connector invite / approve / list / revoke
+                       ▼
+   ┌─────────────────────────────────────────┐
+   │ VPS = CNC                                │
+   │  headscale (systemd)  HTTPS :443         │
+   │  embedded DERP relay  STUN :3478         │
+   │  ACL policy: tag:provider / tag:consumer │
+   │              + Tailscale SSH rules       │
+   └─────────────────────────────────────────┘
+            ▲                         ▲
+            │ coordination            │ coordination
+            │                         │
+   ┌────────┴────────┐       ┌────────┴─────────┐
+   │ consumer node   │──────▶│ provider node    │
+   │ tailscale up    │ direct│ tailscale up     │
+   │ tag:consumer    │  P2P  │ tag:provider --ssh│
+   └─────────────────┘ (DERP │ (WSL or Linux)   │
+                       fallback)─────────────────┘
+        ssh provider-name  (MagicDNS, ACL-gated)
 ```
 
-### 3. Staging User
+- The CNC is the **control plane** and a **DERP relay**. For direct connections
+  it is *not* in the data path; peers talk P2P and fall back to DERP only when a
+  direct path can't be established.
+- Tailnet IPs (`100.64.0.0/10`) and MagicDNS names are assigned automatically by
+  headscale. There is no manual IP allocation.
 
-Special user account `connector`:
-- Purpose: Accept registration uploads
-- Permissions: Write-only to `pending/` directory
-- Authentication: Password-based (shared with WSL users)
-- Shell: Limited (cannot execute commands)
+## Onboarding (always admin-gated)
 
-### 4. WireGuard Configuration
+There is **no auto-join and no shared reusable key**. Two paths, both controlled
+by the admin:
 
-**Server Config** (`/etc/wireguard/wg-connector.conf`):
-```ini
-[Interface]
-Address = 10.0.0.1/24
-ListenPort = 51820
-PrivateKey = <server_private_key>
-PostUp = iptables rules for NAT/forwarding
-PostDown = cleanup rules
+1. **Invite (streamlined).** Admin runs `connector invite` on the CNC (or from a
+   linked controller, proxied over SSH). It mints a **single-use, short-expiry**
+   pre-auth key (`headscale preauthkeys create … --expiration 1h`) carrying the
+   chosen tags, and prints the exact `connector register …` command to hand to
+   that one machine. The key dies after one use / expiry, so it is not a secret
+   to protect long-term.
 
-[Peer]  # Added for each approved client
-PublicKey = <client_public_key>
-AllowedIPs = 10.0.0.X/32
-```
+2. **Approve (manual review).** A machine runs `connector register …` with no
+   key and shows up in `headscale nodes list`. The admin reviews it and runs
+   `connector approve <node> <type>` to tag/approve that **specific** node.
+   Never "approve all".
 
-**Client Config** (`/etc/wireguard/wg-connector.conf` on WSL):
-```ini
-[Interface]
-Address = 10.0.0.X/32
-PrivateKey = <client_private_key>
-DNS = 1.1.1.1
+`finalize` from the old tool is gone: after a successful `register`, the node is
+already connected.
 
-[Peer]
-PublicKey = <server_public_key>
-Endpoint = <vps_ip>:51820
-AllowedIPs = 10.0.0.0/24
-PersistentKeepalive = 25
-```
+### Controller (C&C commander) invites
 
-## Data Flow
+A controller commands the CNC over SSH, so promoting one is the single place
+where SSH-key handling remains. `connector invite` → option `[3]` (only shown to
+a cnc/controller) authorizes the invitee's SSH public key on the CNC admin
+account and prints the `connector link …` command for them. The invitee gets
+their key via `connector commander-key`. Revoking a controller = removing that
+key from the CNC admin's `authorized_keys`.
 
-### Registration Flow
+## Admin-command routing
 
-```
-WSL Machine                    VPS Server
-    │                              │
-    │  1. Generate keys            │
-    │  (WireGuard + SSH)           │
-    │                              │
-    │  2. Create registration      │
-    │  JSON with metadata          │
-    │                              │
-    │  3. Upload via SCP           │
-    ├─────────────────────────────>│
-    │  (using staging user)        │
-    │                              │  4. JSON saved to pending/
-    │                              │
-    │  5. Wait for approval        │
-    │                              │
-```
+`invite`, `approve`, `list`, `revoke`, and `cleanup-cnc` go through one helper:
 
-### Approval Flow
+1. if this machine **is the CNC** → run `headscale …` locally (via sudo);
+2. else if it **is a controller** → `ssh <CNC> [sudo] headscale …` and relay output;
+3. else → fail with guidance to `cnc-init` or `link` a CNC.
 
-```
-VPS Admin                     VPS Server
-    │                             │
-    │  1. List pending            │
-    │<────────────────────────────┤
-    │                             │
-    │  2. Select machine          │
-    ├────────────────────────────>│
-    │                             │
-    │                             │  3. Allocate IP (10.0.0.X)
-    │                             │
-    │                             │  4. Add [Peer] to wg-connector.conf
-    │                             │
-    │                             │  5. Reload WireGuard
-    │                             │
-    │                             │  6. Add SSH key to authorized_keys
-    │                             │
-    │                             │  7. Generate client config
-    │                             │
-    │                             │  8. Move to approved/
-    │                             │
-    │  9. Display token           │
-    │<────────────────────────────┤
-    │                             │
-```
+Interactive prompts (the invite menu, etc.) happen locally; only concrete
+commands are sent to the CNC.
 
-### Finalization Flow
+## ACL policy (`/etc/headscale/acl.hujson`)
 
-```
-WSL Machine                    VPS Server
-    │                              │
-    │  1. Request config           │
-    ├─────────────────────────────>│
-    │  (using staging user + token)│
-    │                              │  2. Validate token
-    │                              │
-    │  3. Download wg-connector.conf        │
-    │<─────────────────────────────┤
-    │                              │
-    │  4. Install config           │
-    │  to /etc/wireguard/          │
-    │                              │
-    │  5. Enable systemd services  │
-    │  (wg-quick@wg-connector, sshd)        │
-    │                              │
-    │  6. Start WireGuard          │
-    │                              │
-    │  7. Establish tunnel         │
-    │<────────────────────────────>│
-    │  WireGuard handshake         │
-    │                              │
-    │  8. Test connectivity        │
-    │  (ping 10.0.0.1)             │
-    │                              │
-```
-
-## Data Structures
-
-### Registration JSON
-
-```json
+```hujson
 {
-  "machine_id": "wsl-abc12345",
-  "timestamp": "2025-11-25T10:00:00Z",
-  "hostname": "my-laptop",
-  "username": "john",
-  "wg_pubkey": "base64_encoded_wireguard_public_key",
-  "ssh_pubkey": "ssh-ed25519 AAAAC3... john@wsl",
-  "request_note": "WSL machine registration"
+  "tagOwners": { "tag:provider": ["mesh"], "tag:consumer": ["mesh"] },
+  "acls": [
+    { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider:*"] }
+  ],
+  "ssh": [
+    { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider"],
+      "users": ["autogroup:nonroot"] }
+  ]
 }
 ```
 
-### Approved Machine JSON
+Tailnet membership is already gated at join time (invite key / approve), so
+network access here is a static, tag-based policy instead of per-host
+`sshd_config`/`authorized_keys` edits. Switching the SSH rule to
+`"action": "check"` additionally requires re-auth per SSH session.
 
-```json
-{
-  "machine_id": "wsl-abc12345",
-  "timestamp": "2025-11-25T10:00:00Z",
-  "approved_at": "2025-11-25T10:05:00Z",
-  "hostname": "my-laptop",
-  "username": "john",
-  "wg_ip": "10.0.0.2",
-  "wg_pubkey": "base64_encoded_wireguard_public_key",
-  "ssh_pubkey": "ssh-ed25519 AAAAC3... john@wsl",
-  "request_note": "WSL machine registration"
-}
-```
+## TLS / control URL
 
-## Security Model
+`cnc-init --url https://host` configures headscale's built-in Let's Encrypt via
+`tls_letsencrypt_hostname` (`TLS-ALPN-01` challenge by default). A reachable DNS
+name for the VPS is strongly recommended.
 
-### Threat Model
+Fallbacks if you can't use ALPN/Let's Encrypt:
+- switch `tls_letsencrypt_challenge_type` to `HTTP-01` (needs :80 reachable);
+- terminate TLS at a reverse proxy and point `server_url` at it;
+- for IP-only/lab use, set `tls_cert_path`/`tls_key_path` to your own cert, or
+  pass a plain `http://…` URL (clients then need their own TLS-terminating proxy).
 
-**Protected Against:**
-- Unauthorized machine registration (requires admin approval)
-- Key compromise (unique keys per machine)
-- Man-in-the-middle (WireGuard encryption)
-- Lateral movement (isolated VPN subnet)
+## WSL specifics (auto-handled)
 
-**Attack Vectors:**
-- Staging password compromise (can upload fake registrations)
-- VPS compromise (full system access)
-- Physical access to WSL machine
+`register` detects WSL and:
+- if systemd is **not** PID 1, **asks** before adding `[boot] systemd=true` to
+  `/etc/wsl.conf` (idempotent; `--yes` skips the prompt), then tells you to
+  `wsl --shutdown` and re-run;
+- pins the `tailscale0` MTU to 1280 **only if** the current value is larger,
+  avoiding large-packet drops over WSL's NAT.
 
-### Security Measures
+## State & files
 
-1. **Separation of Duties**
-   - WSL users can register but not approve
-   - Admin approval required for network access
-   - Staging user has minimal permissions
+| Location                               | Purpose                                    |
+|----------------------------------------|--------------------------------------------|
+| `/etc/headscale/config.yaml`           | CNC: headscale config (written by `cnc-init`) |
+| `/etc/headscale/acl.hujson`            | CNC: tag/SSH ACL policy                    |
+| `/var/lib/headscale/`                  | CNC: keys + sqlite DB                      |
+| `~/.config/connector/cnc`             | controller: linked CNC (`CNC_SSH/URL/PORT`)|
+| `~/.config/connector/role`            | node: last registered role (provider/…)    |
+| `~/.config/connector/aliases.conf`    | saved `connector <name>` SSH shortcuts     |
+| `~/.ssh/config`                       | optional Host entries written by `alias`   |
 
-2. **Cryptographic Security**
-   - WireGuard: Noise protocol framework
-   - SSH: ed25519 keys (modern, secure)
-   - All keys generated locally
+The only persisted controller secret is the SSH access it already has to the
+CNC. Everything else is read live from headscale/tailscale.
 
-3. **Network Isolation**
-   - Each client isolated with AllowedIPs
-   - No direct internet access via VPN (by default)
-   - SSH only accessible via WireGuard tunnel
+## Ports (open on the CNC)
 
-4. **Audit Trail**
-   - All registrations logged with timestamps
-   - Approved/revoked machines tracked
-   - JSON files provide audit history
+| Port        | Use                                   |
+|-------------|---------------------------------------|
+| 443/tcp     | headscale control + DERP (HTTPS)      |
+| 3478/udp    | STUN (NAT traversal)                  |
+| 41641/udp   | tailscale direct connections          |
 
-5. **Minimal Attack Surface**
-   - Only UDP 51820 exposed on VPS
-   - Staging user cannot execute commands
-   - Write-only pending directory
+## Migration from the old WireGuard connector
 
-### Best Practices
+This is a greenfield cut-over. After moving to headscale/tailscale, tear down
+leftover state from the previous design (the relevant commands are printed by
+`connector cleanup-cnc`):
 
-1. **Rotate staging password regularly**
-2. **Monitor pending directory for suspicious registrations**
-3. **Review approved machines periodically** (`connector list`)
-4. **Revoke unused machines** (`connector revoke`)
-5. **Backup `/var/lib/wsl-registry/` regularly**
-6. **Keep WireGuard updated** on all systems
-
-## Systemd Integration
-
-### VPS Services
-
-- `wg-quick@wg-connector.service`: WireGuard server
-  - Enabled: Auto-start on boot
-  - Manages interface and routing
-
-### WSL Services
-
-- `wg-quick@wg-connector.service`: WireGuard client
-  - Enabled: Auto-start when systemd initializes
-  - Connects to VPS automatically
-
-- `sshd.service`: SSH daemon
-  - Enabled: Auto-start when systemd initializes
-  - Listens on port 22 (WireGuard interface)
-
-### WSL Boot Process
-
-```
-Windows starts WSL
-       │
-       ▼
-/etc/wsl.conf loaded
-       │
-       ▼
-systemd enabled? ──No──> Traditional init
-       │
-      Yes
-       ▼
-systemd starts
-       │
-       ├─> wg-quick@wg-connector.service
-       │   └─> Establishes WireGuard tunnel
-       │
-       └─> sshd.service
-           └─> SSH server ready
-```
-
-## IP Allocation Algorithm
-
-```python
-def get_next_ip():
-    max_ip = 1  # Start from .2 (VPS is .1)
-    
-    for each file in approved/:
-        ip = extract_ip_from_json(file)
-        last_octet = ip.split('.')[-1]
-        if last_octet > max_ip:
-            max_ip = last_octet
-    
-    return f"10.0.0.{max_ip + 1}"
-```
-
-This ensures:
-- Sequential IP assignment
-- No conflicts
-- Simple to understand
-- Recovers from deletions
-
-## Error Handling
-
-### Registration Errors
-
-- **Network failure**: Retry with manual SCP
-- **Permission denied**: Check staging password
-- **Keys exist**: Reuse existing keys
-
-### Approval Errors
-
-- **Invalid JSON**: Skip and warn admin
-- **IP exhaustion**: Fail with clear message
-- **WireGuard reload fails**: Rollback changes
-
-### Finalization Errors
-
-- **Config download fails**: Check token and connectivity
-- **systemd not available**: Warn user to restart WSL
-- **Tunnel won't connect**: Check firewall and VPS status
-
-## Performance Considerations
-
-### Scalability
-
-- **Client Limit**: 254 clients (10.0.0.2 - 10.0.0.255)
-- **WireGuard Overhead**: ~4% (minimal CPU/bandwidth impact)
-- **JSON Parsing**: O(n) for listing machines
-
-### Optimization
-
-- Use `wg syncconf` instead of full restart (zero downtime)
-- JSON files are small (< 1KB each)
-- No database required (filesystem is sufficient)
-
-## Future Enhancements
-
-Possible improvements:
-
-1. **Web Interface**: Browser-based approval workflow
-2. **Automatic Revocation**: Remove inactive machines after X days
-3. **Multi-VPS**: Support federation of multiple VPS servers
-4. **IPv6 Support**: Dual-stack configuration
-5. **Metrics**: Bandwidth and connection statistics
-6. **Notifications**: Email/webhook on registration
-7. **Key Rotation**: Automatic key rotation for machines
-
-## Comparison with Alternatives
-
-### vs Traditional VPN (OpenVPN)
-
-**Advantages:**
-- Faster (WireGuard is significantly faster)
-- Simpler configuration
-- Modern cryptography
-- Better NAT traversal
-
-**Disadvantages:**
-- Less mature (OpenVPN has 20+ years)
-- Fewer client options
-
-### vs Tailscale/ZeroTier
-
-**Advantages:**
-- Self-hosted (no third-party)
-- Full control over infrastructure
-- No account registration
-- Simple architecture
-
-**Disadvantages:**
-- More manual setup
-- No built-in relay servers
-- Requires public VPS
-
-### vs Direct SSH
-
-**Advantages:**
-- Persistent VPN tunnel
-- Multiple services (not just SSH)
-- Better for WSL (stable IPs)
-- Network-level access
-
-**Disadvantages:**
-- More complex setup
-- Additional moving parts
-- Requires WireGuard installation
+- `wg-quick@wg-connector` service + `/etc/wireguard/wg-connector.conf`
+- the `/var/lib/wsl-registry/` registry tree
+- the `connector` staging user
+- any `Match User connector` blocks in `/etc/ssh/sshd_config`
 
 ## References
 
-- [WireGuard Official Site](https://www.wireguard.com/)
-- [WireGuard Protocol Paper](https://www.wireguard.com/papers/wireguard.pdf)
-- [systemd Documentation](https://www.freedesktop.org/wiki/Software/systemd/)
-- [WSL Documentation](https://docs.microsoft.com/en-us/windows/wsl/)
+- headscale — https://github.com/juanfont/headscale
+- Tailscale ACLs — https://tailscale.com/kb/1018/acls
+- Tailscale SSH — https://tailscale.com/kb/1193/tailscale-ssh
+- DERP — https://tailscale.com/kb/1232/derp-servers
+- WSL systemd — https://learn.microsoft.com/windows/wsl/systemd
