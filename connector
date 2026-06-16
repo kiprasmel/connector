@@ -995,9 +995,19 @@ register_macos() {
     if [ "$cli" = "$TS_MAC_APP_CLI" ]; then runner_cmd=("$cli"); else runner_cmd=(sudo "$cli"); fi
 
     log_info "Bringing up tailscale on macOS (type: $type, hostname: $hostname)..."
-    local up_args=(up --login-server "$url" --hostname "$hostname" --advertise-tags="$tags" --accept-dns=true)
+    # --reset makes register declarative: apply exactly these flags and ignore
+    # stale prefs from earlier attempts (tailscale otherwise refuses to change
+    # settings without re-stating every non-default flag).
+    # An auth key already carries its tags (forced tags). headscale rejects a
+    # user-scoped key combined with --advertise-tags, so only advertise the tags
+    # for interactive (keyless) registration where the admin owns them.
+    local up_args=(up --reset --login-server "$url" --hostname "$hostname" --accept-dns=true)
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
-    [ -n "$key" ] && up_args+=(--authkey "$key")
+    if [ -n "$key" ]; then
+        up_args+=(--authkey "$key")
+    else
+        up_args+=(--advertise-tags="$tags")
+    fi
 
     if ! "${runner_cmd[@]}" "${up_args[@]}"; then
         log_warn "tailscale up failed."
@@ -1083,9 +1093,19 @@ cmd_register() {
     esac
 
     log_info "Bringing up tailscale (type: $type, hostname: $hostname)..."
-    local up_args=(--login-server "$url" --hostname "$hostname" --advertise-tags="$tags" --accept-dns=true)
+    # --reset makes register declarative: apply exactly these flags and ignore
+    # stale prefs from earlier attempts (tailscale otherwise refuses to change
+    # settings without re-stating every non-default flag).
+    # An auth key already carries its tags (forced tags). headscale rejects a
+    # user-scoped key combined with --advertise-tags, so only advertise the tags
+    # for interactive (keyless) registration where the admin owns them.
+    local up_args=(--reset --login-server "$url" --hostname "$hostname" --accept-dns=true)
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
-    [ -n "$key" ] && up_args+=(--authkey "$key")
+    if [ -n "$key" ]; then
+        up_args+=(--authkey "$key")
+    else
+        up_args+=(--advertise-tags="$tags")
+    fi
 
     if ! as_root tailscale up "${up_args[@]}"; then
         if [ -z "$key" ]; then
