@@ -2,7 +2,7 @@
 # connector - headscale/tailscale mesh management tool
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # --- Constants ---------------------------------------------------------------
 HEADSCALE_USER="mesh"
@@ -10,15 +10,21 @@ HEADSCALE_CONFIG="/etc/headscale/config.yaml"
 HEADSCALE_ACL="/etc/headscale/acl.hujson"
 HEADSCALE_LIB="/var/lib/headscale"
 HEADSCALE_BIN="/usr/local/bin/headscale"
+HEADSCALE_CERT_DIR="${HEADSCALE_LIB}/certs"
+HEADSCALE_CERT="${HEADSCALE_CERT_DIR}/cnc.crt"
+HEADSCALE_KEY="${HEADSCALE_CERT_DIR}/cnc.key"
+HS_TLS_PORT_DEFAULT="8443"
 CONNECTOR_BIN="/usr/local/bin/connector"
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/connector"
 CNC_LINK_FILE="${STATE_DIR}/cnc"
 ROLE_FILE="${STATE_DIR}/role"
+CNC_CA_FILE="${STATE_DIR}/cnc-ca.crt"
 ALIASES_FILE="${STATE_DIR}/aliases.conf"
 SSH_CONFIG_FILE="${HOME}/.ssh/config"
 KEY_EXPIRY="${CONNECTOR_KEY_EXPIRY:-1h}"
 WSL_MTU="1280"
 TS_INSTALL_URL="https://tailscale.com/install.sh"
+TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
     cnc-init link invite commander-key register approve list revoke
@@ -73,6 +79,53 @@ self_path() {
 # Extract a top-level JSON string field ("field":"value") from stdin.
 json_str() {
     sed -n 's/.*"'"$1"'":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+}
+
+os_kind() {
+    case "$(uname -s)" in
+        Darwin) echo "macos" ;;
+        Linux)  echo "linux" ;;
+        *)      echo "other" ;;
+    esac
+}
+
+# True if $1 looks like a bare IP (v4 or v6), not a DNS hostname.
+is_ip() {
+    local h="$1"
+    case "$h" in *:*) return 0 ;; esac          # IPv6 contains colons
+    case "$h" in *[!0-9.]*) return 1 ;; esac     # v4 has only digits + dots
+    [ "$(printf '%s' "$h" | tr -cd '.' | wc -c | tr -d ' ')" = "3" ]
+}
+
+# Parse host / port out of a URL (handles scheme, [v6]:port, host:port, path).
+url_host() {
+    local u="${1#*://}"; u="${u%%/*}"
+    case "$u" in
+        \[*\]*) printf '%s' "${u%%\]*}]" | tr -d '[]' ;;
+        *:*)    printf '%s' "${u%%:*}" ;;
+        *)      printf '%s' "$u" ;;
+    esac
+}
+url_port() {
+    local u="${1#*://}"; u="${u%%/*}"
+    case "$u" in
+        \[*\]:*) printf '%s' "${u##*]:}" ;;
+        \[*\])   printf '' ;;
+        *:*)     printf '%s' "${u##*:}" ;;
+        *)       printf '' ;;
+    esac
+}
+
+# SHA-256 fingerprint (lowercase hex, no colons) of a PEM cert on stdin.
+fp_of_pem() {
+    openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+        | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f' | tr -d '[:space:]'
+}
+
+# Fetch the leaf cert a TLS server presents: fetch_live_cert <host> <port>
+fetch_live_cert() {
+    echo | openssl s_client -connect "${1}:${2}" -servername "$1" 2>/dev/null \
+        | openssl x509 2>/dev/null
 }
 
 # --- Role detection ----------------------------------------------------------
@@ -231,17 +284,118 @@ EOF
     as_root systemctl daemon-reload
 }
 
+# Generate a long-lived self-signed cert with the IP in the SAN (idempotent).
+gen_self_signed() {
+    local ip="$1"
+    if [ -s "$HEADSCALE_CERT" ] && [ -s "$HEADSCALE_KEY" ] \
+        && as_root openssl x509 -in "$HEADSCALE_CERT" -noout -text 2>/dev/null | grep -q "IP Address:${ip}\b"; then
+        log_info "Reusing existing self-signed cert for ${ip}"
+    else
+        have openssl || as_root apt-get install -y openssl >/dev/null 2>&1 || true
+        log_info "Generating self-signed TLS cert for ${ip} (10y, P-256)..."
+        as_root mkdir -p "$HEADSCALE_CERT_DIR"
+        as_root openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -days 3650 -subj "/CN=${ip}" -addext "subjectAltName=IP:${ip}" \
+            -keyout "$HEADSCALE_KEY" -out "$HEADSCALE_CERT" >/dev/null 2>&1 \
+            || die "openssl certificate generation failed"
+    fi
+    # headscale (.deb) runs as user 'headscale'; binary install runs as root.
+    as_root chown -R headscale:headscale "$HEADSCALE_CERT_DIR" 2>/dev/null || true
+    as_root chmod 750 "$HEADSCALE_CERT_DIR" 2>/dev/null || true
+    as_root chmod 640 "$HEADSCALE_KEY"  2>/dev/null || true
+    as_root chmod 644 "$HEADSCALE_CERT" 2>/dev/null || true
+}
+
+# Print the CNC's self-signed cert PEM (local file on cnc, or over SSH).
+cnc_cert_pem() {
+    if is_cnc; then
+        as_root cat "$HEADSCALE_CERT" 2>/dev/null
+    elif is_controller; then
+        load_cnc_link
+        if [ "$CNC_USER" = "root" ]; then ssh_cnc cat "$HEADSCALE_CERT" 2>/dev/null
+        else ssh_cnc sudo cat "$HEADSCALE_CERT" 2>/dev/null; fi
+    fi
+}
+
+cnc_cert_fingerprint() { cnc_cert_pem | fp_of_pem; }
+
+# Install + trust a CNC cert (PEM on stdin) in this machine's trust store.
+trust_cnc_cert() {
+    local pem; pem="$(cat)"
+    [ -n "$pem" ] || { log_warn "No CNC certificate to trust."; return 1; }
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+    printf '%s\n' "$pem" > "$CNC_CA_FILE"; chmod 644 "$CNC_CA_FILE"
+    case "$(os_kind)" in
+        macos)
+            log_info "Trusting the CNC certificate in the macOS System keychain (needs sudo)..."
+            sudo security add-trusted-cert -d -r trustRoot -p ssl \
+                -k /Library/Keychains/System.keychain "$CNC_CA_FILE" \
+                || { log_error "Failed to add the cert to the System keychain."; return 1; }
+            ;;
+        linux)
+            as_root install -m 0644 "$CNC_CA_FILE" /usr/local/share/ca-certificates/headscale-cnc.crt
+            as_root update-ca-certificates >/dev/null 2>&1 || true
+            ;;
+        *) log_warn "Unknown OS; trust $CNC_CA_FILE manually." ;;
+    esac
+    log_success "Trusted the CNC certificate."
+}
+
+# Remove a previously-trusted CNC cert. untrust_cnc_cert [common-name]
+untrust_cnc_cert() {
+    local cn="${1:-}"
+    case "$(os_kind)" in
+        macos) [ -n "$cn" ] && sudo security delete-certificate -c "$cn" /Library/Keychains/System.keychain 2>/dev/null || true ;;
+        linux) as_root rm -f /usr/local/share/ca-certificates/headscale-cnc.crt 2>/dev/null || true
+               as_root update-ca-certificates --fresh >/dev/null 2>&1 || true ;;
+    esac
+    rm -f "$CNC_CA_FILE" 2>/dev/null || true
+}
+
+# Ensure this machine trusts the CNC's self-signed cert (only for IP CNCs).
+# establish_cnc_trust <url> [pin-sha256]
+establish_cnc_trust() {
+    local url="$1" pin="${2:-}" host port pem livefp
+    [ "${url%%://*}" = "https" ] || return 0
+    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
+    is_ip "$host" || return 0                      # public-domain CNC = publicly-trusted cert
+    [ -s "$CNC_CA_FILE" ] && return 0              # already trusted
+    if is_controller; then
+        pem="$(cnc_cert_pem)"
+        [ -n "$pem" ] || die "Could not read the CNC cert over SSH."
+    else
+        pem="$(fetch_live_cert "$host" "$port")"
+        [ -n "$pem" ] || die "Could not fetch a TLS cert from ${host}:${port}."
+        livefp="$(printf '%s\n' "$pem" | fp_of_pem)"
+        if [ -n "$pin" ]; then
+            [ "$livefp" = "$pin" ] || die "CNC cert fingerprint mismatch (pinned $pin, got $livefp)."
+        else
+            log_warn "No --ca-sha256 pin given; cert presented by ${host}:${port} has fingerprint:"
+            log_warn "  $livefp"
+            confirm "Trust this CNC certificate?" || die "Declined."
+        fi
+    fi
+    printf '%s\n' "$pem" | trust_cnc_cert
+}
+
 write_headscale_config() {
-    local url="$1" base_domain="$2" host scheme listen_addr tls_block
-    host="${url#*://}"; host="${host%%/*}"; host="${host%%:*}"
+    local url="$1" base_domain="$2" host scheme port listen_addr tls_block
+    host="$(url_host "$url")"; port="$(url_port "$url")"
     scheme="${url%%://*}"
-    if [ "$scheme" = "https" ]; then
-        listen_addr="0.0.0.0:443"
+    if [ "$scheme" = "https" ] && is_ip "$host"; then
+        [ -n "$port" ] || port="$HS_TLS_PORT_DEFAULT"
+        listen_addr="0.0.0.0:${port}"
+        gen_self_signed "$host"
+        tls_block=$(printf 'tls_cert_path: "%s"\ntls_key_path: "%s"\ntls_letsencrypt_hostname: ""' "$HEADSCALE_CERT" "$HEADSCALE_KEY")
+    elif [ "$scheme" = "https" ]; then
+        [ -n "$port" ] || port="443"
+        listen_addr="0.0.0.0:${port}"
         tls_block=$(printf 'tls_letsencrypt_hostname: "%s"\ntls_letsencrypt_cache_dir: %s/cache\ntls_letsencrypt_challenge_type: TLS-ALPN-01' "$host" "$HEADSCALE_LIB")
     else
-        listen_addr="0.0.0.0:8080"
+        [ -n "$port" ] || port="8080"
+        listen_addr="0.0.0.0:${port}"
         tls_block='tls_letsencrypt_hostname: ""'
-        log_warn "URL is not https; headscale will serve plain HTTP on :8080 (clients need an https endpoint or a TLS proxy)."
+        log_warn "URL is not https; headscale will serve plain HTTP on :${port} (clients need an https endpoint or a TLS proxy)."
     fi
     as_root mkdir -p /etc/headscale "$HEADSCALE_LIB"
     as_root tee "$HEADSCALE_CONFIG" >/dev/null <<EOF
@@ -331,19 +485,23 @@ EOF
 }
 
 open_firewall() {
-    if have ufw; then
-        as_root ufw allow 443/tcp   >/dev/null 2>&1 || true
+    local tcp_port="${1:-$HS_TLS_PORT_DEFAULT}" desc
+    desc="${tcp_port}/tcp, 3478/udp, 41641/udp"
+    if have ufw && as_root ufw status 2>/dev/null | grep -q "Status: active"; then
+        as_root ufw allow "${tcp_port}/tcp" >/dev/null 2>&1 || true
         as_root ufw allow 3478/udp  >/dev/null 2>&1 || true
         as_root ufw allow 41641/udp >/dev/null 2>&1 || true
-        log_success "ufw rules added (443/tcp, 3478/udp, 41641/udp)"
-    elif have firewall-cmd; then
-        as_root firewall-cmd --permanent --add-port=443/tcp   >/dev/null 2>&1 || true
+        log_success "ufw rules added (${desc})"
+    elif have firewall-cmd && as_root firewall-cmd --state >/dev/null 2>&1; then
+        as_root firewall-cmd --permanent --add-port="${tcp_port}/tcp" >/dev/null 2>&1 || true
         as_root firewall-cmd --permanent --add-port=3478/udp  >/dev/null 2>&1 || true
         as_root firewall-cmd --permanent --add-port=41641/udp >/dev/null 2>&1 || true
         as_root firewall-cmd --reload >/dev/null 2>&1 || true
-        log_success "firewalld rules added (443/tcp, 3478/udp, 41641/udp)"
+        log_success "firewalld rules added (${desc})"
     else
-        log_warn "No ufw/firewalld found. Open manually: 443/tcp, 3478/udp, 41641/udp"
+        # No active host firewall (e.g. ufw inactive) - do NOT enable one (lockout risk).
+        log_info "No active host firewall detected; not enabling one."
+        log_info "Ensure these are open (including any cloud firewall): ${desc}"
     fi
 }
 
@@ -360,24 +518,41 @@ ensure_headscale_user() {
 cnc_init_local() {
     local url="$1" base_domain="$2"
     require_root cnc-init
-    [ -n "$url" ] || die "Usage: connector cnc-init --url https://vpn.example.com"
+    [ -n "$url" ] || die "Usage: connector cnc-init --url https://<host-or-ip>[:port]"
     [ -n "$base_domain" ] || base_domain="connector.mesh"
 
-    log_info "Initialising CNC (headscale) for ${url} (MagicDNS base: ${base_domain})"
+    local host port self_signed=0
+    host="$(url_host "$url")"; port="$(url_port "$url")"
+    if [ "${url%%://*}" = "https" ] && is_ip "$host"; then
+        self_signed=1
+        # No domain -> headscale serves its own TLS on a dedicated port (default 8443),
+        # so it never collides with anything already on :443.
+        if [ -z "$port" ]; then port="$HS_TLS_PORT_DEFAULT"; url="https://${host}:${port}"; fi
+    fi
+
+    log_info "Initialising CNC (headscale) for ${url}"
+    [ "$self_signed" = 1 ] && log_info "TLS: self-signed cert pinned to ${host} (no domain needed)."
     have curl || as_root apt-get install -y curl >/dev/null 2>&1 || true
     install_headscale
     write_headscale_config "$url" "$base_domain"
     write_acl
     log_info "Enabling + starting headscale..."
-    as_root systemctl enable --now headscale >/dev/null 2>&1 || as_root systemctl restart headscale
+    as_root systemctl enable headscale >/dev/null 2>&1 || true
+    as_root systemctl restart headscale
     sleep 2
     ensure_headscale_user
-    open_firewall
+    open_firewall "${port:-$HS_TLS_PORT_DEFAULT}"
 
     echo
-    log_success "CNC ready at ${url}"
-    echo "Next: authorize a machine:"
-    echo "    connector invite            # choose provider/consumer; prints a register command"
+    if as_root systemctl is-active --quiet headscale; then
+        log_success "CNC ready at ${url}"
+    else
+        log_warn "headscale is not active yet - check: journalctl -u headscale -e"
+    fi
+    if [ "$self_signed" = 1 ]; then
+        echo "  CNC cert SHA-256: $(cnc_cert_fingerprint 2>/dev/null || echo '?')"
+    fi
+    echo "Next: authorize a machine:  connector invite"
 }
 
 # --- cnc-init dispatcher + remote orchestration + link ----------------------
@@ -399,9 +574,31 @@ cmd_cnc_init() {
     fi
 }
 
+# Resolve an ssh target/alias to its configured HostName (IP or domain).
+ssh_resolved_host() {
+    ssh -G "$1" 2>/dev/null | awk '/^hostname /{print $2; exit}'
+}
+
+# Verify the CNC TLS port is reachable from here; prompt to open firewall if not.
+check_cnc_reachable() {
+    local url="$1" host port i ok=0
+    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
+    log_info "Checking that ${host}:${port} is reachable from here..."
+    for i in 1 2 3; do
+        if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then ok=1; exec 3>&- 2>/dev/null; break; fi
+        [ "$i" -lt 3 ] && sleep 2
+    done
+    if [ "$ok" = 1 ]; then
+        log_success "${host}:${port} is reachable."
+    else
+        log_warn "Could NOT reach ${host}:${port} from this machine."
+        echo "  Open on the CNC's firewall (including any cloud firewall): ${port}/tcp, 3478/udp, 41641/udp"
+        confirm "Continue anyway?" || die "Open the firewall, then re-run."
+    fi
+}
+
 cnc_init_remote() {
-    local host="$1" url="$2" port="$3" sshflag scpflag self
-    [ -n "$url" ] || die "Usage: connector cnc-init <user@host> --url https://vpn.example.com [-p port]"
+    local host="$1" url="$2" port="$3" sshflag scpflag self configured=0
     have ssh || die "ssh not found"; have scp || die "scp not found"
     sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
     scpflag="$([ -n "$port" ] && echo "-P $port" || true)"
@@ -412,6 +609,30 @@ cnc_init_remote() {
 
     # shellcheck disable=SC2086
     if ssh $sshflag "$host" 'test -f /etc/headscale/config.yaml && systemctl is-active --quiet headscale' 2>/dev/null; then
+        configured=1
+    fi
+
+    # Determine the server URL: explicit --url, else the remote's existing one,
+    # else derive an IP from your SSH config (HostName) + default TLS port.
+    if [ -z "$url" ]; then
+        if [ "$configured" = 1 ]; then
+            # shellcheck disable=SC2086
+            url="$(ssh $sshflag "$host" "sudo sed -n 's/^server_url:[[:space:]]*//p' /etc/headscale/config.yaml 2>/dev/null | head -n1" | tr -d '\r')"
+        fi
+        if [ -z "$url" ]; then
+            local ip; ip="$(ssh_resolved_host "$host")"
+            [ -n "$ip" ] || die "Could not resolve an address for '$host'; pass --url https://<ip>:${HS_TLS_PORT_DEFAULT}"
+            url="https://${ip}:${HS_TLS_PORT_DEFAULT}"
+            log_info "No --url given; using ${url} (resolved from your SSH config for '$host')."
+        fi
+    fi
+    # Normalise an IP CNC without a port so the saved link matches the listener.
+    if [ "${url%%://*}" = "https" ]; then
+        local uh up; uh="$(url_host "$url")"; up="$(url_port "$url")"
+        if is_ip "$uh" && [ -z "$up" ]; then url="https://${uh}:${HS_TLS_PORT_DEFAULT}"; fi
+    fi
+
+    if [ "$configured" = 1 ]; then
         log_info "CNC already configured on $host; skipping install."
     else
         log_info "Copying connector to $host and running cnc-init..."
@@ -426,6 +647,8 @@ cnc_init_remote() {
 
     save_cnc_link "$host" "$url" "$port"
     log_success "Linked to CNC $host (this machine is now a controller)."
+
+    check_cnc_reachable "$url"
 
     echo
     echo "Register this machine on the tailnet?"
@@ -532,7 +755,7 @@ cmd_invite() {
     fi
 
     if [ "${#types[@]}" -gt 0 ]; then
-        local type url key hostarg=""
+        local type url key hostarg="" pinarg="" fp
         if printf '%s\n' "${types[@]}" | grep -qx provider && printf '%s\n' "${types[@]}" | grep -qx consumer; then
             type="both"
         else
@@ -541,11 +764,15 @@ cmd_invite() {
         url="$(cnc_server_url)"; [ -n "$url" ] || url="<server-url>"
         key="$(mint_key "$type")"
         [ -n "$name" ] && hostarg=" --hostname $name"
+        if is_ip "$(url_host "$url")"; then
+            fp="$(cnc_cert_fingerprint 2>/dev/null || true)"
+            [ -n "$fp" ] && pinarg=" --ca-sha256 ${fp}"
+        fi
         echo
         log_success "Single-use invite created (type: ${type}, expires in ${KEY_EXPIRY})."
         echo "Run this on the new machine:"
         echo
-        echo "    connector register ${type} ${url} --authkey ${key}${hostarg}"
+        echo "    connector register ${type} ${url} --authkey ${key}${pinarg}${hostarg}"
         echo
     fi
 }
@@ -613,6 +840,108 @@ install_tailscale() {
     have tailscale || die "tailscale installation failed."
 }
 
+install_tailscale_macos_app() {
+    [ -x "$TS_MAC_APP_CLI" ] && return 0
+    if have brew; then
+        log_info "Installing the Tailscale GUI app (Homebrew cask)..."
+        brew install --cask tailscale \
+            || die "brew install --cask tailscale failed; install from https://tailscale.com/download/mac"
+    else
+        die "Install the Tailscale app from https://tailscale.com/download/mac (or install Homebrew), then re-run."
+    fi
+    open -a Tailscale 2>/dev/null || true
+    log_warn "Launched Tailscale.app - if macOS prompts, allow its VPN/system extension, then re-run register."
+}
+
+install_tailscale_macos_oss() {
+    have tailscale && return 0
+    have brew || die "Homebrew is required for open-source tailscaled (https://brew.sh), or choose the app."
+    log_info "Installing open-source tailscaled (Homebrew)..."
+    brew install tailscale || die "brew install tailscale failed"
+    log_info "Starting tailscaled as a service..."
+    sudo brew services start tailscale >/dev/null 2>&1 || brew services start tailscale >/dev/null 2>&1 \
+        || log_warn "Could not auto-start tailscaled; run: sudo brew services start tailscale"
+}
+
+# Choose (installing if needed) a macOS tailscale CLI. Prints the path on stdout;
+# all prompts go to stderr/tty so the captured stdout is only the path.
+macos_tailscale_cli() {
+    local variant="$1" app="$TS_MAC_APP_CLI" oss have_app=0 have_oss=0 c
+    [ -x "$app" ] && have_app=1
+    oss="$(command -v tailscale 2>/dev/null || true)"; [ -n "$oss" ] && have_oss=1
+    case "$variant" in
+        app) install_tailscale_macos_app >&2; printf '%s\n' "$app"; return 0 ;;
+        oss) install_tailscale_macos_oss >&2; command -v tailscale; return 0 ;;
+        "")  ;;
+        *)   echo "Unknown --tailscale variant: $variant (use 'app' or 'oss')" >&2; return 1 ;;
+    esac
+    if [ "$have_app" = 1 ] && [ "$have_oss" = 0 ]; then printf '%s\n' "$app"; return 0; fi
+    if [ "$have_oss" = 1 ] && [ "$have_app" = 0 ]; then printf '%s\n' "$oss"; return 0; fi
+    if [ "$have_app" = 1 ] && [ "$have_oss" = 1 ]; then
+        { echo "Two Tailscale installs found:"
+          echo "  [1] GUI app    ($app)"
+          echo "  [2] tailscaled ($oss)"; } >&2
+        read -r -p "Use which? [1/2]: " c </dev/tty || c=1
+        case "$c" in 2) printf '%s\n' "$oss" ;; *) printf '%s\n' "$app" ;; esac
+        return 0
+    fi
+    { echo "Tailscale is not installed. Install which variant?"
+      echo "  [1] GUI app (Homebrew cask / tailscale.com download)"
+      echo "  [2] open-source tailscaled (Homebrew, CLI only)"; } >&2
+    read -r -p "Install [1/2]: " c </dev/tty || c=1
+    case "$c" in
+        2) install_tailscale_macos_oss >&2; command -v tailscale ;;
+        *) install_tailscale_macos_app >&2; printf '%s\n' "$app" ;;
+    esac
+}
+
+# Print the post-join summary. register_summary <type> <cli> <hostname>
+register_summary() {
+    local type="$1" cli="$2" hostname="$3" ts_ip ts_name
+    ts_ip="$("$cli" ip -4 2>/dev/null | head -n1 || true)"
+    ts_name="$("$cli" status --json 2>/dev/null | json_str DNSName)"; ts_name="${ts_name%.}"
+    [ -n "$ts_name" ] || ts_name="$hostname"
+    echo
+    log_success "Connected as ${type}."
+    [ -n "$ts_ip" ] && echo "  Tailnet IP: $ts_ip"
+    echo "  MagicDNS:   $ts_name"
+    case "$type" in provider|both) echo "  Others reach you via:  ssh <user>@${ts_name}" ;; esac
+    case "$type" in consumer|both) echo "  Reach a provider via:  connector hop <provider-name>" ;; esac
+}
+
+register_macos() {
+    local type="$1" url="$2" key="$3" hostname="$4" variant="$5" cli
+    [ -n "$hostname" ] || hostname="$(hostname -s 2>/dev/null || hostname)"
+    cli="$(macos_tailscale_cli "$variant")" || die "Could not determine a tailscale CLI."
+    [ -n "$cli" ] || die "tailscale CLI not found after install."
+
+    local tags ssh_flag=""
+    case "$type" in
+        provider) tags="tag:provider"; ssh_flag="--ssh" ;;
+        consumer) tags="tag:consumer" ;;
+        both)     tags="tag:provider,tag:consumer"; ssh_flag="--ssh" ;;
+    esac
+
+    # GUI app talks to a per-user daemon (no sudo); oss tailscaled needs root.
+    local -a runner_cmd
+    if [ "$cli" = "$TS_MAC_APP_CLI" ]; then runner_cmd=("$cli"); else runner_cmd=(sudo "$cli"); fi
+
+    log_info "Bringing up tailscale on macOS (type: $type, hostname: $hostname)..."
+    local up_args=(up --login-server "$url" --hostname "$hostname" --advertise-tags="$tags" --accept-dns=true)
+    [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
+    [ -n "$key" ] && up_args+=(--authkey "$key")
+
+    if ! "${runner_cmd[@]}" "${up_args[@]}"; then
+        log_warn "tailscale up failed."
+        log_warn "If a browser login URL appeared, finish there; or ask the admin to run 'connector approve'."
+        log_warn "If using the GUI app, ensure it is running and its system extension is approved."
+        die "tailscale up did not complete."
+    fi
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+    printf '%s\n' "$type" > "$ROLE_FILE"
+    register_summary "$type" "$cli" "$hostname"
+}
+
 # Consent-gated, idempotent WSL systemd enablement. Returns non-zero to abort.
 ensure_wsl_systemd() {
     is_wsl || return 0
@@ -650,19 +979,29 @@ cmd_register() {
     local type="${1:-}"; shift || true
     case "$type" in
         provider|consumer|both) ;;
-        *) die "Usage: connector register <provider|consumer|both> <url> [--authkey KEY] [--hostname N] [--yes]" ;;
+        *) die "Usage: connector register <provider|consumer|both> <url> [--authkey KEY] [--ca-sha256 FP] [--hostname N] [--tailscale app|oss] [--yes]" ;;
     esac
-    local url="" key="" hostname=""
+    local url="" key="" hostname="" pin="" ts_variant=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --authkey)  key="$2"; shift 2 ;;
-            --hostname) hostname="$2"; shift 2 ;;
-            --yes|-y)   ASSUME_YES=1; shift ;;
+            --authkey)   key="$2"; shift 2 ;;
+            --hostname)  hostname="$2"; shift 2 ;;
+            --ca-sha256) pin="$(printf '%s' "$2" | tr 'A-F' 'a-f' | tr -d ': ')"; shift 2 ;;
+            --tailscale) ts_variant="$2"; shift 2 ;;
+            --yes|-y)    ASSUME_YES=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *) [ -z "$url" ] && url="$1" || die "Unexpected argument: $1"; shift ;;
         esac
     done
     [ -n "$url" ] || die "Usage: connector register <provider|consumer|both> <url> [--authkey KEY]"
+
+    # Trust the CNC's self-signed cert (only for IP CNCs; no-op for domain CNCs).
+    establish_cnc_trust "$url" "$pin"
+
+    if [ "$(os_kind)" = "macos" ]; then
+        register_macos "$type" "$url" "$key" "$hostname" "$ts_variant"
+        return $?
+    fi
 
     ensure_wsl_systemd || return 0
     install_tailscale
@@ -691,22 +1030,7 @@ cmd_register() {
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
     printf '%s\n' "$type" > "$ROLE_FILE"
     maybe_fix_wsl_mtu
-
-    local ts_ip ts_name
-    ts_ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-    ts_name="$(tailscale status --json 2>/dev/null | json_str DNSName)"; ts_name="${ts_name%.}"
-    [ -n "$ts_name" ] || ts_name="$hostname"
-
-    echo
-    log_success "Connected as ${type}."
-    [ -n "$ts_ip" ] && echo "  Tailnet IP: $ts_ip"
-    echo "  MagicDNS:   $ts_name"
-    case "$type" in
-        provider|both) echo "  Others reach you via:  ssh <user>@${ts_name}" ;;
-    esac
-    case "$type" in
-        consumer|both) echo "  Reach a provider via:  connector hop <provider-name>" ;;
-    esac
+    register_summary "$type" "tailscale" "$hostname"
 }
 
 # --- Admin: list / approve / revoke -----------------------------------------
@@ -899,11 +1223,22 @@ ssh_config_remove_block() {
 cmd_cleanup() {
     log_warn "This will disconnect this machine from the tailnet."
     confirm "Continue?" || { log_info "Cancelled."; exit 0; }
-    if have tailscale; then
-        as_root tailscale logout 2>/dev/null || true
-        as_root tailscale down 2>/dev/null || true
+    local cli=""
+    if have tailscale; then cli="tailscale"; elif [ -x "$TS_MAC_APP_CLI" ]; then cli="$TS_MAC_APP_CLI"; fi
+    if [ -n "$cli" ]; then
+        if [ "$cli" = "$TS_MAC_APP_CLI" ]; then
+            "$cli" down 2>/dev/null || true; "$cli" logout 2>/dev/null || true
+        else
+            as_root "$cli" logout 2>/dev/null || true; as_root "$cli" down 2>/dev/null || true
+        fi
     fi
     rm -f "$ROLE_FILE"
+    # Remove the trusted self-signed CNC cert, if we installed one.
+    if [ -s "$CNC_CA_FILE" ]; then
+        local cn; cn="$(openssl x509 -in "$CNC_CA_FILE" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -n1)"
+        untrust_cnc_cert "$cn"
+        log_info "Removed the trusted CNC certificate."
+    fi
     if is_controller && confirm "Also forget the linked CNC?"; then
         rm -f "$CNC_LINK_FILE"; log_success "Forgot CNC link."
     fi
@@ -924,8 +1259,9 @@ cmd_cleanup_cnc() {
     if is_cnc; then
         as_root systemctl stop headscale 2>/dev/null || true
         as_root systemctl disable headscale 2>/dev/null || true
+        as_root rm -rf "$HEADSCALE_CERT_DIR" 2>/dev/null || true
     else
-        ssh_cnc 'sudo systemctl stop headscale; sudo systemctl disable headscale' 2>/dev/null || true
+        ssh_cnc "sudo systemctl stop headscale; sudo systemctl disable headscale; sudo rm -rf '$HEADSCALE_CERT_DIR'" 2>/dev/null || true
     fi
     log_success "CNC cleaned up (nodes deleted, headscale stopped)."
     echo
@@ -944,10 +1280,13 @@ connector v${VERSION} - headscale/tailscale mesh manager
 This machine: $(current_roles)
 
 SETUP
-  cnc-init [user@host] --url https://HOST [-p PORT]
+  cnc-init [user@host] [--url https://HOST[:PORT]] [-p SSH_PORT]
                        Set up the CNC (headscale). With user@host it runs
                        remotely over SSH and links this PC as a controller.
-  link <user@host> --url https://HOST [-p PORT]
+                       No domain needed: with a bare IP it self-signs TLS on
+                       :${HS_TLS_PORT_DEFAULT} and pins the cert on clients. If --url is omitted
+                       for a remote, the IP is taken from your SSH config.
+  link <user@host> --url https://HOST[:PORT] [-p SSH_PORT]
                        Attach to an existing CNC (become a controller).
 
 ONBOARD                [admin: run on the CNC or a linked controller]
@@ -961,8 +1300,12 @@ ONBOARD                [admin: run on the CNC or a linked controller]
                        Tag/approve a node that joined without a key.
 
 JOIN
-  register <provider|consumer|both> <url> [--authkey KEY] [--hostname N] [--yes]
-                       Join the tailnet. Auto-handles WSL systemd (asks first).
+  register <provider|consumer|both> <url> [--authkey KEY] [--ca-sha256 FP]
+           [--hostname N] [--tailscale app|oss] [--yes]
+                       Join the tailnet (just paste the command 'invite' prints).
+                       Auto-handles WSL systemd (asks first), trusts a self-signed
+                       CNC cert (pinned via --ca-sha256), and on macOS installs/uses
+                       either the GUI app or open-source tailscaled.
 
 USE
   status               Roles + tailscale/headscale status.
@@ -977,9 +1320,10 @@ USE
   help                 This help.
 
 Examples
-  connector cnc-init root@203.0.113.1 --url https://vpn.example.com
+  connector cnc-init root@203.0.113.1            # no domain; self-signs TLS on :${HS_TLS_PORT_DEFAULT}
+  connector cnc-init root@203.0.113.1 --url https://vpn.example.com   # with a domain
   connector invite consumer
-  connector register consumer https://vpn.example.com --authkey hskey-xxxx
+  connector register consumer https://203.0.113.1:${HS_TLS_PORT_DEFAULT} --authkey hskey-xxxx --ca-sha256 ab12...
   connector hop my-laptop
 EOF
 }

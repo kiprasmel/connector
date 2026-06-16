@@ -40,7 +40,8 @@ controller. A plain provider/consumer has no admin authority.
                        ▼
    ┌─────────────────────────────────────────┐
    │ VPS = CNC                                │
-   │  headscale (systemd)  HTTPS :443         │
+   │  headscale (systemd)  HTTPS :8443        │
+   │   self-signed IP cert  (or :443 + domain)│
    │  embedded DERP relay  STUN :3478         │
    │  ACL policy: tag:provider / tag:consumer │
    │              + Tailscale SSH rules       │
@@ -125,15 +126,30 @@ network access here is a static, tag-based policy instead of per-host
 
 ## TLS / control URL
 
-`cnc-init --url https://host` configures headscale's built-in Let's Encrypt via
-`tls_letsencrypt_hostname` (`TLS-ALPN-01` challenge by default). A reachable DNS
-name for the VPS is strongly recommended.
+Tailscale clients require HTTPS to the control server. `cnc-init` picks the TLS
+mode from the `--url` (or, for a remote, the IP resolved from your SSH config):
 
-Fallbacks if you can't use ALPN/Let's Encrypt:
-- switch `tls_letsencrypt_challenge_type` to `HTTP-01` (needs :80 reachable);
-- terminate TLS at a reverse proxy and point `server_url` at it;
-- for IP-only/lab use, set `tls_cert_path`/`tls_key_path` to your own cert, or
-  pass a plain `http://…` URL (clients then need their own TLS-terminating proxy).
+**Default — no domain, self-signed IP cert.** When the host is a bare IP,
+`cnc-init` generates a long-lived self-signed cert (P-256, `subjectAltName=IP:…`)
+and headscale serves its own TLS on a dedicated port (`:8443` by default) via
+`tls_cert_path`/`tls_key_path`. This never collides with an existing `:443`
+(e.g. nginx/certbot) on the box. `server_url` becomes `https://<ip>:8443`.
+
+Clients trust this cert by **fingerprint pinning**, not blind acceptance:
+- `invite` reads the cert's SHA-256 and bakes `--ca-sha256 <fp>` into the printed
+  `register` command.
+- `register` fetches the live cert from `<ip>:8443`, verifies it matches the pin,
+  then installs it into the OS trust store (macOS System keychain via
+  `security add-trusted-cert`; Linux `/usr/local/share/ca-certificates` +
+  `update-ca-certificates`). A linked controller instead reads the cert straight
+  off the CNC over SSH (already-trusted channel), so no pin is needed there.
+- `cleanup` removes the cert from the trust store again.
+
+**Optional — public domain.** `cnc-init --url https://vpn.example.com` uses
+headscale's built-in Let's Encrypt (`tls_letsencrypt_hostname`, `TLS-ALPN-01` on
+`:443`). No client-side pinning/trust step is needed (publicly-trusted CA).
+Other options: `HTTP-01` challenge (needs `:80`), or terminate TLS at a reverse
+proxy and point `server_url` at it.
 
 ## WSL specifics (auto-handled)
 
@@ -144,6 +160,18 @@ Fallbacks if you can't use ALPN/Let's Encrypt:
 - pins the `tailscale0` MTU to 1280 **only if** the current value is larger,
   avoiding large-packet drops over WSL's NAT.
 
+## macOS clients (auto-handled)
+
+`register` detects macOS and supports both Tailscale variants:
+- **GUI app** (Homebrew cask `tailscale` or tailscale.com download) — its CLI is
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale`, driven without `sudo`.
+- **open-source `tailscaled`** (Homebrew formula `tailscale`, started via
+  `sudo brew services start tailscale`) — driven with `sudo`.
+
+If both are present it asks which to use; if neither, it asks which to install
+(`--tailscale app|oss` skips the prompt). For an IP CNC it trusts the pinned
+self-signed cert in the System keychain before `tailscale up`.
+
 ## State & files
 
 | Location                               | Purpose                                    |
@@ -151,8 +179,10 @@ Fallbacks if you can't use ALPN/Let's Encrypt:
 | `/etc/headscale/config.yaml`           | CNC: headscale config (written by `cnc-init`) |
 | `/etc/headscale/acl.hujson`            | CNC: tag/SSH ACL policy                    |
 | `/var/lib/headscale/`                  | CNC: keys + sqlite DB                      |
+| `/var/lib/headscale/certs/`            | CNC: self-signed `cnc.crt`/`cnc.key` (IP mode) |
 | `~/.config/connector/cnc`             | controller: linked CNC (`CNC_SSH/URL/PORT`)|
 | `~/.config/connector/role`            | node: last registered role (provider/…)    |
+| `~/.config/connector/cnc-ca.crt`      | node: trusted self-signed CNC cert (for cleanup) |
 | `~/.config/connector/aliases.conf`    | saved `connector <name>` SSH shortcuts     |
 | `~/.ssh/config`                       | optional Host entries written by `alias`   |
 
@@ -161,11 +191,16 @@ CNC. Everything else is read live from headscale/tailscale.
 
 ## Ports (open on the CNC)
 
-| Port        | Use                                   |
-|-------------|---------------------------------------|
-| 443/tcp     | headscale control + DERP (HTTPS)      |
-| 3478/udp    | STUN (NAT traversal)                  |
-| 41641/udp   | tailscale direct connections          |
+| Port         | Use                                          |
+|--------------|----------------------------------------------|
+| 8443/tcp     | headscale control + DERP (HTTPS, self-signed; `:443` with a domain) |
+| 3478/udp     | STUN (NAT traversal)                         |
+| 41641/udp    | tailscale direct connections                 |
+
+`cnc-init` does **not** enable a host firewall (lockout risk). It opens these
+ports only on an already-active ufw/firewalld, and after a remote `cnc-init` it
+probes the control port from your machine and **asks** you to open any cloud
+firewall (e.g. DigitalOcean) if it's unreachable.
 
 ## Migration from the old WireGuard connector
 
