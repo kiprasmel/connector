@@ -106,9 +106,12 @@ commands are sent to the CNC.
 
 ## ACL policy (`/etc/headscale/acl.hujson`)
 
+Note: headscale policy v2 (0.26+) requires usernames to be written with a
+trailing `@` (the owner `mesh@` refers to the user registered as `mesh`).
+
 ```hujson
 {
-  "tagOwners": { "tag:provider": ["mesh"], "tag:consumer": ["mesh"] },
+  "tagOwners": { "tag:provider": ["mesh@"], "tag:consumer": ["mesh@"] },
   "acls": [
     { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider:*"] }
   ],
@@ -189,7 +192,7 @@ self-signed cert in the System keychain before `tailscale up`.
 The only persisted controller secret is the SSH access it already has to the
 CNC. Everything else is read live from headscale/tailscale.
 
-## Ports (open on the CNC)
+## Ports (open INBOUND on the CNC)
 
 | Port         | Use                                          |
 |--------------|----------------------------------------------|

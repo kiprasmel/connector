@@ -153,21 +153,37 @@ current_roles() {
 # --- CNC link state ----------------------------------------------------------
 CNC_SSH=""; CNC_URL=""; CNC_PORT=""; CNC_USER=""
 
+# Resolve the login user for an SSH target (honours ~/.ssh/config for aliases).
+resolve_ssh_user() {
+    local target="$1" user
+    case "$target" in
+        *@*) printf '%s\n' "${target%@*}"; return 0 ;;
+    esac
+    user="$(ssh -G "$target" 2>/dev/null | awk '/^user /{print $2; exit}')"
+    [ -n "$user" ] && printf '%s\n' "$user"
+}
+
 load_cnc_link() {
     [ -f "$CNC_LINK_FILE" ] || die "No CNC linked. Run: connector link <user@host> --url https://..."
+    CNC_USER=""
     # shellcheck disable=SC1090
     . "$CNC_LINK_FILE"
-    CNC_USER="${CNC_SSH%@*}"
-    [ "$CNC_USER" = "$CNC_SSH" ] && CNC_USER="$(id -un)"
+    # Prefer a stored user; else derive it (handles bare SSH aliases like 'nyc').
+    if [ -z "${CNC_USER:-}" ]; then
+        CNC_USER="$(resolve_ssh_user "$CNC_SSH")"
+        [ -n "$CNC_USER" ] || CNC_USER="$(id -un)"
+    fi
 }
 
 save_cnc_link() {
-    local ssh_target="$1" url="$2" port="${3:-}"
+    local ssh_target="$1" url="$2" port="${3:-}" user
+    user="$(resolve_ssh_user "$ssh_target")"; [ -n "$user" ] || user="$(id -un)"
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
     {
         echo "CNC_SSH=\"$ssh_target\""
         echo "CNC_URL=\"$url\""
         echo "CNC_PORT=\"$port\""
+        echo "CNC_USER=\"$user\""
     } > "$CNC_LINK_FILE"
     chmod 600 "$CNC_LINK_FILE"
 }
@@ -209,16 +225,21 @@ cnc_server_url() {
 
 # Resolve a node name (or numeric id) to a headscale node id.
 resolve_node_id() {
-    local node="$1" out id
+    local node="$1" out
     case "$node" in
         ''|*[!0-9]*) ;;                 # not purely numeric -> look up by name
         *) printf '%s\n' "$node"; return 0 ;;
     esac
     out="$(hs nodes list --output json 2>/dev/null)" || return 1
-    id="$(printf '%s' "$out" | tr '{}' '\n\n' \
-         | grep -E "\"(name|given_name)\":\"$node\"" | head -n1 \
-         | sed -n 's/.*"id":[[:space:]]*"\{0,1\}\([0-9]\+\).*/\1/p')"
-    [ -n "$id" ] && printf '%s\n' "$id"
+    if have jq; then
+        printf '%s' "$out" | jq -r --arg n "$node" \
+            'first(.[] | select((.name==$n) or (.given_name==$n)) | .id) // empty' 2>/dev/null | head -n1
+        return 0
+    fi
+    # Fallback for pretty-printed JSON (best-effort; jq strongly preferred).
+    printf '%s' "$out" | tr '\n\t' '  ' | sed 's/  */ /g' \
+        | grep -o "\"id\": *\"\{0,1\}[0-9]*\"\{0,1\}[^]]*\"given_name\": *\"$node\"" \
+        | sed -n 's/.*"id": *"\{0,1\}\([0-9]*\).*/\1/p' | head -n1
 }
 
 # --- CNC: install + configure headscale -------------------------------------
@@ -465,8 +486,8 @@ write_acl() {
     as_root tee "$HEADSCALE_ACL" >/dev/null <<EOF
 {
   "tagOwners": {
-    "tag:provider": ["${HEADSCALE_USER}"],
-    "tag:consumer": ["${HEADSCALE_USER}"]
+    "tag:provider": ["${HEADSCALE_USER}@"],
+    "tag:consumer": ["${HEADSCALE_USER}@"]
   },
   "acls": [
     { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider:*"] }
@@ -579,22 +600,51 @@ ssh_resolved_host() {
     ssh -G "$1" 2>/dev/null | awk '/^hostname /{print $2; exit}'
 }
 
-# Verify the CNC TLS port is reachable from here; prompt to open firewall if not.
-check_cnc_reachable() {
-    local url="$1" host port i ok=0
-    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
-    log_info "Checking that ${host}:${port} is reachable from here..."
-    for i in 1 2 3; do
-        if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then ok=1; exec 3>&- 2>/dev/null; break; fi
-        [ "$i" -lt 3 ] && sleep 2
+# Bounded TCP connect test (never hangs on a filtered port). port_open <host> <port> [timeout]
+port_open() {
+    local host="$1" port="$2" to="${3:-5}" pid i
+    ( exec 3<>"/dev/tcp/${host}/${port}" ) 2>/dev/null &
+    pid=$!
+    for (( i=0; i < to*10; i++ )); do
+        kill -0 "$pid" 2>/dev/null || break    # connect finished (ok or refused)
+        sleep 0.1
     done
-    if [ "$ok" = 1 ]; then
-        log_success "${host}:${port} is reachable."
-    else
-        log_warn "Could NOT reach ${host}:${port} from this machine."
-        echo "  Open on the CNC's firewall (including any cloud firewall): ${port}/tcp, 3478/udp, 41641/udp"
-        confirm "Continue anyway?" || die "Open the firewall, then re-run."
+    if kill -0 "$pid" 2>/dev/null; then         # still running -> timed out
+        kill -9 "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        return 1
     fi
+    wait "$pid"                                  # propagate connect exit status
+}
+
+# Verify the CNC TLS port is reachable from here; loop with a re-check option.
+check_cnc_reachable() {
+    local url="$1" host port ans
+    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
+    while true; do
+        log_info "Checking ${host}:${port} reachability (5s timeout)..."
+        if port_open "$host" "$port" 5; then
+            log_success "${host}:${port} is reachable."
+            return 0
+        fi
+        echo
+        log_warn "Could NOT reach ${host}:${port} - a firewall is most likely blocking it."
+        echo "  Add these INBOUND rules on the CNC's firewall, INCLUDING any CLOUD"
+        echo "  firewall (e.g. DigitalOcean -> Networking -> Firewalls):"
+        echo "      ${port}/tcp    headscale control plane + DERP"
+        echo "      3478/udp       STUN (NAT traversal)"
+        echo "      41641/udp      tailscale direct connections"
+        echo
+        if ! read -r -p "[r] re-check (default)   [c] continue anyway   [a] abort: " ans </dev/tty 2>/dev/null; then
+            log_warn "No interactive terminal; continuing without a verified check."
+            return 0
+        fi
+        case "${ans:-r}" in
+            c|C) log_warn "Continuing without verified reachability."; return 0 ;;
+            a|A) die "Aborted. Open the firewall, then re-run." ;;
+            *)   ;;  # anything else (incl. empty / 'r') -> re-check
+        esac
+    done
 }
 
 cnc_init_remote() {
@@ -607,6 +657,11 @@ cnc_init_remote() {
     # shellcheck disable=SC2086
     ssh -o ConnectTimeout=10 $sshflag "$host" true || die "Cannot SSH to $host"
 
+    # Only prefix sudo when the remote login user is not root (avoids noise + works for non-root admins).
+    local rsudo="sudo "
+    # shellcheck disable=SC2086
+    if ssh $sshflag "$host" 'test "$(id -u)" = 0' 2>/dev/null; then rsudo=""; fi
+
     # shellcheck disable=SC2086
     if ssh $sshflag "$host" 'test -f /etc/headscale/config.yaml && systemctl is-active --quiet headscale' 2>/dev/null; then
         configured=1
@@ -617,7 +672,7 @@ cnc_init_remote() {
     if [ -z "$url" ]; then
         if [ "$configured" = 1 ]; then
             # shellcheck disable=SC2086
-            url="$(ssh $sshflag "$host" "sudo sed -n 's/^server_url:[[:space:]]*//p' /etc/headscale/config.yaml 2>/dev/null | head -n1" | tr -d '\r')"
+            url="$(ssh $sshflag "$host" "${rsudo}sed -n 's/^server_url:[[:space:]]*//p' /etc/headscale/config.yaml 2>/dev/null | head -n1" | tr -d '\r')"
         fi
         if [ -z "$url" ]; then
             local ip; ip="$(ssh_resolved_host "$host")"
@@ -640,9 +695,9 @@ cnc_init_remote() {
         # shellcheck disable=SC2086
         scp $scpflag "$self" "$host:/tmp/connector.$$" >/dev/null
         # shellcheck disable=SC2086
-        ssh $sshflag "$host" "sudo install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$"
+        ssh $sshflag "$host" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$"
         # shellcheck disable=SC2086
-        ssh -t $sshflag "$host" "sudo ${CONNECTOR_BIN} cnc-init --url '$url'" || die "Remote cnc-init failed"
+        ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url'" || die "Remote cnc-init failed"
     fi
 
     save_cnc_link "$host" "$url" "$port"
@@ -651,8 +706,10 @@ cnc_init_remote() {
     check_cnc_reachable "$url"
 
     echo
-    echo "Register this machine on the tailnet?"
-    echo "  [1] provider   [2] consumer   (enter '1 2' for both)   [s] skip"
+    echo "Also register THIS local machine (the one you're running connector on)"
+    echo "as a tailnet node?"
+    echo "  [1] provider (others can reach/SSH it)   [2] consumer (it reaches providers)"
+    echo "  enter '1 2' for both, or [s] to skip"
     local choice; read -r -p "Choose: " choice || choice="s"
     local type=""
     case "$(echo "$choice" | tr -d ' ')" in
@@ -693,27 +750,32 @@ cmd_link() {
 
 # --- Invite ------------------------------------------------------------------
 hs_user_id() {
-    local out id
+    local out
     out="$(hs users list --output json 2>/dev/null)" || return 1
-    id="$(printf '%s' "$out" | tr '{}' '\n\n' \
-         | grep "\"name\":\"$HEADSCALE_USER\"" | head -n1 \
-         | sed -n 's/.*"id":[[:space:]]*"\{0,1\}\([0-9]\+\).*/\1/p')"
-    [ -n "$id" ] && printf '%s\n' "$id"
+    if have jq; then
+        printf '%s' "$out" | jq -r --arg n "$HEADSCALE_USER" \
+            'first(.[] | select(.name==$n) | .id) // empty' 2>/dev/null | head -n1
+        return 0
+    fi
+    # Fallback for pretty-printed JSON: each user object lists "id" then "name".
+    printf '%s' "$out" | tr '\n\t' '  ' | sed 's/  */ /g' \
+        | grep -o "\"id\": *[0-9]* *, *\"name\": *\"$HEADSCALE_USER\"" \
+        | sed -n 's/.*"id": *\([0-9]*\).*/\1/p' | head -n1
 }
 
 # Mint a single-use, short-expiry pre-auth key for a type; echo the key.
+# headscale's --user takes a numeric user ID, so we always resolve it.
 mint_key() {
-    local type="$1" tags user uid out key
+    local type="$1" tags uid out key
     case "$type" in
         provider) tags="tag:provider" ;;
         consumer) tags="tag:consumer" ;;
         both)     tags="tag:provider,tag:consumer" ;;
         *) die "Invalid type: $type" ;;
     esac
-    user="$HEADSCALE_USER"
     uid="$(hs_user_id 2>/dev/null || true)"
-    [ -n "$uid" ] && user="$uid"
-    out="$(hs preauthkeys create --user "$user" --tags "$tags" --expiration "$KEY_EXPIRY" --output json 2>/dev/null)" \
+    [ -n "$uid" ] || die "Could not resolve headscale user '$HEADSCALE_USER' on the CNC (is headscale running? try: connector status)"
+    out="$(hs preauthkeys create --user "$uid" --tags "$tags" --expiration "$KEY_EXPIRY" --output json 2>/dev/null)" \
         || die "Failed to create pre-auth key on CNC"
     key="$(printf '%s' "$out" | json_str key)"
     [ -n "$key" ] || die "Could not parse pre-auth key from headscale output"
@@ -866,9 +928,15 @@ install_tailscale_macos_oss() {
 # Choose (installing if needed) a macOS tailscale CLI. Prints the path on stdout;
 # all prompts go to stderr/tty so the captured stdout is only the path.
 macos_tailscale_cli() {
-    local variant="$1" app="$TS_MAC_APP_CLI" oss have_app=0 have_oss=0 c
+    local variant="$1" app="$TS_MAC_APP_CLI" oss have_app=0 have_oss=0 c p
     [ -x "$app" ] && have_app=1
-    oss="$(command -v tailscale 2>/dev/null || true)"; [ -n "$oss" ] && have_oss=1
+    oss="$(command -v tailscale 2>/dev/null || true)"
+    if [ -z "$oss" ]; then
+        for p in /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
+            [ -x "$p" ] && { oss="$p"; break; }
+        done
+    fi
+    [ -n "$oss" ] && have_oss=1
     case "$variant" in
         app) install_tailscale_macos_app >&2; printf '%s\n' "$app"; return 0 ;;
         oss) install_tailscale_macos_oss >&2; command -v tailscale; return 0 ;;
@@ -1251,8 +1319,12 @@ cmd_cleanup_cnc() {
     confirm "Continue?" || { log_info "Cancelled."; exit 0; }
     local out ids id
     out="$(hs nodes list --output json 2>/dev/null)" || out=""
-    ids="$(printf '%s' "$out" | tr '{}' '\n\n' \
-         | sed -n 's/.*"id":[[:space:]]*"\{0,1\}\([0-9]\+\).*/\1/p' | sort -un)"
+    if have jq; then
+        ids="$(printf '%s' "$out" | jq -r '.[].id' 2>/dev/null)"
+    else
+        ids="$(printf '%s' "$out" | tr '\n\t' '  ' | grep -o '"id": *"\{0,1\}[0-9]*' \
+             | sed -n 's/.*"id": *"\{0,1\}\([0-9]*\).*/\1/p' | sort -un)"
+    fi
     for id in $ids; do
         hs nodes delete --identifier "$id" --force >/dev/null 2>&1 || true
     done
@@ -1304,8 +1376,8 @@ JOIN
            [--hostname N] [--tailscale app|oss] [--yes]
                        Join the tailnet (just paste the command 'invite' prints).
                        Auto-handles WSL systemd (asks first), trusts a self-signed
-                       CNC cert (pinned via --ca-sha256), and on macOS installs/uses
-                       either the GUI app or open-source tailscaled.
+                       CNC cert (pinned via --ca-sha256), and on macOS auto-detects
+                       the GUI app or open-source tailscaled (override: --tailscale).
 
 USE
   status               Roles + tailscale/headscale status.
