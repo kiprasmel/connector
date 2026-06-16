@@ -903,8 +903,15 @@ systemd_active() { [ -d /run/systemd/system ]; }
 install_tailscale() {
     have tailscale && return 0
     log_info "Installing tailscale..."
+    # Arch mirrors keep only the newest build, so a stale local pacman DB makes
+    # the upstream installer request a 404'd version. Refresh it first.
+    # (apt-based installs are refreshed by the upstream script itself.)
+    if have pacman; then
+        log_info "Refreshing pacman database (Arch)..."
+        as_root pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    fi
     curl -fsSL "$TS_INSTALL_URL" | sh
-    have tailscale || die "tailscale installation failed."
+    have tailscale || die "tailscale installation failed. On Arch, run 'sudo pacman -Syu' then re-run register."
 }
 
 install_tailscale_macos_app() {
