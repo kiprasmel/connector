@@ -354,6 +354,11 @@ trust_cnc_cert() {
                 || { log_error "Failed to add the cert to the System keychain."; return 1; }
             ;;
         linux)
+            # Debian/Ubuntu (incl. WSL) read this dir via update-ca-certificates.
+            # On a minimal image the ca-certificates package (and its dir) may be
+            # missing, so ensure both before installing the cert.
+            have update-ca-certificates || as_root apt-get install -y ca-certificates >/dev/null 2>&1 || true
+            as_root mkdir -p /usr/local/share/ca-certificates
             as_root install -m 0644 "$CNC_CA_FILE" /usr/local/share/ca-certificates/headscale-cnc.crt
             as_root update-ca-certificates >/dev/null 2>&1 || true
             ;;
