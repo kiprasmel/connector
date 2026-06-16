@@ -64,6 +64,74 @@ as_root() {
     if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
 }
 
+# --- Dependencies ------------------------------------------------------------
+# Detect the system package manager (prints a token; empty if none recognised).
+pkg_mgr() {
+    if   have apt-get; then echo apt
+    elif have pacman;  then echo pacman
+    elif have dnf;     then echo dnf
+    elif have yum;     then echo yum
+    elif have zypper;  then echo zypper
+    elif have apk;     then echo apk
+    elif have brew;    then echo brew
+    fi
+}
+
+# Package that provides a command for a manager (defaults to the command name).
+pkg_for() {
+    case "$1:$2" in
+        hostname:pacman) echo inetutils ;;
+        *)               echo "$1" ;;
+    esac
+}
+
+# Install packages with the detected manager (refreshing the DB first).
+pkg_install() {
+    case "$(pkg_mgr)" in
+        apt)    as_root apt-get update -qq && as_root apt-get install -y "$@" ;;
+        pacman) as_root pacman -Sy --needed --noconfirm "$@" ;;
+        dnf)    as_root dnf install -y "$@" ;;
+        yum)    as_root yum install -y "$@" ;;
+        zypper) as_root zypper --non-interactive install "$@" ;;
+        apk)    as_root apk add "$@" ;;
+        brew)   brew install "$@" ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Ensure required commands exist; offer to install any that are missing.
+# Usage: ensure_deps curl openssl
+ensure_deps() {
+    local cmd mgr
+    local -a missing=() pkgs=()
+    for cmd in "$@"; do have "$cmd" || missing+=("$cmd"); done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+
+    log_warn "Missing required tool(s): ${missing[*]}"
+    mgr="$(pkg_mgr)"
+    [ -n "$mgr" ] || die "Please install them with your package manager, then re-run."
+    for cmd in "${missing[@]}"; do pkgs+=("$(pkg_for "$cmd" "$mgr")"); done
+    confirm "Install ${pkgs[*]} via ${mgr}?" y || die "Cannot continue without: ${missing[*]}"
+    log_info "Installing: ${pkgs[*]} ..."
+    pkg_install "${pkgs[@]}" || die "Failed to install: ${pkgs[*]}"
+
+    local -a still=()
+    for cmd in "${missing[@]}"; do have "$cmd" || still+=("$cmd"); done
+    [ "${#still[@]}" -eq 0 ] || die "Still missing after install: ${still[*]}"
+}
+
+# Best-effort short hostname that does not require the `hostname` binary
+# (Arch base, minimal containers, etc. may not ship it). Empty if unknown;
+# tailscale then derives the node name itself.
+node_name() {
+    local n=""
+    if have hostname; then n="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"; fi
+    if [ -z "$n" ]; then n="${HOSTNAME:-}"; fi
+    if [ -z "$n" ] && [ -r /etc/hostname ]; then n="$(cat /etc/hostname 2>/dev/null || true)"; fi
+    if [ -z "$n" ]; then n="$(uname -n 2>/dev/null || true)"; fi
+    printf '%s\n' "${n%%.*}"
+}
+
 # Resolve the absolute path of this script, following symlinks.
 self_path() {
     local s="${BASH_SOURCE[0]}" d
@@ -848,7 +916,7 @@ invite_controller() {
     is_admin || die "Only a CNC or controller can invite a controller."
     local url cnc_target pubkey
     url="$(cnc_server_url)"
-    if is_controller; then load_cnc_link; cnc_target="$CNC_SSH"; else cnc_target="$(id -un)@$(hostname -f 2>/dev/null || hostname)"; fi
+    if is_controller; then load_cnc_link; cnc_target="$CNC_SSH"; else cnc_target="$(id -un)@$(node_name)"; fi
 
     echo
     echo "== Invite a controller (C&C commander) =="
@@ -889,7 +957,7 @@ cmd_commander_key() {
     done
     if [ -z "$key" ]; then
         log_info "No SSH key found; generating an ed25519 key..."
-        ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" -C "connector-commander@$(hostname)" >/dev/null
+        ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" -C "connector-commander@$(node_name)" >/dev/null
         key="$HOME/.ssh/id_ed25519.pub"
     fi
     echo "# Hand this public key to a CNC/controller running 'connector invite' -> controller:"
@@ -991,7 +1059,7 @@ register_summary() {
 
 register_macos() {
     local type="$1" url="$2" key="$3" hostname="$4" variant="$5" cli
-    [ -n "$hostname" ] || hostname="$(hostname -s 2>/dev/null || hostname)"
+    [ -n "$hostname" ] || hostname="$(node_name)"
     cli="$(macos_tailscale_cli "$variant")" || die "Could not determine a tailscale CLI."
     [ -n "$cli" ] || die "tailscale CLI not found after install."
 
@@ -1006,14 +1074,15 @@ register_macos() {
     local -a runner_cmd
     if [ "$cli" = "$TS_MAC_APP_CLI" ]; then runner_cmd=("$cli"); else runner_cmd=(sudo "$cli"); fi
 
-    log_info "Bringing up tailscale on macOS (type: $type, hostname: $hostname)..."
+    log_info "Bringing up tailscale on macOS (type: $type, hostname: ${hostname:-auto})..."
     # --reset makes register declarative: apply exactly these flags and ignore
     # stale prefs from earlier attempts (tailscale otherwise refuses to change
     # settings without re-stating every non-default flag).
     # An auth key already carries its tags (forced tags). headscale rejects a
     # user-scoped key combined with --advertise-tags, so only advertise the tags
     # for interactive (keyless) registration where the admin owns them.
-    local up_args=(up --reset --login-server "$url" --hostname "$hostname" --accept-dns=true)
+    local up_args=(up --reset --login-server "$url" --accept-dns=true)
+    [ -n "$hostname" ] && up_args+=(--hostname "$hostname")
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
     if [ -n "$key" ]; then
         up_args+=(--authkey "$key")
@@ -1085,6 +1154,9 @@ cmd_register() {
     done
     [ -n "$url" ] || die "Usage: connector register <provider|consumer|both> <url> [--authkey KEY]"
 
+    # On Linux, make sure the join flow's tools are present (prompt to install).
+    [ "$(os_kind)" = "linux" ] && ensure_deps curl openssl
+
     # Trust the CNC's self-signed cert (only for IP CNCs; no-op for domain CNCs).
     establish_cnc_trust "$url" "$pin"
 
@@ -1095,7 +1167,7 @@ cmd_register() {
 
     ensure_wsl_systemd || return 0
     install_tailscale
-    [ -n "$hostname" ] || hostname="$(hostname -s 2>/dev/null || hostname)"
+    [ -n "$hostname" ] || hostname="$(node_name)"
 
     local tags ssh_flag=""
     case "$type" in
@@ -1104,14 +1176,15 @@ cmd_register() {
         both)     tags="tag:provider,tag:consumer"; ssh_flag="--ssh" ;;
     esac
 
-    log_info "Bringing up tailscale (type: $type, hostname: $hostname)..."
+    log_info "Bringing up tailscale (type: $type, hostname: ${hostname:-auto})..."
     # --reset makes register declarative: apply exactly these flags and ignore
     # stale prefs from earlier attempts (tailscale otherwise refuses to change
     # settings without re-stating every non-default flag).
     # An auth key already carries its tags (forced tags). headscale rejects a
     # user-scoped key combined with --advertise-tags, so only advertise the tags
     # for interactive (keyless) registration where the admin owns them.
-    local up_args=(--reset --login-server "$url" --hostname "$hostname" --accept-dns=true)
+    local up_args=(--reset --login-server "$url" --accept-dns=true)
+    [ -n "$hostname" ] && up_args+=(--hostname "$hostname")
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
     if [ -n "$key" ]; then
         up_args+=(--authkey "$key")
