@@ -28,7 +28,7 @@ TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
     cnc-init cnc-update propagate-update link invite manager-key commander-key register approve list revoke
-    status whoami hop alias cleanup cleanup-cnc help --help -h
+    status whoami hop ssh alias cleanup cleanup-cnc help --help -h
 )
 
 # --- Logging -----------------------------------------------------------------
@@ -1692,6 +1692,8 @@ USE
   list                 [admin] List nodes.
   revoke <node>        [admin] Remove a node.
   hop [user@name|name] SSH to a provider by MagicDNS name (no arg = list).
+                       Aliases: 'connector ssh <name>'; and any non-command
+                       word is an implicit hop -> 'connector <name>'.
   alias <name> <user@name> | alias list | alias rm <name>
                        Save an SSH shortcut (optionally writes ~/.ssh/config).
   cleanup              Disconnect this machine from the tailnet.
@@ -1752,23 +1754,20 @@ main() {
         revoke)         cmd_revoke "$@" ;;
         status)         cmd_status "$@" ;;
         whoami)         cmd_whoami "$@" ;;
-        hop)            cmd_hop "$@" ;;
+        hop|ssh)        cmd_hop "$@" ;;
         alias)          cmd_alias "$@" ;;
         cleanup)        cmd_cleanup "$@" ;;
         cleanup-cnc)    cmd_cleanup_cnc "$@" ;;
         help|--help|-h) cmd_help ;;
         *)
-            local line target
+            # Not a built-in: treat it as an implicit hop target. A saved alias
+            # maps to its full user@host; otherwise hop straight to the name
+            # (so 'connector <name>' == 'connector hop <name>').
+            local line target="$cmd"
             line="$(alias_lookup "$cmd" || true)"
-            if [ -n "$line" ]; then
-                target="${line#*|}"
-                cmd_hop "$target"
-                exit $?
-            fi
-            log_error "Unknown command: $cmd"
-            echo
-            cmd_help
-            exit 1
+            [ -n "$line" ] && target="${line#*|}"
+            cmd_hop "$target"
+            exit $?
             ;;
     esac
 
