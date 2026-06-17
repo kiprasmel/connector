@@ -132,6 +132,13 @@ node_name() {
     printf '%s\n' "${n%%.*}"
 }
 
+# Portable SHA-256 of a file (prints the hex digest; empty if unavailable).
+file_sha256() {
+    if   have sha256sum; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif have shasum;    then shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
 # Resolve the absolute path of this script, following symlinks.
 self_path() {
     local s="${BASH_SOURCE[0]}" d
@@ -821,6 +828,35 @@ cmd_link() {
     echo "Try: connector list"
 }
 
+# Push this machine's connector script to the linked CNC and install it there.
+cmd_cnc_update() {
+    is_controller || die "No CNC linked. Run this from a controller (set up via 'connector cnc-init' or 'connector link')."
+    have ssh || die "ssh not found"; have scp || die "scp not found"
+    load_cnc_link
+    local self sshflag scpflag rsudo="sudo " lsum rsum
+    self="$(self_path)"
+    sshflag="$([ -n "${CNC_PORT:-}" ] && echo "-p $CNC_PORT" || true)"
+    scpflag="$([ -n "${CNC_PORT:-}" ] && echo "-P $CNC_PORT" || true)"
+    [ "${CNC_USER:-}" = "root" ] && rsudo=""
+
+    log_info "Updating connector on CNC ${CNC_SSH} (${CONNECTOR_BIN})..."
+    # shellcheck disable=SC2086
+    scp $scpflag "$self" "$CNC_SSH:/tmp/connector.$$" >/dev/null || die "Copy to CNC failed."
+    # shellcheck disable=SC2086
+    ssh $sshflag "$CNC_SSH" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$" \
+        || die "Install on CNC failed."
+
+    # Verify the remote copy matches what we just pushed.
+    lsum="$(file_sha256 "$self")"
+    # shellcheck disable=SC2086
+    rsum="$(ssh $sshflag "$CNC_SSH" "sha256sum ${CONNECTOR_BIN} 2>/dev/null || shasum -a 256 ${CONNECTOR_BIN} 2>/dev/null" | awk '{print $1}' | tr -d '\r')"
+    if [ -n "$lsum" ] && [ "$lsum" = "$rsum" ]; then
+        log_success "CNC connector updated and verified (sha256 ${lsum:0:12}...)."
+    else
+        log_warn "Installed on CNC, but could not verify checksum (local=${lsum:-?} cnc=${rsum:-?})."
+    fi
+}
+
 # --- Invite ------------------------------------------------------------------
 hs_user_id() {
     local out
@@ -1465,6 +1501,8 @@ SETUP
                        for a remote, the IP is taken from your SSH config.
   link <user@host> --url https://HOST[:PORT] [-p SSH_PORT]
                        Attach to an existing CNC (become a controller).
+  cnc-update           [controller] Push this machine's connector script to
+                       the linked CNC and install it there.
 
 ONBOARD                [admin: run on the CNC or a linked controller]
   invite [provider] [consumer] [controller] [name]
@@ -1510,6 +1548,7 @@ main() {
     local cmd="${1:-help}"; shift || true
     case "$cmd" in
         cnc-init)       cmd_cnc_init "$@" ;;
+        cnc-update)     cmd_cnc_update "$@" ;;
         link)           cmd_link "$@" ;;
         invite)         cmd_invite "$@" ;;
         commander-key)  cmd_commander_key "$@" ;;
