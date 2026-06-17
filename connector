@@ -28,8 +28,8 @@ TS_INSTALL_URL="https://tailscale.com/install.sh"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
-    cnc-init cnc-update propagate-update link invite manager-key commander-key register approve list revoke
-    status whoami hop ssh alias cleanup cleanup-cnc help --help -h
+    cnc-init cnc-update propagate-update link invite manager-key commander-key register approve list ls revoke
+    status whoami hop ssh cnc alias cleanup cleanup-cnc help --help -h
 )
 
 # --- Logging -----------------------------------------------------------------
@@ -1383,7 +1383,12 @@ cmd_register() {
 # --- Admin: list / approve / revoke -----------------------------------------
 cmd_list() {
     is_admin || die "Only a CNC or manager can list nodes."
-    hs nodes list
+    local rows; rows="$(hs_nodes_tsv 2>/dev/null || true)"
+    if [ -n "$rows" ]; then
+        print_node_table "$rows"
+    else
+        hs nodes list   # fallback (no jq, or unexpected output)
+    fi
 }
 
 approve_routes() {
@@ -1473,51 +1478,107 @@ ts_cli() {
 }
 have_ts() { { [ "$(os_kind)" = "macos" ] && [ -x "$TS_MAC_APP_CLI" ]; } || have tailscale; }
 
-# Online provider peers this node is allowed to SSH to. Prints short MagicDNS names.
-ts_reachable_providers() {
-    have jq || return 0
-    ts_cli status --json 2>/dev/null | jq -r '
-        (.Peer // {}) | to_entries[] | .value
-        | select((.Tags // []) | index("tag:provider"))
-        | select(.Online == true)
-        | (.DNSName // (.HostName + ".")) | sub("\\.$"; "") | split(".")[0]' 2>/dev/null
+# jq snippet: derive a short role from a tags array bound as $t.
+JQ_ROLE='(if ($t|index("tag:provider")) and ($t|index("tag:consumer")) then "both"
+          elif ($t|index("tag:provider")) then "provider"
+          elif ($t|index("tag:consumer")) then "consumer" else "-" end)'
+
+# This node's view of the tailnet (self + visible peers) as TSV:
+#   id <TAB> name <TAB> role <TAB> ip <TAB> online(1/0)   (id is "-" here).
+ts_nodes_tsv() {
+    have jq || return 1
+    ts_cli status --json 2>/dev/null | jq -r "
+        ([.Self] + ((.Peer // {}) | to_entries | map(.value)))[]
+        | (.Tags // []) as \$t
+        | [ \"-\",
+            ((.DNSName // (.HostName + \".\")) | sub(\"\\\\.\$\";\"\") | split(\".\")[0]),
+            $JQ_ROLE,
+            ((.TailscaleIPs // []) | map(select(test(\":\")|not)) | .[0] // \"-\"),
+            (if .Online then \"1\" else \"0\" end) ] | @tsv" 2>/dev/null
 }
 
-# This machine's own MagicDNS name (short), best-effort.
-ts_self_name() {
-    have jq || { node_name; return; }
-    local n; n="$(ts_cli status --json 2>/dev/null | jq -r '(.Self.DNSName // (.Self.HostName + ".")) | sub("\\.$";"") | split(".")[0]' 2>/dev/null)"
-    [ -n "$n" ] && printf '%s\n' "$n" || node_name
+# All tailnet nodes from headscale (admin only) as the same TSV shape.
+hs_nodes_tsv() {
+    have jq || return 1
+    local json; json="$(hs nodes list -o json 2>/dev/null)" || return 1
+    [ -n "$json" ] || return 1
+    printf '%s' "$json" | jq -r "
+        .[] | (.tags // []) as \$t
+        | [ (.id|tostring), .given_name, $JQ_ROLE,
+            ((.ip_addresses // []) | map(select(test(\":\")|not)) | .[0] // \"-\"),
+            (if .online then \"1\" else \"0\" end) ] | @tsv" 2>/dev/null
 }
 
-# Print only the hosts this machine can actually connect to (role/tag aware).
+# Render TSV node rows as a clean table, adding ONLINE + CONNECTABLE (relative to
+# this machine) columns. A consumer can SSH to online providers; self is never
+# connectable. Drops machine/node keys, duplicate name, and expiration.
+print_node_table() {
+    local rows="$1" self_ip="" me_consumer=0
+    [ -n "$rows" ] || { echo "No nodes found."; return 0; }
+    is_consumer && me_consumer=1
+    have jq && self_ip="$(ts_cli status --json 2>/dev/null | jq -r '(.Self.TailscaleIPs // [])[0] // empty' 2>/dev/null || true)"
+    {
+        printf 'ID\tNAME\tROLE\tIP\tONLINE\tCONNECTABLE\n'
+        local id name role ip online onl conn
+        while IFS=$'\t' read -r id name role ip online; do
+            [ -n "$name" ] || continue
+            [ "$online" = "1" ] && onl="yes" || onl="no"
+            if [ -n "$self_ip" ] && [ "$ip" = "$self_ip" ]; then
+                conn="no (self)"
+            elif [ "$me_consumer" = 1 ] && [ "$online" = "1" ] \
+                && { [ "$role" = "provider" ] || [ "$role" = "both" ]; }; then
+                conn="yes"
+            else
+                conn="no"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${id:--}" "$name" "$role" "${ip:--}" "$onl" "$conn"
+        done <<EOF
+$rows
+EOF
+    } | { if have column; then column -t -s "$(printf '\t')"; else cat; fi; }
+}
+
+# List ONLY the hosts this machine can connect to: the CNC (for a manager) and
+# online providers a consumer may SSH to. Used by 'help' + arg-less 'hop'/'ssh'.
+# Quiet (prints nothing) when there is nothing to connect to.
 print_hosts() {
-    have_ts || return 0
-    if is_consumer; then
-        local list=""
-        if have jq; then list="$(ts_reachable_providers)"; else
-            list="$(ts_cli status 2>/dev/null | awk 'NF>=2 && $1 !~ /^#/ {print $2}')"
-        fi
-        if [ -n "$list" ]; then
-            echo "Providers you can reach (connector hop <name>):"
-            printf '%s\n' "$list" | sed 's/^/  /'
-        else
-            echo "No providers are online right now."
-        fi
-    elif is_provider; then
-        echo "This machine is a provider; consumers connect to it at:"
-        echo "  $(ts_self_name)"
-    elif is_admin; then
-        echo "See all nodes with: connector list"
+    local out="" n names
+    if is_manager; then
+        load_cnc_link
+        [ -n "${CNC_SSH:-}" ] && out+="  cnc"$'\n'
     fi
+    if have_ts && is_consumer && have jq; then
+        names="$(ts_cli status --json 2>/dev/null | jq -r '
+            (.Peer // {}) | to_entries[] | .value
+            | select((.Tags // []) | index("tag:provider"))
+            | select(.Online == true)
+            | (.DNSName // (.HostName + ".")) | sub("\\.$";"") | split(".")[0]' 2>/dev/null || true)"
+        while IFS= read -r n; do [ -n "$n" ] && out+="  $n"$'\n'; done <<EOF
+$names
+EOF
+    fi
+    [ -n "$out" ] || return 0
+    echo "Hosts you can connect to:"
+    printf '%s' "$out"
 }
 
 cmd_hop() {
     local target="${1:-}"
     if [ -z "$target" ]; then
         print_hosts
-        is_consumer && echo "  (or: ssh <user>@<name>)"
         return 0
+    fi
+    # 'cnc' is a virtual target: a manager reaches the control server over its
+    # existing admin SSH (the CNC is not a tailnet node).
+    if [ "$target" = "cnc" ]; then
+        is_cnc && die "This machine is the CNC."
+        is_manager || die "Only a manager can hop to the CNC (link one: connector link ...)."
+        load_cnc_link
+        [ -n "${CNC_SSH:-}" ] || die "No CNC link found."
+        local p=""; [ -n "${CNC_PORT:-}" ] && p="-p $CNC_PORT"
+        # shellcheck disable=SC2086
+        ssh $p "$CNC_SSH"
+        return $?
     fi
     if [[ "$target" == *"@"* ]]; then
         ssh "$target"
@@ -1708,11 +1769,13 @@ JOIN
 USE
   status               Roles + tailscale/headscale status.
   whoami               Detected role(s) + linked CNC.
-  list                 [admin] List nodes.
+  list | ls            [admin] List nodes (role, IP, online, connectable).
   revoke <node>        [admin] Remove a node.
-  hop [user@name|name] SSH to a provider by MagicDNS name (no arg = list).
-                       Aliases: 'connector ssh <name>'; and any non-command
-                       word is an implicit hop -> 'connector <name>'.
+  hop [user@name|name|cnc]
+                       SSH to a provider by MagicDNS name (no arg = list the
+                       hosts you can connect to). Use 'cnc' to SSH the control
+                       server (managers). Aliases: 'connector ssh <name>'; any
+                       non-command word is an implicit hop -> 'connector <name>'.
   alias <name> <user@name> | alias list | alias rm <name>
                        Save an SSH shortcut (optionally writes ~/.ssh/config).
   cleanup              Disconnect this machine from the tailnet.
@@ -1769,7 +1832,7 @@ main() {
         manager-key|commander-key)  cmd_manager_key "$@" ;;
         register)       cmd_register "$@" ;;
         approve)        cmd_approve "$@" ;;
-        list)           cmd_list "$@" ;;
+        list|ls)        cmd_list "$@" ;;
         revoke)         cmd_revoke "$@" ;;
         status)         cmd_status "$@" ;;
         whoami)         cmd_whoami "$@" ;;
