@@ -1223,6 +1223,17 @@ register_macos() {
     local -a runner_cmd
     if [ "$cli" = "$TS_MAC_APP_CLI" ]; then runner_cmd=("$cli"); else runner_cmd=(sudo "$cli"); fi
 
+    # The sandboxed macOS GUI app cannot run the Tailscale SSH *server* ("does not
+    # run in sandboxed Tailscale GUI builds"), which otherwise hard-fails 'up'.
+    # Drop --ssh so registration succeeds; to host SSH as a provider on macOS, use
+    # the open-source tailscaled instead (--tailscale oss).
+    if [ -n "$ssh_flag" ] && [ "$cli" = "$TS_MAC_APP_CLI" ]; then
+        log_warn "The Tailscale GUI app can't host Tailscale SSH (sandboxed build)."
+        log_warn "Registering without --ssh: this Mac joins the tailnet but won't accept"
+        log_warn "incoming 'connector hop'. To host SSH on macOS, re-run with --tailscale oss."
+        ssh_flag=""
+    fi
+
     log_info "Bringing up tailscale on macOS (type: $type, hostname: ${hostname:-auto})..."
     # --reset makes register declarative: apply exactly these flags and ignore
     # stale prefs from earlier attempts (tailscale otherwise refuses to change
