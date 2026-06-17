@@ -27,7 +27,7 @@ TS_INSTALL_URL="https://tailscale.com/install.sh"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
-    cnc-init link invite commander-key register approve list revoke
+    cnc-init cnc-update propagate-update link invite commander-key register approve list revoke
     status whoami hop alias cleanup cleanup-cnc help --help -h
 )
 
@@ -415,7 +415,36 @@ cnc_cert_pem() {
 
 cnc_cert_fingerprint() { cnc_cert_pem | fp_of_pem; }
 
+# p11-kit anchor directories used by Fedora/RHEL, Arch, and SUSE respectively.
+CA_ANCHOR_DIRS="/etc/pki/ca-trust/source/anchors /etc/ca-certificates/trust-source/anchors /etc/pki/trust/anchors"
+
+# Add a PEM CA file to the Linux system trust store across distro families.
+# Returns non-zero if no trust mechanism could be used.
+linux_trust_ca() {
+    local crt="$1" d=""
+    # Nothing to drive the store yet? Try to install the standard package.
+    if ! have update-ca-certificates && ! have update-ca-trust && ! have trust; then
+        pkg_install ca-certificates >/dev/null 2>&1 || true
+    fi
+    if have update-ca-certificates; then            # Debian/Ubuntu (incl. WSL)
+        as_root mkdir -p /usr/local/share/ca-certificates || return 1
+        as_root install -m 0644 "$crt" /usr/local/share/ca-certificates/headscale-cnc.crt || return 1
+        as_root update-ca-certificates >/dev/null 2>&1 || return 1
+    elif have update-ca-trust; then                 # Fedora/RHEL/Arch/SUSE (p11-kit)
+        for c in $CA_ANCHOR_DIRS; do [ -d "$c" ] && { d="$c"; break; }; done
+        [ -n "$d" ] || { d="/etc/ca-certificates/trust-source/anchors"; as_root mkdir -p "$d" || return 1; }
+        as_root install -m 0644 "$crt" "$d/headscale-cnc.crt" || return 1
+        as_root update-ca-trust extract >/dev/null 2>&1 || as_root update-ca-trust >/dev/null 2>&1 || return 1
+    elif have trust; then                            # generic p11-kit
+        as_root trust anchor --store "$crt" >/dev/null 2>&1 || return 1
+    else
+        return 1
+    fi
+}
+
 # Install + trust a CNC cert (PEM on stdin) in this machine's trust store.
+# The local marker (CNC_CA_FILE) is only kept when trust actually succeeds, so
+# a failed attempt is retried on the next run instead of being skipped.
 trust_cnc_cert() {
     local pem; pem="$(cat)"
     [ -n "$pem" ] || { log_warn "No CNC certificate to trust."; return 1; }
@@ -426,16 +455,11 @@ trust_cnc_cert() {
             log_info "Trusting the CNC certificate in the macOS System keychain (needs sudo)..."
             sudo security add-trusted-cert -d -r trustRoot -p ssl \
                 -k /Library/Keychains/System.keychain "$CNC_CA_FILE" \
-                || { log_error "Failed to add the cert to the System keychain."; return 1; }
+                || { rm -f "$CNC_CA_FILE"; log_error "Failed to add the cert to the System keychain."; return 1; }
             ;;
         linux)
-            # Debian/Ubuntu (incl. WSL) read this dir via update-ca-certificates.
-            # On a minimal image the ca-certificates package (and its dir) may be
-            # missing, so ensure both before installing the cert.
-            have update-ca-certificates || as_root apt-get install -y ca-certificates >/dev/null 2>&1 || true
-            as_root mkdir -p /usr/local/share/ca-certificates
-            as_root install -m 0644 "$CNC_CA_FILE" /usr/local/share/ca-certificates/headscale-cnc.crt
-            as_root update-ca-certificates >/dev/null 2>&1 || true
+            linux_trust_ca "$CNC_CA_FILE" \
+                || { rm -f "$CNC_CA_FILE"; log_error "Could not add the cert to the system trust store."; return 1; }
             ;;
         *) log_warn "Unknown OS; trust $CNC_CA_FILE manually." ;;
     esac
@@ -444,11 +468,15 @@ trust_cnc_cert() {
 
 # Remove a previously-trusted CNC cert. untrust_cnc_cert [common-name]
 untrust_cnc_cert() {
-    local cn="${1:-}"
+    local cn="${1:-}" d
     case "$(os_kind)" in
         macos) [ -n "$cn" ] && sudo security delete-certificate -c "$cn" /Library/Keychains/System.keychain 2>/dev/null || true ;;
-        linux) as_root rm -f /usr/local/share/ca-certificates/headscale-cnc.crt 2>/dev/null || true
-               as_root update-ca-certificates --fresh >/dev/null 2>&1 || true ;;
+        linux)
+            as_root rm -f /usr/local/share/ca-certificates/headscale-cnc.crt 2>/dev/null || true
+            have update-ca-certificates && as_root update-ca-certificates --fresh >/dev/null 2>&1 || true
+            for d in $CA_ANCHOR_DIRS; do as_root rm -f "$d/headscale-cnc.crt" 2>/dev/null || true; done
+            have update-ca-trust && { as_root update-ca-trust extract >/dev/null 2>&1 || as_root update-ca-trust >/dev/null 2>&1 || true; }
+            ;;
     esac
     rm -f "$CNC_CA_FILE" 2>/dev/null || true
 }
@@ -828,10 +856,8 @@ cmd_link() {
     echo "Try: connector list"
 }
 
-# Push this machine's connector script to the linked CNC and install it there.
-cmd_cnc_update() {
-    is_controller || die "No CNC linked. Run this from a controller (set up via 'connector cnc-init' or 'connector link')."
-    have ssh || die "ssh not found"; have scp || die "scp not found"
+# Push this machine's connector to the linked CNC and install it. Returns 0/1.
+cnc_update_push() {
     load_cnc_link
     local self sshflag scpflag rsudo="sudo " lsum rsum
     self="$(self_path)"
@@ -839,22 +865,106 @@ cmd_cnc_update() {
     scpflag="$([ -n "${CNC_PORT:-}" ] && echo "-P $CNC_PORT" || true)"
     [ "${CNC_USER:-}" = "root" ] && rsudo=""
 
-    log_info "Updating connector on CNC ${CNC_SSH} (${CONNECTOR_BIN})..."
+    log_info "-> CNC ${CNC_SSH} (${CONNECTOR_BIN})"
     # shellcheck disable=SC2086
-    scp $scpflag "$self" "$CNC_SSH:/tmp/connector.$$" >/dev/null || die "Copy to CNC failed."
+    scp $scpflag "$self" "$CNC_SSH:/tmp/connector.$$" >/dev/null 2>&1 || { log_warn "   copy to CNC failed."; return 1; }
     # shellcheck disable=SC2086
     ssh $sshflag "$CNC_SSH" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$" \
-        || die "Install on CNC failed."
+        || { log_warn "   install on CNC failed."; return 1; }
 
-    # Verify the remote copy matches what we just pushed.
     lsum="$(file_sha256 "$self")"
     # shellcheck disable=SC2086
     rsum="$(ssh $sshflag "$CNC_SSH" "sha256sum ${CONNECTOR_BIN} 2>/dev/null || shasum -a 256 ${CONNECTOR_BIN} 2>/dev/null" | awk '{print $1}' | tr -d '\r')"
     if [ -n "$lsum" ] && [ "$lsum" = "$rsum" ]; then
-        log_success "CNC connector updated and verified (sha256 ${lsum:0:12}...)."
+        log_success "   updated + verified (sha256 ${lsum:0:12}...)"
     else
-        log_warn "Installed on CNC, but could not verify checksum (local=${lsum:-?} cnc=${rsum:-?})."
+        log_warn "   installed, but checksum unverified (local=${lsum:-?} cnc=${rsum:-?})."
     fi
+}
+
+# Push this machine's connector to a provider node over Tailscale SSH. Returns 0/1.
+provider_update_push() {
+    local name="$1" user self
+    user="$(id -un)"; self="$(self_path)"
+    log_info "-> provider ${name} (ssh ${user}@${name})"
+    scp -o ConnectTimeout=10 "$self" "${user}@${name}:/tmp/connector.$$" >/dev/null 2>&1 \
+        || { log_warn "   copy failed (online + SSH-reachable?)."; return 1; }
+    ssh -t -o ConnectTimeout=10 "${user}@${name}" \
+        "sudo install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$" \
+        || { log_warn "   remote install failed (sudo rights?)."; return 1; }
+    log_success "   updated."
+}
+
+# Push this machine's connector script to the linked CNC and install it there.
+cmd_cnc_update() {
+    is_controller || die "No CNC linked. Run this from a controller (set up via 'connector cnc-init' or 'connector link')."
+    have ssh || die "ssh not found"; have scp || die "scp not found"
+    cnc_update_push
+}
+
+# Print provider node names (TAB online-flag) from the CNC's headscale.
+provider_nodes() {
+    local json; json="$(hs nodes list -o json 2>/dev/null)" || return 1
+    have jq || return 1
+    printf '%s' "$json" | jq -r '.[]
+        | select((.tags // []) | index("tag:provider"))
+        | "\(.given_name)\t\(.online)"' 2>/dev/null
+}
+
+# Update connector everywhere: the CNC and (optionally) provider nodes.
+cmd_propagate_update() {
+    is_controller || die "Run from a controller (linked via 'connector cnc-init' or 'connector link')."
+    have ssh || die "ssh not found"; have scp || die "scp not found"
+    load_cnc_link
+
+    local -a names=() kinds=()
+    names+=("$CNC_SSH"); kinds+=("cnc")
+    local nm on
+    while IFS="$(printf '\t')" read -r nm on; do
+        [ -n "$nm" ] || continue
+        names+=("$nm"); kinds+=("provider:$on")
+    done < <(provider_nodes 2>/dev/null || true)
+
+    echo "Update connector on which targets?"
+    local i label
+    for i in "${!names[@]}"; do
+        case "${kinds[$i]}" in
+            cnc)            label="CNC          (${names[$i]})" ;;
+            provider:true)  label="provider     ${names[$i]} (online)" ;;
+            provider:false) label="provider     ${names[$i]} (offline - may be unreachable)" ;;
+            *)              label="${names[$i]}" ;;
+        esac
+        printf "  [%d] %s\n" "$((i+1))" "$label"
+    done
+    echo "  [0] all of the above"
+
+    local sel; read -r -p "Select (space-separated numbers, 0 = all): " sel </dev/tty || sel="0"
+
+    local -a chosen=()
+    if [ -z "$sel" ] || printf '%s' " $sel " | grep -q ' 0 '; then
+        for i in "${!names[@]}"; do chosen+=("$i"); done
+    else
+        local tok
+        for tok in $sel; do
+            case "$tok" in
+                ''|*[!0-9]*) continue ;;
+                *) [ "$tok" -ge 1 ] && [ "$tok" -le "${#names[@]}" ] && chosen+=("$((tok-1))") ;;
+            esac
+        done
+    fi
+    [ "${#chosen[@]}" -gt 0 ] || die "Nothing selected."
+
+    echo
+    local idx ok=0 fail=0
+    for idx in "${chosen[@]}"; do
+        case "${kinds[$idx]}" in
+            cnc)         cnc_update_push && ok=$((ok+1)) || fail=$((fail+1)) ;;
+            provider:*)  provider_update_push "${names[$idx]}" && ok=$((ok+1)) || fail=$((fail+1)) ;;
+        esac
+    done
+    echo
+    if [ "$fail" -eq 0 ]; then log_success "propagate-update complete: ${ok} updated."
+    else log_warn "propagate-update finished: ${ok} updated, ${fail} failed."; fi
 }
 
 # --- Invite ------------------------------------------------------------------
@@ -1203,6 +1313,15 @@ cmd_register() {
 
     ensure_wsl_systemd || return 0
     install_tailscale
+    # tailscaled caches the system CA pool at startup; if it is already running,
+    # restart it so a freshly-trusted CNC cert is picked up before we connect
+    # (otherwise the control-plane TLS handshake hangs on a self-signed CNC).
+    if [ "${url%%://*}" = "https" ] && is_ip "$(url_host "$url")" \
+        && have systemctl && systemctl is-active --quiet tailscaled 2>/dev/null; then
+        log_info "Restarting tailscaled to load the CNC certificate..."
+        as_root systemctl restart tailscaled 2>/dev/null || true
+        sleep 1
+    fi
     [ -n "$hostname" ] || hostname="$(node_name)"
 
     local tags ssh_flag=""
@@ -1503,6 +1622,8 @@ SETUP
                        Attach to an existing CNC (become a controller).
   cnc-update           [controller] Push this machine's connector script to
                        the linked CNC and install it there.
+  propagate-update     [controller] Update connector on the CNC and provider
+                       nodes; pick from a list (or 0 for all).
 
 ONBOARD                [admin: run on the CNC or a linked controller]
   invite [provider] [consumer] [controller] [name]
@@ -1549,6 +1670,7 @@ main() {
     case "$cmd" in
         cnc-init)       cmd_cnc_init "$@" ;;
         cnc-update)     cmd_cnc_update "$@" ;;
+        propagate-update) cmd_propagate_update "$@" ;;
         link)           cmd_link "$@" ;;
         invite)         cmd_invite "$@" ;;
         commander-key)  cmd_commander_key "$@" ;;
