@@ -5,4 +5,6 @@ set -xeuo pipefail
 PREFIX="${PREFIX:-$HOME/.local}"
 EXE="connector"
 
-ln -s "$PWD/$EXE" "$PREFIX/bin/"
+mkdir -p "$PREFIX/bin"
+ln -sf "$PWD/$EXE" "$PREFIX/bin/$EXE"
+ln -sf "$PWD/$EXE" "$PREFIX/bin/con"   # short 'con' shortcut

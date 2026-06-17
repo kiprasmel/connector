@@ -15,6 +15,7 @@ HEADSCALE_CERT="${HEADSCALE_CERT_DIR}/cnc.crt"
 HEADSCALE_KEY="${HEADSCALE_CERT_DIR}/cnc.key"
 HS_TLS_PORT_DEFAULT="8443"
 CONNECTOR_BIN="/usr/local/bin/connector"
+CON_BIN="/usr/local/bin/con"        # short 'con' shortcut, symlinked to connector
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/connector"
 CNC_LINK_FILE="${STATE_DIR}/cnc"
 ROLE_FILE="${STATE_DIR}/role"
@@ -650,6 +651,8 @@ cnc_init_local() {
     [ -n "$url" ] || die "Usage: connector cnc-init --url https://<host-or-ip>[:port]"
     [ -n "$base_domain" ] || base_domain="connector.mesh"
 
+    install_self_local        # ensure 'connector' + 'con' are on PATH on the CNC
+
     local host port self_signed=0
     host="$(url_host "$url")"; port="$(url_port "$url")"
     if [ "${url%%://*}" = "https" ] && is_ip "$host"; then
@@ -803,7 +806,7 @@ cnc_init_remote() {
         # shellcheck disable=SC2086
         scp $scpflag "$self" "$host:/tmp/connector.$$" >/dev/null
         # shellcheck disable=SC2086
-        ssh $sshflag "$host" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$"
+        ssh $sshflag "$host" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$"
         # shellcheck disable=SC2086
         ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url'" || die "Remote cnc-init failed"
     fi
@@ -869,7 +872,7 @@ cnc_update_push() {
     # shellcheck disable=SC2086
     scp $scpflag "$self" "$CNC_SSH:/tmp/connector.$$" >/dev/null 2>&1 || { log_warn "   copy to CNC failed."; return 1; }
     # shellcheck disable=SC2086
-    ssh $sshflag "$CNC_SSH" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$" \
+    ssh $sshflag "$CNC_SSH" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$" \
         || { log_warn "   install on CNC failed."; return 1; }
 
     lsum="$(file_sha256 "$self")"
@@ -890,7 +893,7 @@ provider_update_push() {
     scp -o ConnectTimeout=10 "$self" "${user}@${name}:/tmp/connector.$$" >/dev/null 2>&1 \
         || { log_warn "   copy failed (online + SSH-reachable?)."; return 1; }
     ssh -t -o ConnectTimeout=10 "${user}@${name}" \
-        "sudo install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && rm -f /tmp/connector.$$" \
+        "sudo install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && sudo ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$" \
         || { log_warn "   remote install failed (sudo rights?)."; return 1; }
     log_success "   updated."
 }
@@ -1244,6 +1247,7 @@ register_macos() {
     fi
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
     printf '%s\n' "$type" > "$ROLE_FILE"
+    install_self_local
     register_summary "$type" "$cli" "$hostname"
 }
 
@@ -1278,6 +1282,20 @@ maybe_fix_wsl_mtu() {
         log_info "Pinning tailscale0 MTU to ${WSL_MTU} (WSL large-packet fix)..."
         as_root ip link set tailscale0 mtu "$WSL_MTU" 2>/dev/null || true
     fi
+}
+
+# Install the running connector to CONNECTOR_BIN and create the 'con' shortcut,
+# so the node has 'connector'/'con' on PATH after joining. Never fatal.
+install_self_local() {
+    local self dir; self="$(self_path)"; dir="${CONNECTOR_BIN%/*}"
+    [ -n "$self" ] && [ -f "$self" ] || return 0
+    as_root mkdir -p "$dir" 2>/dev/null || true
+    if [ "$self" != "$CONNECTOR_BIN" ]; then
+        as_root install -m 0755 "$self" "$CONNECTOR_BIN" 2>/dev/null \
+            || { log_warn "Could not install 'connector' to ${dir} (need sudo?); skipping."; return 0; }
+    fi
+    as_root ln -sf "$CONNECTOR_BIN" "$CON_BIN" 2>/dev/null || true
+    log_success "Installed 'connector' + 'con' to ${dir}."
 }
 
 cmd_register() {
@@ -1358,6 +1376,7 @@ cmd_register() {
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
     printf '%s\n' "$type" > "$ROLE_FILE"
     maybe_fix_wsl_mtu
+    install_self_local
     register_summary "$type" "tailscale" "$hostname"
 }
 
