@@ -1447,14 +1447,57 @@ cmd_whoami() {
 }
 
 # --- hop / alias -------------------------------------------------------------
+# Run the tailscale CLI for this OS (prefer the macOS app's daemon).
+ts_cli() {
+    if [ "$(os_kind)" = "macos" ] && [ -x "$TS_MAC_APP_CLI" ]; then "$TS_MAC_APP_CLI" "$@"
+    else tailscale "$@"; fi
+}
+have_ts() { { [ "$(os_kind)" = "macos" ] && [ -x "$TS_MAC_APP_CLI" ]; } || have tailscale; }
+
+# Online provider peers this node is allowed to SSH to. Prints short MagicDNS names.
+ts_reachable_providers() {
+    have jq || return 0
+    ts_cli status --json 2>/dev/null | jq -r '
+        (.Peer // {}) | to_entries[] | .value
+        | select((.Tags // []) | index("tag:provider"))
+        | select(.Online == true)
+        | (.DNSName // (.HostName + ".")) | sub("\\.$"; "") | split(".")[0]' 2>/dev/null
+}
+
+# This machine's own MagicDNS name (short), best-effort.
+ts_self_name() {
+    have jq || { node_name; return; }
+    local n; n="$(ts_cli status --json 2>/dev/null | jq -r '(.Self.DNSName // (.Self.HostName + ".")) | sub("\\.$";"") | split(".")[0]' 2>/dev/null)"
+    [ -n "$n" ] && printf '%s\n' "$n" || node_name
+}
+
+# Print only the hosts this machine can actually connect to (role/tag aware).
+print_hosts() {
+    have_ts || return 0
+    if is_consumer; then
+        local list=""
+        if have jq; then list="$(ts_reachable_providers)"; else
+            list="$(ts_cli status 2>/dev/null | awk 'NF>=2 && $1 !~ /^#/ {print $2}')"
+        fi
+        if [ -n "$list" ]; then
+            echo "Providers you can reach (connector hop <name>):"
+            printf '%s\n' "$list" | sed 's/^/  /'
+        else
+            echo "No providers are online right now."
+        fi
+    elif is_provider; then
+        echo "This machine is a provider; consumers connect to it at:"
+        echo "  $(ts_self_name)"
+    elif is_admin; then
+        echo "See all nodes with: connector list"
+    fi
+}
+
 cmd_hop() {
     local target="${1:-}"
     if [ -z "$target" ]; then
-        log_info "Tailnet peers (providers accept SSH):"
-        have tailscale && tailscale status 2>/dev/null \
-            | awk 'NF>=2 && $1 !~ /^#/ {print "  " $2 "  (" $1 ")"}'
-        echo
-        echo "Connect with: connector hop <name>   (or: ssh <user>@<name>)"
+        print_hosts
+        is_consumer && echo "  (or: ssh <user>@<name>)"
         return 0
     fi
     if [[ "$target" == *"@"* ]]; then
@@ -1662,6 +1705,35 @@ Examples
   connector register consumer https://203.0.113.1:${HS_TLS_PORT_DEFAULT} --authkey hskey-xxxx --ca-sha256 ab12...
   connector hop my-laptop
 EOF
+    echo
+    print_hosts
+}
+
+# Once per hour, warn a controller if the CNC's connector differs and offer to sync.
+maybe_check_cnc_sync() {
+    is_controller || return 0
+    [ -t 0 ] || return 0                     # interactive sessions only
+    local stamp="$STATE_DIR/.synccheck" now=0 last=0 self lsum rsum sshflag
+    now="$(date +%s 2>/dev/null || echo 0)"
+    [ -f "$stamp" ] && last="$(cat "$stamp" 2>/dev/null || echo 0)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ "$now" -gt 0 ] && [ "$((now - last))" -lt 3600 ] && return 0
+    load_cnc_link
+    self="$(self_path)"; lsum="$(file_sha256 "$self")"
+    [ -n "$lsum" ] || return 0
+    sshflag="$([ -n "${CNC_PORT:-}" ] && echo "-p $CNC_PORT" || true)"
+    # shellcheck disable=SC2086
+    rsum="$(ssh -o ConnectTimeout=5 -o BatchMode=yes $sshflag "$CNC_SSH" \
+        "sha256sum ${CONNECTOR_BIN} 2>/dev/null || shasum -a 256 ${CONNECTOR_BIN} 2>/dev/null" 2>/dev/null \
+        | awk '{print $1}' | tr -d '\r')"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+    [ -n "$rsum" ] || return 0               # CNC unreachable -> skip quietly
+    if [ "$lsum" != "$rsum" ]; then
+        echo
+        log_warn "The CNC's connector is out of sync with this machine."
+        confirm "Run 'propagate-update' to sync the CNC (and providers)?" y && cmd_propagate_update
+    fi
 }
 
 # --- Dispatcher --------------------------------------------------------------
@@ -1698,6 +1770,11 @@ main() {
             cmd_help
             exit 1
             ;;
+    esac
+
+    # Opportunistically (and throttled) nudge controllers when the CNC drifts.
+    case "$cmd" in
+        invite|list|status|approve|revoke|whoami) maybe_check_cnc_sync || true ;;
     esac
 }
 
