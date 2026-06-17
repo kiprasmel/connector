@@ -15,25 +15,25 @@ exchange, NAT traversal, DNS, SSH authz — is delegated to headscale/tailscale.
 
 ## Roles
 
-A machine can hold several roles at once (a laptop is usually controller +
+A machine can hold several roles at once (a laptop is usually manager +
 consumer). `connector` detects them from cheap, local state:
 
 | Role           | Detected by                                             | Can do                                  |
 |----------------|---------------------------------------------------------|-----------------------------------------|
 | **cnc**        | `headscale` binary present **and** `/etc/headscale/config.yaml` exists | runs admin commands locally |
-| **controller** | a saved link at `~/.config/connector/cnc`               | runs admin commands on the CNC over SSH |
+| **manager**    | a saved link at `~/.config/connector/cnc`               | runs admin commands on the CNC over SSH |
 | **provider**   | local role file says `provider`/`both` (`tag:provider`) | accepts Tailscale SSH                   |
 | **consumer**   | local role file says `consumer`/`both` (`tag:consumer`) | initiates SSH to providers              |
 
 `connector whoami` prints the detected set; `connector status` shows it too.
 
-Only a **cnc or controller** may invite or approve machines, or promote a new
-controller. A plain provider/consumer has no admin authority.
+Only a **cnc or manager** may invite or approve machines, or promote a new
+manager. A plain provider/consumer has no admin authority.
 
 ## Topology
 
 ```
-        local controller (admin laptop)
+        local manager (admin laptop)
         drives the CNC over the admin's own SSH
                        │
                        │  connector invite / approve / list / revoke
@@ -70,7 +70,7 @@ There is **no auto-join and no shared reusable key**. Two paths, both controlled
 by the admin:
 
 1. **Invite (streamlined).** Admin runs `connector invite` on the CNC (or from a
-   linked controller, proxied over SSH). It mints a **single-use, short-expiry**
+   linked manager, proxied over SSH). It mints a **single-use, short-expiry**
    pre-auth key (`headscale preauthkeys create … --expiration 1h`) carrying the
    chosen tags, and prints the exact `connector register …` command to hand to
    that one machine. The key dies after one use / expiry, so it is not a secret
@@ -84,13 +84,13 @@ by the admin:
 `finalize` from the old tool is gone: after a successful `register`, the node is
 already connected.
 
-### Controller (C&C commander) invites
+### Manager invites
 
-A controller commands the CNC over SSH, so promoting one is the single place
+A manager commands the CNC over SSH, so promoting one is the single place
 where SSH-key handling remains. `connector invite` → option `[3]` (only shown to
-a cnc/controller) authorizes the invitee's SSH public key on the CNC admin
+a cnc/manager) authorizes the invitee's SSH public key on the CNC admin
 account and prints the `connector link …` command for them. The invitee gets
-their key via `connector commander-key`. Revoking a controller = removing that
+their key via `connector manager-key`. Revoking a manager = removing that
 key from the CNC admin's `authorized_keys`.
 
 ## Admin-command routing
@@ -98,7 +98,7 @@ key from the CNC admin's `authorized_keys`.
 `invite`, `approve`, `list`, `revoke`, and `cleanup-cnc` go through one helper:
 
 1. if this machine **is the CNC** → run `headscale …` locally (via sudo);
-2. else if it **is a controller** → `ssh <CNC> [sudo] headscale …` and relay output;
+2. else if it **is a manager** → `ssh <CNC> [sudo] headscale …` and relay output;
 3. else → fail with guidance to `cnc-init` or `link` a CNC.
 
 Interactive prompts (the invite menu, etc.) happen locally; only concrete
@@ -144,7 +144,7 @@ Clients trust this cert by **fingerprint pinning**, not blind acceptance:
 - `register` fetches the live cert from `<ip>:8443`, verifies it matches the pin,
   then installs it into the OS trust store (macOS System keychain via
   `security add-trusted-cert`; Linux `/usr/local/share/ca-certificates` +
-  `update-ca-certificates`). A linked controller instead reads the cert straight
+  `update-ca-certificates`). A linked manager instead reads the cert straight
   off the CNC over SSH (already-trusted channel), so no pin is needed there.
 - `cleanup` removes the cert from the trust store again.
 
@@ -183,13 +183,13 @@ self-signed cert in the System keychain before `tailscale up`.
 | `/etc/headscale/acl.hujson`            | CNC: tag/SSH ACL policy                    |
 | `/var/lib/headscale/`                  | CNC: keys + sqlite DB                      |
 | `/var/lib/headscale/certs/`            | CNC: self-signed `cnc.crt`/`cnc.key` (IP mode) |
-| `~/.config/connector/cnc`             | controller: linked CNC (`CNC_SSH/URL/PORT`)|
+| `~/.config/connector/cnc`             | manager: linked CNC (`CNC_SSH/URL/PORT`)|
 | `~/.config/connector/role`            | node: last registered role (provider/…)    |
 | `~/.config/connector/cnc-ca.crt`      | node: trusted self-signed CNC cert (for cleanup) |
 | `~/.config/connector/aliases.conf`    | saved `connector <name>` SSH shortcuts     |
 | `~/.ssh/config`                       | optional Host entries written by `alias`   |
 
-The only persisted controller secret is the SSH access it already has to the
+The only persisted manager secret is the SSH access it already has to the
 CNC. Everything else is read live from headscale/tailscale.
 
 ## Ports (open INBOUND on the CNC)

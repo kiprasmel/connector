@@ -27,7 +27,7 @@ TS_INSTALL_URL="https://tailscale.com/install.sh"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
-    cnc-init cnc-update propagate-update link invite commander-key register approve list revoke
+    cnc-init cnc-update propagate-update link invite manager-key commander-key register approve list revoke
     status whoami hop alias cleanup cleanup-cnc help --help -h
 )
 
@@ -205,8 +205,8 @@ fetch_live_cert() {
 
 # --- Role detection ----------------------------------------------------------
 is_cnc()        { have headscale && [ -f "$HEADSCALE_CONFIG" ]; }
-is_controller() { [ -f "$CNC_LINK_FILE" ]; }
-is_admin()      { is_cnc || is_controller; }
+is_manager() { [ -f "$CNC_LINK_FILE" ]; }
+is_admin()      { is_cnc || is_manager; }
 
 node_role()   { [ -f "$ROLE_FILE" ] && cat "$ROLE_FILE" 2>/dev/null || true; }
 is_provider() { case "$(node_role)" in provider|both) return 0 ;; *) return 1 ;; esac; }
@@ -216,7 +216,7 @@ is_node()     { have tailscale && tailscale status >/dev/null 2>&1; }
 current_roles() {
     local roles=()
     is_cnc        && roles+=("cnc")
-    is_controller && roles+=("controller")
+    is_manager && roles+=("manager")
     is_provider   && roles+=("provider")
     is_consumer   && roles+=("consumer")
     if [ "${#roles[@]}" -eq 0 ]; then
@@ -277,7 +277,7 @@ ssh_cnc() {
 hs() {
     if is_cnc; then
         as_root headscale "$@"
-    elif is_controller; then
+    elif is_manager; then
         load_cnc_link
         if [ "$CNC_USER" = "root" ]; then
             ssh_cnc headscale "$@"
@@ -293,7 +293,7 @@ hs() {
 cnc_server_url() {
     if is_cnc; then
         sed -n 's/^server_url:[[:space:]]*//p' "$HEADSCALE_CONFIG" 2>/dev/null | head -n1
-    elif is_controller; then
+    elif is_manager; then
         load_cnc_link; printf '%s\n' "$CNC_URL"
     fi
 }
@@ -406,7 +406,7 @@ gen_self_signed() {
 cnc_cert_pem() {
     if is_cnc; then
         as_root cat "$HEADSCALE_CERT" 2>/dev/null
-    elif is_controller; then
+    elif is_manager; then
         load_cnc_link
         if [ "$CNC_USER" = "root" ]; then ssh_cnc cat "$HEADSCALE_CERT" 2>/dev/null
         else ssh_cnc sudo cat "$HEADSCALE_CERT" 2>/dev/null; fi
@@ -489,7 +489,7 @@ establish_cnc_trust() {
     host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
     is_ip "$host" || return 0                      # public-domain CNC = publicly-trusted cert
     [ -s "$CNC_CA_FILE" ] && return 0              # already trusted
-    if is_controller; then
+    if is_manager; then
         pem="$(cnc_cert_pem)"
         [ -n "$pem" ] || die "Could not read the CNC cert over SSH."
     else
@@ -809,7 +809,7 @@ cnc_init_remote() {
     fi
 
     save_cnc_link "$host" "$url" "$port"
-    log_success "Linked to CNC $host (this machine is now a controller)."
+    log_success "Linked to CNC $host (this machine is now a manager)."
 
     check_cnc_reachable "$url"
 
@@ -852,7 +852,7 @@ cmd_link() {
     ssh -o ConnectTimeout=10 $sshflag "$host" 'test -f /etc/headscale/config.yaml' \
         || die "$host is not a configured CNC (no /etc/headscale/config.yaml)"
     save_cnc_link "$host" "$url" "$port"
-    log_success "Linked to CNC $host. This machine is now a controller."
+    log_success "Linked to CNC $host. This machine is now a manager."
     echo "Try: connector list"
 }
 
@@ -897,7 +897,7 @@ provider_update_push() {
 
 # Push this machine's connector script to the linked CNC and install it there.
 cmd_cnc_update() {
-    is_controller || die "No CNC linked. Run this from a controller (set up via 'connector cnc-init' or 'connector link')."
+    is_manager || die "No CNC linked. Run this from a manager (set up via 'connector cnc-init' or 'connector link')."
     have ssh || die "ssh not found"; have scp || die "scp not found"
     cnc_update_push
 }
@@ -913,7 +913,7 @@ provider_nodes() {
 
 # Update connector everywhere: the CNC and (optionally) provider nodes.
 cmd_propagate_update() {
-    is_controller || die "Run from a controller (linked via 'connector cnc-init' or 'connector link')."
+    is_manager || die "Run from a manager (linked via 'connector cnc-init' or 'connector link')."
     have ssh || die "ssh not found"; have scp || die "scp not found"
     load_cnc_link
 
@@ -1002,37 +1002,37 @@ mint_key() {
 }
 
 cmd_invite() {
-    is_admin || die "Only a CNC or controller can invite. Link one: connector link <host> --url ..."
-    local types=() name="" want_controller=0
+    is_admin || die "Only a CNC or manager can invite. Link one: connector link <host> --url ..."
+    local types=() name="" want_manager=0
     while [ $# -gt 0 ]; do
         case "$1" in
             provider) types+=("provider"); shift ;;
             consumer) types+=("consumer"); shift ;;
-            controller|commander) want_controller=1; shift ;;
+            manager|controller|commander) want_manager=1; shift ;;
             *) name="$1"; shift ;;
         esac
     done
 
-    if [ "${#types[@]}" -eq 0 ] && [ "$want_controller" -eq 0 ]; then
+    if [ "${#types[@]}" -eq 0 ] && [ "$want_manager" -eq 0 ]; then
         echo "Invite as:"
         echo "  [1] provider"
         echo "  [2] consumer"
-        echo "  [3] controller (C&C commander)"
+        echo "  [3] manager (commands the CNC over SSH)"
         local sel n
         read -r -p 'Enter number(s) (e.g. 1, 2, or "1 2"): ' sel || sel=""
         for n in $sel; do
             case "$n" in
                 1) types+=("provider") ;;
                 2) types+=("consumer") ;;
-                3) want_controller=1 ;;
+                3) want_manager=1 ;;
                 *) log_warn "Ignoring invalid choice: $n" ;;
             esac
         done
     fi
-    [ "${#types[@]}" -eq 0 ] && [ "$want_controller" -eq 0 ] && die "Nothing selected."
+    [ "${#types[@]}" -eq 0 ] && [ "$want_manager" -eq 0 ] && die "Nothing selected."
 
-    if [ "$want_controller" -eq 1 ]; then
-        invite_controller
+    if [ "$want_manager" -eq 1 ]; then
+        invite_manager
     fi
 
     if [ "${#types[@]}" -gt 0 ]; then
@@ -1058,17 +1058,17 @@ cmd_invite() {
     fi
 }
 
-invite_controller() {
-    is_admin || die "Only a CNC or controller can invite a controller."
+invite_manager() {
+    is_admin || die "Only a CNC or manager can invite a manager."
     local url cnc_target pubkey
     url="$(cnc_server_url)"
-    if is_controller; then load_cnc_link; cnc_target="$CNC_SSH"; else cnc_target="$(id -un)@$(node_name)"; fi
+    if is_manager; then load_cnc_link; cnc_target="$CNC_SSH"; else cnc_target="$(id -un)@$(node_name)"; fi
 
     echo
-    echo "== Invite a controller (C&C commander) =="
-    echo "A controller commands the CNC over SSH, so its key must be authorized"
+    echo "== Invite a manager =="
+    echo "A manager commands the CNC over SSH, so its key must be authorized"
     echo "on the CNC admin account (${cnc_target})."
-    echo "On the NEW controller, run 'connector commander-key' and paste its output here."
+    echo "On the NEW manager, run 'connector manager-key' and paste its output here."
     echo
     read -r -p "Paste SSH public key: " pubkey || true
     [ -n "$pubkey" ] || die "No key provided."
@@ -1076,15 +1076,15 @@ invite_controller() {
         ssh-*|ecdsa-*|sk-*) ;;
         *) die "That does not look like an SSH public key." ;;
     esac
-    authorize_commander "$pubkey"
-    log_success "Authorized the new controller's key on the CNC admin account."
+    authorize_manager "$pubkey"
+    log_success "Authorized the new manager's key on the CNC admin account."
     echo
     echo "Tell them to run:"
     echo "    connector link ${cnc_target} --url ${url}${CNC_PORT:+ -p $CNC_PORT}"
 }
 
 # Append a public key to the CNC admin account's authorized_keys.
-authorize_commander() {
+authorize_manager() {
     local pubkey="$1"
     if is_cnc; then
         mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
@@ -1096,17 +1096,17 @@ authorize_commander() {
     fi
 }
 
-cmd_commander_key() {
+cmd_manager_key() {
     local k key=""
     for k in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub" "$HOME/.ssh/id_rsa.pub"; do
         [ -f "$k" ] && { key="$k"; break; }
     done
     if [ -z "$key" ]; then
         log_info "No SSH key found; generating an ed25519 key..."
-        ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" -C "connector-commander@$(node_name)" >/dev/null
+        ssh-keygen -t ed25519 -N "" -f "$HOME/.ssh/id_ed25519" -C "connector-manager@$(node_name)" >/dev/null
         key="$HOME/.ssh/id_ed25519.pub"
     fi
-    echo "# Hand this public key to a CNC/controller running 'connector invite' -> controller:"
+    echo "# Hand this public key to a CNC/manager running 'connector invite' -> manager:"
     cat "$key"
 }
 
@@ -1363,7 +1363,7 @@ cmd_register() {
 
 # --- Admin: list / approve / revoke -----------------------------------------
 cmd_list() {
-    is_admin || die "Only a CNC or controller can list nodes."
+    is_admin || die "Only a CNC or manager can list nodes."
     hs nodes list
 }
 
@@ -1376,7 +1376,7 @@ approve_routes() {
 }
 
 cmd_approve() {
-    is_admin || die "Only a CNC or controller can approve."
+    is_admin || die "Only a CNC or manager can approve."
     local node="${1:-}" type="${2:-}"
     if [ -z "$node" ]; then
         echo "Nodes:"
@@ -1405,7 +1405,7 @@ cmd_approve() {
 }
 
 cmd_revoke() {
-    is_admin || die "Only a CNC or controller can revoke nodes."
+    is_admin || die "Only a CNC or manager can revoke nodes."
     local node="${1:-}"
     [ -n "$node" ] || die "Usage: connector revoke <node-name|node-id>"
     local id; id="$(resolve_node_id "$node")" || die "Node not found: $node"
@@ -1417,7 +1417,7 @@ cmd_revoke() {
 # --- Status / whoami ---------------------------------------------------------
 cmd_status() {
     echo "Roles: $(current_roles)"
-    if is_controller; then load_cnc_link; echo "Linked CNC: $CNC_SSH ($CNC_URL)"; fi
+    if is_manager; then load_cnc_link; echo "Linked CNC: $CNC_SSH ($CNC_URL)"; fi
     echo
     if is_cnc; then
         if systemctl is-active --quiet headscale 2>/dev/null; then
@@ -1438,7 +1438,7 @@ cmd_status() {
 
 cmd_whoami() {
     echo "Roles: $(current_roles)"
-    if is_controller; then load_cnc_link; echo "Linked CNC: $CNC_SSH"; echo "Server URL: $CNC_URL"; fi
+    if is_manager; then load_cnc_link; echo "Linked CNC: $CNC_SSH"; echo "Server URL: $CNC_URL"; fi
     if is_cnc; then echo "Server URL: $(cnc_server_url)"; fi
     if is_node; then
         local ip; ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
@@ -1610,14 +1610,14 @@ cmd_cleanup() {
         untrust_cnc_cert "$cn"
         log_info "Removed the trusted CNC certificate."
     fi
-    if is_controller && confirm "Also forget the linked CNC?"; then
+    if is_manager && confirm "Also forget the linked CNC?"; then
         rm -f "$CNC_LINK_FILE"; log_success "Forgot CNC link."
     fi
     log_success "Cleanup complete."
 }
 
 cmd_cleanup_cnc() {
-    is_admin || die "Only a CNC or controller can run cleanup-cnc."
+    is_admin || die "Only a CNC or manager can run cleanup-cnc."
     log_warn "This will delete ALL nodes and stop headscale on the CNC."
     confirm "Continue?" || { log_info "Cancelled."; exit 0; }
     local out ids id
@@ -1657,24 +1657,24 @@ This machine: $(current_roles)
 SETUP
   cnc-init [user@host] [--url https://HOST[:PORT]] [-p SSH_PORT]
                        Set up the CNC (headscale). With user@host it runs
-                       remotely over SSH and links this PC as a controller.
+                       remotely over SSH and links this PC as a manager.
                        No domain needed: with a bare IP it self-signs TLS on
                        :${HS_TLS_PORT_DEFAULT} and pins the cert on clients. If --url is omitted
                        for a remote, the IP is taken from your SSH config.
   link <user@host> --url https://HOST[:PORT] [-p SSH_PORT]
-                       Attach to an existing CNC (become a controller).
-  cnc-update           [controller] Push this machine's connector script to
+                       Attach to an existing CNC (become a manager).
+  cnc-update           [manager] Push this machine's connector script to
                        the linked CNC and install it there.
-  propagate-update     [controller] Update connector on the CNC and provider
+  propagate-update     [manager] Update connector on the CNC and provider
                        nodes; pick from a list (or 0 for all).
 
-ONBOARD                [admin: run on the CNC or a linked controller]
-  invite [provider] [consumer] [controller] [name]
+ONBOARD                [admin: run on the CNC or a linked manager]
+  invite [provider] [consumer] [manager] [name]
                        No args -> menu ([1] provider [2] consumer
-                       [3] controller). Enter "1 2" for both. Mints a
+                       [3] manager). Enter "1 2" for both. Mints a
                        single-use key and prints the register command.
-  commander-key        Print this machine's SSH public key (for a
-                       'controller' invite).
+  manager-key          Print this machine's SSH public key (for a
+                       'manager' invite).
   approve [node] [type]
                        Tag/approve a node that joined without a key.
 
@@ -1709,9 +1709,9 @@ EOF
     print_hosts
 }
 
-# Once per hour, warn a controller if the CNC's connector differs and offer to sync.
+# Once per hour, warn a manager if the CNC's connector differs and offer to sync.
 maybe_check_cnc_sync() {
-    is_controller || return 0
+    is_manager || return 0
     [ -t 0 ] || return 0                     # interactive sessions only
     local stamp="$STATE_DIR/.synccheck" now=0 last=0 self lsum rsum sshflag
     now="$(date +%s 2>/dev/null || echo 0)"
@@ -1745,7 +1745,7 @@ main() {
         propagate-update) cmd_propagate_update "$@" ;;
         link)           cmd_link "$@" ;;
         invite)         cmd_invite "$@" ;;
-        commander-key)  cmd_commander_key "$@" ;;
+        manager-key|commander-key)  cmd_manager_key "$@" ;;
         register)       cmd_register "$@" ;;
         approve)        cmd_approve "$@" ;;
         list)           cmd_list "$@" ;;
@@ -1772,7 +1772,7 @@ main() {
             ;;
     esac
 
-    # Opportunistically (and throttled) nudge controllers when the CNC drifts.
+    # Opportunistically (and throttled) nudge managers when the CNC drifts.
     case "$cmd" in
         invite|list|status|approve|revoke|whoami) maybe_check_cnc_sync || true ;;
     esac
