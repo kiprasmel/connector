@@ -1155,9 +1155,11 @@ install_tailscale_macos_oss() {
 }
 
 # Choose (installing if needed) a macOS tailscale CLI. Prints the path on stdout;
-# all prompts go to stderr/tty so the captured stdout is only the path.
+# ALL prompts/messages go to stderr so the captured stdout is only the path.
+# $2 (needs_ssh): 1 when registering as provider/both. The sandboxed GUI app
+# cannot host Tailscale SSH, so a provider must use open-source tailscaled.
 macos_tailscale_cli() {
-    local variant="$1" app="$TS_MAC_APP_CLI" oss have_app=0 have_oss=0 c p
+    local variant="$1" needs_ssh="${2:-0}" app="$TS_MAC_APP_CLI" oss have_app=0 have_oss=0 c p ans
     [ -x "$app" ] && have_app=1
     oss="$(command -v tailscale 2>/dev/null || true)"
     if [ -z "$oss" ]; then
@@ -1167,11 +1169,40 @@ macos_tailscale_cli() {
     fi
     [ -n "$oss" ] && have_oss=1
     case "$variant" in
-        app) install_tailscale_macos_app >&2; printf '%s\n' "$app"; return 0 ;;
+        app) [ "$needs_ssh" = 1 ] && log_warn "The GUI app can't host Tailscale SSH; this Mac won't be a provider." >&2
+             install_tailscale_macos_app >&2; printf '%s\n' "$app"; return 0 ;;
         oss) install_tailscale_macos_oss >&2; command -v tailscale; return 0 ;;
         "")  ;;
         *)   echo "Unknown --tailscale variant: $variant (use 'app' or 'oss')" >&2; return 1 ;;
     esac
+
+    # Provider/both must host Tailscale SSH -> only open-source tailscaled works.
+    if [ "$needs_ssh" = 1 ]; then
+        if [ "$have_oss" = 1 ]; then
+            log_info "Using open-source tailscaled (required to be a provider on macOS)." >&2
+            printf '%s\n' "$oss"; return 0
+        fi
+        if [ "$have_app" = 1 ]; then
+            log_warn "Only the Tailscale GUI app is installed; it CANNOT be a provider (no Tailscale SSH)." >&2
+            read -r -p "Install open-source tailscaled so this Mac can be a provider? [Y/n]: " ans </dev/tty || ans=y
+            case "${ans:-y}" in
+                [nN]*) log_warn "Continuing with the GUI app: it joins the tailnet but is NOT a provider." >&2
+                       printf '%s\n' "$app"; return 0 ;;
+                *)     install_tailscale_macos_oss >&2; command -v tailscale; return 0 ;;
+            esac
+        fi
+        { echo "Tailscale is not installed. A provider needs Tailscale SSH:"
+          echo "  [1] GUI app                 - CANNOT be a provider (no Tailscale SSH)"
+          echo "  [2] open-source tailscaled  - recommended (hosts SSH)"; } >&2
+        read -r -p "Install [1/2] (default 2): " c </dev/tty || c=2
+        case "${c:-2}" in
+            1) install_tailscale_macos_app >&2; printf '%s\n' "$app" ;;
+            *) install_tailscale_macos_oss >&2; command -v tailscale ;;
+        esac
+        return 0
+    fi
+
+    # Consumer (no SSH server needed): the GUI app is fine.
     if [ "$have_app" = 1 ] && [ "$have_oss" = 0 ]; then printf '%s\n' "$app"; return 0; fi
     if [ "$have_oss" = 1 ] && [ "$have_app" = 0 ]; then printf '%s\n' "$oss"; return 0; fi
     if [ "$have_app" = 1 ] && [ "$have_oss" = 1 ]; then
@@ -1207,9 +1238,12 @@ register_summary() {
 }
 
 register_macos() {
-    local type="$1" url="$2" key="$3" hostname="$4" variant="$5" cli
+    local type="$1" url="$2" key="$3" hostname="$4" variant="$5" cli needs_ssh=0
     [ -n "$hostname" ] || hostname="$(node_name)"
-    cli="$(macos_tailscale_cli "$variant")" || die "Could not determine a tailscale CLI."
+    # Providers must host Tailscale SSH, which the sandboxed GUI app can't do;
+    # let the CLI chooser steer to open-source tailscaled in that case.
+    case "$type" in provider|both) needs_ssh=1 ;; esac
+    cli="$(macos_tailscale_cli "$variant" "$needs_ssh")" || die "Could not determine a tailscale CLI."
     [ -n "$cli" ] || die "tailscale CLI not found after install."
 
     local tags ssh_flag=""
@@ -1556,7 +1590,10 @@ print_hosts() {
     local out="" n names
     if is_manager; then
         load_cnc_link
-        [ -n "${CNC_SSH:-}" ] && out+="  cnc"$'\n'
+        if [ -n "${CNC_SSH:-}" ]; then
+            local cnc_name="${CNC_SSH##*@}"   # bare host/alias, e.g. 'nyc'
+            out+="  ${cnc_name}  (cnc)"$'\n'
+        fi
     fi
     if have_ts && is_consumer && have jq; then
         names="$(ts_cli status --json 2>/dev/null | jq -r '
@@ -1573,15 +1610,29 @@ EOF
     printf '%s' "$out"
 }
 
+# True if $1 names the linked CNC: the literal 'cnc', the CNC's ssh remote
+# (e.g. 'root@1.2.3.4'), or its bare host/alias (e.g. 'nyc').
+is_cnc_target() {
+    [ "$1" = "cnc" ] && return 0
+    is_manager || return 1
+    [ -f "$CNC_LINK_FILE" ] || return 1
+    load_cnc_link
+    [ -n "${CNC_SSH:-}" ] || return 1
+    [ "$1" = "$CNC_SSH" ] && return 0
+    [ "$1" = "${CNC_SSH##*@}" ] && return 0
+    return 1
+}
+
 cmd_hop() {
     local target="${1:-}"
     if [ -z "$target" ]; then
         print_hosts
         return 0
     fi
-    # 'cnc' is a virtual target: a manager reaches the control server over its
-    # existing admin SSH (the CNC is not a tailnet node).
-    if [ "$target" = "cnc" ]; then
+    # The CNC is not a tailnet node: a manager reaches it over its existing admin
+    # SSH. Accept the literal 'cnc' or the CNC's ssh remote name (e.g. 'nyc'), so
+    # you can use the same name you linked it with.
+    if is_cnc_target "$target"; then
         is_cnc && die "This machine is the CNC."
         is_manager || die "Only a manager can hop to the CNC (link one: connector link ...)."
         load_cnc_link
@@ -1784,9 +1835,10 @@ USE
   revoke <node>        [admin] Remove a node.
   hop [user@name|name|cnc]
                        SSH to a provider by MagicDNS name (no arg = list the
-                       hosts you can connect to). Use 'cnc' to SSH the control
-                       server (managers). Aliases: 'connector ssh <name>'; any
-                       non-command word is an implicit hop -> 'connector <name>'.
+                       hosts you can connect to). Managers reach the control
+                       server via 'cnc' or its ssh remote name (e.g. 'connector
+                       nyc'). Aliases: 'connector ssh <name>'; any non-command
+                       word is an implicit hop -> 'connector <name>'.
   alias <name> <user@name> | alias list | alias rm <name>
                        Save an SSH shortcut (optionally writes ~/.ssh/config).
   cleanup              Disconnect this machine from the tailnet.
