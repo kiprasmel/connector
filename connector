@@ -209,10 +209,44 @@ is_cnc()        { have headscale && [ -f "$HEADSCALE_CONFIG" ]; }
 is_manager() { [ -f "$CNC_LINK_FILE" ]; }
 is_admin()      { is_cnc || is_manager; }
 
-node_role()   { [ -f "$ROLE_FILE" ] && cat "$ROLE_FILE" 2>/dev/null || true; }
-is_provider() { case "$(node_role)" in provider|both) return 0 ;; *) return 1 ;; esac; }
-is_consumer() { case "$(node_role)" in consumer|both) return 0 ;; *) return 1 ;; esac; }
+# Does CSV role-list $1 contain role $2?  e.g. role_has "provider,consumer" provider
+role_has() { case ",${1}," in *",${2},"*) return 0 ;; *) return 1 ;; esac; }
+
+node_role() {
+    local r=""
+    [ -f "$ROLE_FILE" ] && r="$(cat "$ROLE_FILE" 2>/dev/null || true)"
+    [ "$r" = "both" ] && r="provider,consumer"   # migrate legacy 'both'
+    printf '%s' "$r"
+}
+is_provider() { role_has "$(node_role)" provider; }
+is_consumer() { role_has "$(node_role)" consumer; }
 is_node()     { have tailscale && tailscale status >/dev/null 2>&1; }
+
+# Canonicalize a comma/space separated node-role spec into an ordered, de-duped
+# CSV of tailnet roles (provider[,consumer]). 'both' stays as a legacy alias.
+# Dies on any unknown role. Empty input yields empty output (no error).
+parse_node_roles() {
+    local tok p=0 c=0 out=""
+    for tok in $(printf '%s' "${1:-}" | tr ',' ' '); do
+        case "$tok" in
+            provider) p=1 ;;
+            consumer) c=1 ;;
+            both)     p=1; c=1 ;;
+            *) die "Invalid role: '$tok' (expected provider and/or consumer)" ;;
+        esac
+    done
+    [ "$p" = 1 ] && out="provider"
+    [ "$c" = 1 ] && out="${out:+$out,}consumer"
+    printf '%s' "$out"
+}
+
+# Map a canonical node-role CSV to a tailscale tag CSV (tag:provider[,tag:consumer]).
+tags_for_roles() {
+    local tags=()
+    role_has "$1" provider && tags+=("tag:provider")
+    role_has "$1" consumer && tags+=("tag:consumer")
+    local IFS=,; printf '%s' "${tags[*]}"
+}
 
 current_roles() {
     local roles=()
@@ -822,17 +856,17 @@ cnc_init_remote() {
     echo "  [1] provider (others can reach/SSH it)   [2] consumer (it reaches providers)"
     echo "  enter '1 2' for both, or [s] to skip"
     local choice; read -r -p "Choose: " choice || choice="s"
-    local type=""
+    local reg_roles=""
     case "$(echo "$choice" | tr -d ' ')" in
-        1)        type="provider" ;;
-        2)        type="consumer" ;;
-        12|21)    type="both" ;;
-        ''|s|S)   type="" ;;
+        1)        reg_roles="provider" ;;
+        2)        reg_roles="consumer" ;;
+        12|21)    reg_roles="provider,consumer" ;;
+        ''|s|S)   reg_roles="" ;;
         *) log_warn "Unrecognised choice; skipping." ;;
     esac
-    if [ -n "$type" ]; then
-        local key; key="$(mint_key "$type")"
-        cmd_register "$type" "$url" --authkey "$key" --yes
+    if [ -n "$reg_roles" ]; then
+        local key; key="$(mint_key "$reg_roles")"
+        cmd_register "$reg_roles" "$url" --authkey "$key" --yes
     else
         log_info "Skipped. Invite machines later with: connector invite"
     fi
@@ -985,16 +1019,13 @@ hs_user_id() {
         | sed -n 's/.*"id": *\([0-9]*\).*/\1/p' | head -n1
 }
 
-# Mint a single-use, short-expiry pre-auth key for a type; echo the key.
+# Mint a single-use, short-expiry pre-auth key for a role spec; echo the key.
 # headscale's --user takes a numeric user ID, so we always resolve it.
 mint_key() {
-    local type="$1" tags uid out key
-    case "$type" in
-        provider) tags="tag:provider" ;;
-        consumer) tags="tag:consumer" ;;
-        both)     tags="tag:provider,tag:consumer" ;;
-        *) die "Invalid type: $type" ;;
-    esac
+    local roles tags uid out key
+    roles="$(parse_node_roles "$1")"
+    [ -n "$roles" ] || die "No roles given for key (expected provider and/or consumer)."
+    tags="$(tags_for_roles "$roles")"
     uid="$(hs_user_id 2>/dev/null || true)"
     [ -n "$uid" ] || die "Could not resolve headscale user '$HEADSCALE_USER' on the CNC (is headscale running? try: connector status)"
     out="$(hs preauthkeys create --user "$uid" --tags "$tags" --expiration "$KEY_EXPIRY" --output json 2>/dev/null)" \
@@ -1006,28 +1037,31 @@ mint_key() {
 
 cmd_invite() {
     is_admin || die "Only a CNC or manager can invite. Link one: connector link <host> --url ..."
-    local types=() name="" want_manager=0
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            provider) types+=("provider"); shift ;;
-            consumer) types+=("consumer"); shift ;;
-            manager|controller|commander) want_manager=1; shift ;;
-            *) name="$1"; shift ;;
+    # Roles may be given comma- or space-separated, e.g. 'provider,consumer'.
+    # Any non-role token is treated as the new machine's hostname.
+    local types=() name="" want_manager=0 tok
+    for tok in $(printf '%s ' "$@" | tr ',' ' '); do
+        case "$tok" in
+            provider) types+=("provider") ;;
+            consumer) types+=("consumer") ;;
+            both)     types+=("provider"); types+=("consumer") ;;
+            manager|controller|commander) want_manager=1 ;;
+            *) name="$tok" ;;
         esac
     done
 
     if [ "${#types[@]}" -eq 0 ] && [ "$want_manager" -eq 0 ]; then
-        echo "Invite as:"
+        echo "Invite as (comma-separated for multiple, e.g. provider,consumer):"
         echo "  [1] provider"
         echo "  [2] consumer"
         echo "  [3] manager (commands the CNC over SSH)"
         local sel n
-        read -r -p 'Enter number(s) (e.g. 1, 2, or "1 2"): ' sel || sel=""
-        for n in $sel; do
+        read -r -p 'Enter roles: ' sel || sel=""
+        for n in $(printf '%s' "$sel" | tr ',' ' '); do
             case "$n" in
-                1) types+=("provider") ;;
-                2) types+=("consumer") ;;
-                3) want_manager=1 ;;
+                1|provider) types+=("provider") ;;
+                2|consumer) types+=("consumer") ;;
+                3|manager|controller|commander) want_manager=1 ;;
                 *) log_warn "Ignoring invalid choice: $n" ;;
             esac
         done
@@ -1039,24 +1073,20 @@ cmd_invite() {
     fi
 
     if [ "${#types[@]}" -gt 0 ]; then
-        local type url key hostarg="" pinarg="" fp
-        if printf '%s\n' "${types[@]}" | grep -qx provider && printf '%s\n' "${types[@]}" | grep -qx consumer; then
-            type="both"
-        else
-            type="${types[0]}"
-        fi
+        local roles url key hostarg="" pinarg="" fp
+        roles="$(parse_node_roles "$(IFS=,; echo "${types[*]}")")"
         url="$(cnc_server_url)"; [ -n "$url" ] || url="<server-url>"
-        key="$(mint_key "$type")"
+        key="$(mint_key "$roles")"
         [ -n "$name" ] && hostarg=" --hostname $name"
         if is_ip "$(url_host "$url")"; then
             fp="$(cnc_cert_fingerprint 2>/dev/null || true)"
             [ -n "$fp" ] && pinarg=" --ca-sha256 ${fp}"
         fi
         echo
-        log_success "Single-use invite created (type: ${type}, expires in ${KEY_EXPIRY})."
+        log_success "Single-use invite created (roles: ${roles}, expires in ${KEY_EXPIRY})."
         echo "Run this on the new machine:"
         echo
-        echo "    connector register ${type} ${url} --authkey ${key}${pinarg}${hostarg}"
+        echo "    connector register ${roles} ${url} --authkey ${key}${pinarg}${hostarg}"
         echo
     fi
 }
@@ -1156,7 +1186,7 @@ install_tailscale_macos_oss() {
 
 # Choose (installing if needed) a macOS tailscale CLI. Prints the path on stdout;
 # ALL prompts/messages go to stderr so the captured stdout is only the path.
-# $2 (needs_ssh): 1 when registering as provider/both. The sandboxed GUI app
+# $2 (needs_ssh): 1 when the roles include provider. The sandboxed GUI app
 # cannot host Tailscale SSH, so a provider must use open-source tailscaled.
 macos_tailscale_cli() {
     local variant="$1" needs_ssh="${2:-0}" app="$TS_MAC_APP_CLI" oss have_app=0 have_oss=0 c p ans
@@ -1176,7 +1206,7 @@ macos_tailscale_cli() {
         *)   echo "Unknown --tailscale variant: $variant (use 'app' or 'oss')" >&2; return 1 ;;
     esac
 
-    # Provider/both must host Tailscale SSH -> only open-source tailscaled works.
+    # A provider must host Tailscale SSH -> only open-source tailscaled works.
     if [ "$needs_ssh" = 1 ]; then
         if [ "$have_oss" = 1 ]; then
             log_info "Using open-source tailscaled (required to be a provider on macOS)." >&2
@@ -1223,35 +1253,32 @@ macos_tailscale_cli() {
     esac
 }
 
-# Print the post-join summary. register_summary <type> <cli> <hostname>
+# Print the post-join summary. register_summary <roles-csv> <cli> <hostname>
 register_summary() {
-    local type="$1" cli="$2" hostname="$3" ts_ip ts_name
+    local roles="$1" cli="$2" hostname="$3" ts_ip ts_name
     ts_ip="$("$cli" ip -4 2>/dev/null | head -n1 || true)"
     ts_name="$("$cli" status --json 2>/dev/null | json_str DNSName)"; ts_name="${ts_name%.}"
     [ -n "$ts_name" ] || ts_name="$hostname"
     echo
-    log_success "Connected as ${type}."
+    log_success "Connected as ${roles}."
     [ -n "$ts_ip" ] && echo "  Tailnet IP: $ts_ip"
     echo "  MagicDNS:   $ts_name"
-    case "$type" in provider|both) echo "  Others reach you via:  ssh <user>@${ts_name}" ;; esac
-    case "$type" in consumer|both) echo "  Reach a provider via:  connector hop <provider-name>" ;; esac
+    role_has "$roles" provider && echo "  Others reach you via:  ssh <user>@${ts_name}"
+    role_has "$roles" consumer && echo "  Reach a provider via:  connector hop <provider-name>"
 }
 
 register_macos() {
-    local type="$1" url="$2" key="$3" hostname="$4" variant="$5" cli needs_ssh=0
+    local roles="$1" url="$2" key="$3" hostname="$4" variant="$5" cli needs_ssh=0
     [ -n "$hostname" ] || hostname="$(node_name)"
     # Providers must host Tailscale SSH, which the sandboxed GUI app can't do;
     # let the CLI chooser steer to open-source tailscaled in that case.
-    case "$type" in provider|both) needs_ssh=1 ;; esac
+    role_has "$roles" provider && needs_ssh=1
     cli="$(macos_tailscale_cli "$variant" "$needs_ssh")" || die "Could not determine a tailscale CLI."
     [ -n "$cli" ] || die "tailscale CLI not found after install."
 
     local tags ssh_flag=""
-    case "$type" in
-        provider) tags="tag:provider"; ssh_flag="--ssh" ;;
-        consumer) tags="tag:consumer" ;;
-        both)     tags="tag:provider,tag:consumer"; ssh_flag="--ssh" ;;
-    esac
+    tags="$(tags_for_roles "$roles")"
+    role_has "$roles" provider && ssh_flag="--ssh"
 
     # GUI app talks to a per-user daemon (no sudo); oss tailscaled needs root.
     local -a runner_cmd
@@ -1268,7 +1295,7 @@ register_macos() {
         ssh_flag=""
     fi
 
-    log_info "Bringing up tailscale on macOS (type: $type, hostname: ${hostname:-auto})..."
+    log_info "Bringing up tailscale on macOS (roles: $roles, hostname: ${hostname:-auto})..."
     # --reset makes register declarative: apply exactly these flags and ignore
     # stale prefs from earlier attempts (tailscale otherwise refuses to change
     # settings without re-stating every non-default flag).
@@ -1291,9 +1318,9 @@ register_macos() {
         die "tailscale up did not complete."
     fi
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-    printf '%s\n' "$type" > "$ROLE_FILE"
+    printf '%s\n' "$roles" > "$ROLE_FILE"
     install_self_local
-    register_summary "$type" "$cli" "$hostname"
+    register_summary "$roles" "$cli" "$hostname"
 }
 
 # Consent-gated, idempotent WSL systemd enablement. Returns non-zero to abort.
@@ -1344,11 +1371,10 @@ install_self_local() {
 }
 
 cmd_register() {
-    local type="${1:-}"; shift || true
-    case "$type" in
-        provider|consumer|both) ;;
-        *) die "Usage: connector register <provider|consumer|both> <url> [--authkey KEY] [--ca-sha256 FP] [--hostname N] [--tailscale app|oss] [--yes]" ;;
-    esac
+    local roles
+    roles="$(parse_node_roles "${1:-}")"
+    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY] [--ca-sha256 FP] [--hostname N] [--tailscale app|oss] [--yes]"
+    shift || true
     local url="" key="" hostname="" pin="" ts_variant=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1361,7 +1387,7 @@ cmd_register() {
             *) [ -z "$url" ] && url="$1" || die "Unexpected argument: $1"; shift ;;
         esac
     done
-    [ -n "$url" ] || die "Usage: connector register <provider|consumer|both> <url> [--authkey KEY]"
+    [ -n "$url" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY]"
 
     # On Linux, make sure the join flow's tools are present (prompt to install).
     [ "$(os_kind)" = "linux" ] && ensure_deps curl openssl
@@ -1370,7 +1396,7 @@ cmd_register() {
     establish_cnc_trust "$url" "$pin"
 
     if [ "$(os_kind)" = "macos" ]; then
-        register_macos "$type" "$url" "$key" "$hostname" "$ts_variant"
+        register_macos "$roles" "$url" "$key" "$hostname" "$ts_variant"
         return $?
     fi
 
@@ -1388,13 +1414,10 @@ cmd_register() {
     [ -n "$hostname" ] || hostname="$(node_name)"
 
     local tags ssh_flag=""
-    case "$type" in
-        provider) tags="tag:provider"; ssh_flag="--ssh" ;;
-        consumer) tags="tag:consumer" ;;
-        both)     tags="tag:provider,tag:consumer"; ssh_flag="--ssh" ;;
-    esac
+    tags="$(tags_for_roles "$roles")"
+    role_has "$roles" provider && ssh_flag="--ssh"
 
-    log_info "Bringing up tailscale (type: $type, hostname: ${hostname:-auto})..."
+    log_info "Bringing up tailscale (roles: $roles, hostname: ${hostname:-auto})..."
     # --reset makes register declarative: apply exactly these flags and ignore
     # stale prefs from earlier attempts (tailscale otherwise refuses to change
     # settings without re-stating every non-default flag).
@@ -1419,10 +1442,10 @@ cmd_register() {
     fi
 
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-    printf '%s\n' "$type" > "$ROLE_FILE"
+    printf '%s\n' "$roles" > "$ROLE_FILE"
     maybe_fix_wsl_mtu
     install_self_local
-    register_summary "$type" "tailscale" "$hostname"
+    register_summary "$roles" "tailscale" "$hostname"
 }
 
 # --- Admin: list / approve / revoke -----------------------------------------
@@ -1452,7 +1475,7 @@ cmd_approve() {
         hs nodes list
         echo
         echo "Tag/approve a node that joined without a key:"
-        echo "    connector approve <node-name|id> <provider|consumer|both>"
+        echo "    connector approve <node-name|id> <provider|consumer|provider,consumer>"
         echo
         echo "(Simpler: 'connector invite' issues a single-use key so no approval step is needed.)"
         return 0
@@ -1460,15 +1483,12 @@ cmd_approve() {
     local id; id="$(resolve_node_id "$node")" || die "Node not found: $node"
     approve_routes "$id"
     if [ -n "$type" ]; then
-        local tags
-        case "$type" in
-            provider) tags="tag:provider" ;;
-            consumer) tags="tag:consumer" ;;
-            both)     tags="tag:provider,tag:consumer" ;;
-            *) die "type must be provider|consumer|both" ;;
-        esac
+        local roles tags
+        roles="$(parse_node_roles "$type")"
+        [ -n "$roles" ] || die "type must be provider, consumer, or provider,consumer"
+        tags="$(tags_for_roles "$roles")"
         hs nodes tag --identifier "$id" --tags "$tags"
-        log_success "Tagged node $node as $type."
+        log_success "Tagged node $node as $roles."
     fi
     log_success "Approved node $node (id $id)."
 }
@@ -1523,8 +1543,8 @@ ts_cli() {
 }
 have_ts() { { [ "$(os_kind)" = "macos" ] && [ -x "$TS_MAC_APP_CLI" ]; } || have tailscale; }
 
-# jq snippet: derive a short role from a tags array bound as $t.
-JQ_ROLE='(if ($t|index("tag:provider")) and ($t|index("tag:consumer")) then "both"
+# jq snippet: derive a role label from a tags array bound as $t.
+JQ_ROLE='(if ($t|index("tag:provider")) and ($t|index("tag:consumer")) then "provider,consumer"
           elif ($t|index("tag:provider")) then "provider"
           elif ($t|index("tag:consumer")) then "consumer" else "-" end)'
 
@@ -1570,8 +1590,7 @@ print_node_table() {
             [ "$online" = "1" ] && onl="yes" || onl="no"
             if [ -n "$self_ip" ] && [ "$ip" = "$self_ip" ]; then
                 conn="no (self)"
-            elif [ "$me_consumer" = 1 ] && [ "$online" = "1" ] \
-                && { [ "$role" = "provider" ] || [ "$role" = "both" ]; }; then
+            elif [ "$me_consumer" = 1 ] && [ "$online" = "1" ] && role_has "$role" provider; then
                 conn="yes"
             else
                 conn="no"
@@ -1811,18 +1830,20 @@ SETUP
                        nodes; pick from a list (or 0 for all).
 
 ONBOARD                [admin: run on the CNC or a linked manager]
-  invite [provider] [consumer] [manager] [name]
-                       No args -> menu ([1] provider [2] consumer
-                       [3] manager). Enter "1 2" for both. Mints a
-                       single-use key and prints the register command.
+  invite [roles] [name]
+                       roles is comma-separated: provider, consumer, manager
+                       (e.g. 'invite provider,consumer'). No args -> menu.
+                       Mints a single-use key and prints the register command.
   manager-key          Print this machine's SSH public key (for a
                        'manager' invite).
-  approve [node] [type]
-                       Tag/approve a node that joined without a key.
+  approve [node] [roles]
+                       Tag/approve a node that joined without a key
+                       (roles comma-separated, e.g. provider,consumer).
 
 JOIN
-  register <provider|consumer|both> <url> [--authkey KEY] [--ca-sha256 FP]
+  register <roles> <url> [--authkey KEY] [--ca-sha256 FP]
            [--hostname N] [--tailscale app|oss] [--yes]
+                       roles is comma-separated: provider[,consumer].
                        Join the tailnet (just paste the command 'invite' prints).
                        Auto-handles WSL systemd (asks first), trusts a self-signed
                        CNC cert (pinned via --ca-sha256), and on macOS auto-detects

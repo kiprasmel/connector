@@ -22,8 +22,8 @@ consumer). `connector` detects them from cheap, local state:
 |----------------|---------------------------------------------------------|-----------------------------------------|
 | **cnc**        | `headscale` binary present **and** `/etc/headscale/config.yaml` exists | runs admin commands locally |
 | **manager**    | a saved link at `~/.config/connector/cnc`               | runs admin commands on the CNC over SSH |
-| **provider**   | local role file says `provider`/`both` (`tag:provider`) | accepts Tailscale SSH                   |
-| **consumer**   | local role file says `consumer`/`both` (`tag:consumer`) | initiates SSH to providers              |
+| **provider**   | local role file contains `provider` (`tag:provider`)    | accepts Tailscale SSH                   |
+| **consumer**   | local role file contains `consumer` (`tag:consumer`)    | initiates SSH to providers              |
 
 `connector whoami` prints the detected set; `connector status` shows it too.
 
