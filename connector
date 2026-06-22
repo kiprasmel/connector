@@ -1793,8 +1793,8 @@ setup_tmux_boot() {
         log_warn "No systemd here: tmux sessions persist across disconnects but not reboots."
         return 0
     fi
-    local tmux_bin unit_dir unit user
-    tmux_bin="$(command -v tmux)"; user="$(id -un)"
+    local tmux_bin unit_dir unit user uid
+    tmux_bin="$(command -v tmux)"; user="$(id -un)"; uid="$(id -u)"
     unit_dir="$HOME/.config/systemd/user"; unit="$unit_dir/connector-tmux.service"
     mkdir -p "$unit_dir"
     cat > "$unit" <<EOF
@@ -1813,15 +1813,21 @@ Restart=on-failure
 [Install]
 WantedBy=default.target
 EOF
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
-    systemctl --user enable connector-tmux.service >/dev/null 2>&1 \
-        || log_warn "Could not enable the systemd user service (sessions still survive disconnects)."
-    # Linger lets the user service start (and restore) at boot without a login.
+    # Linger first: it starts (and keeps) this user's systemd instance even with
+    # no active login, so boot-time restore works AND the user bus exists for the
+    # 'systemctl --user' calls below.
     if ! loginctl show-user "$user" 2>/dev/null | grep -q '^Linger=yes'; then
         loginctl enable-linger "$user" >/dev/null 2>&1 \
             || as_root loginctl enable-linger "$user" >/dev/null 2>&1 \
             || log_warn "Could not enable linger; for reboot persistence run: sudo loginctl enable-linger $user"
     fi
+    # 'systemctl --user' needs these to reach the user bus; over a non-interactive
+    # SSH they're often unset even though linger keeps the user manager running.
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+    export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user enable connector-tmux.service >/dev/null 2>&1 \
+        || log_warn "Could not enable the systemd user service (sessions still survive disconnects)."
 }
 
 # Populate TMUX_SES_NAMES / TMUX_SES_LABELS with this host's connector sessions.
