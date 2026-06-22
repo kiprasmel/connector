@@ -1905,6 +1905,28 @@ cmd_tmux() {
     done
     [ "${#pos[@]}" -ge 1 ] && [ -z "$session" ] && session="${pos[0]}"
 
+    # Don't nest tmux: if we're already inside a session on THIS machine,
+    # attaching/creating would fail ("sessions should be nested with care").
+    # When we're inside the connector server, switch within it; else just inform.
+    # (list/kill are safe inside tmux, so they're allowed through.)
+    if [ -n "${TMUX:-}" ] && [ "$mode" != "list" ] && [ "$mode" != "kill" ]; then
+        local _sock="${TMUX%%,*}"           # current session's socket path
+        if [ "${_sock##*/}" = "$TMUX_SOCKET" ] && { [ "$mode" != "attach" ] || [ -n "$session" ]; }; then
+            local want="${session:-main}"
+            if [ "$mode" = "attach" ] && ! tmux -L "$TMUX_SOCKET" has-session -t "$want" 2>/dev/null; then
+                log_warn "No tmux session '$want' on $(node_name)."
+                die "Create it by dropping -a, e.g.:  connector tmux $want"
+            fi
+            tmux -L "$TMUX_SOCKET" has-session -t "$want" 2>/dev/null \
+                || tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" new-session -d -s "$want"
+            log_info "Already in the connector tmux; switching to '$want'."
+            exec tmux -L "$TMUX_SOCKET" switch-client -t "$want"
+        fi
+        log_warn "Already inside a tmux session on $(node_name); not nesting."
+        log_info "Detach first (prefix + d), then re-run your connector tmux command."
+        return 0
+    fi
+
     ensure_deps tmux git
     setup_persistent_tmux
 
