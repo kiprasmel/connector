@@ -2,7 +2,7 @@
 # connector - headscale/tailscale mesh management tool
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 # --- Constants ---------------------------------------------------------------
 HEADSCALE_USER="mesh"
@@ -21,6 +21,10 @@ CNC_LINK_FILE="${STATE_DIR}/cnc"
 ROLE_FILE="${STATE_DIR}/role"
 CNC_CA_FILE="${STATE_DIR}/cnc-ca.crt"
 ALIASES_FILE="${STATE_DIR}/aliases.conf"
+TMUX_SOCKET="connector"                       # dedicated tmux server socket (-L)
+TMUX_CONF="${STATE_DIR}/tmux.conf"            # connector-managed tmux config
+TMUX_USER_CONF="${STATE_DIR}/tmux.user.conf"  # your pushed ~/.tmux.conf
+TMUX_RESURRECT_DIR="${STATE_DIR}/resurrect"   # tmux-resurrect save dir (isolated)
 SSH_CONFIG_FILE="${HOME}/.ssh/config"
 KEY_EXPIRY="${CONNECTOR_KEY_EXPIRY:-1h}"
 WSL_MTU="1280"
@@ -29,7 +33,7 @@ TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
     cnc-init cnc-update propagate-update link invite manager-key commander-key register approve list ls revoke
-    status whoami hop ssh cnc alias cleanup cleanup-cnc help --help -h
+    status whoami hop ssh tmux cnc alias cleanup cleanup-cnc help --help -h
 )
 
 # --- Logging -----------------------------------------------------------------
@@ -1265,6 +1269,7 @@ register_summary() {
     echo "  MagicDNS:   $ts_name"
     role_has "$roles" provider && echo "  Others reach you via:  ssh <user>@${ts_name}"
     role_has "$roles" consumer && echo "  Reach a provider via:  connector hop <provider-name>"
+    role_has "$roles" consumer && echo "  Persistent tmux shell: connector hop -t <provider-name>"
 }
 
 register_macos() {
@@ -1643,29 +1648,285 @@ is_cnc_target() {
 }
 
 cmd_hop() {
-    local target="${1:-}"
+    local tmux=0 tflag="" session=""
+    local -a pos=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -t|--tmux)    tmux=1 ;;
+            -a|--attach)  tmux=1; tflag="-a" ;;
+            -l|--list)    tmux=1; tflag="-l" ;;
+            -k|--kill)    tmux=1; tflag="-k" ;;
+            -s|--session) tmux=1; session="${2:-}"; shift ;;
+            --)           shift; while [ $# -gt 0 ]; do pos+=("$1"); shift; done; break ;;
+            -*)           die "Unknown hop option: $1" ;;
+            *)            pos+=("$1") ;;
+        esac
+        shift
+    done
+    local target="${pos[0]:-}"
+    [ "${#pos[@]}" -ge 2 ] && [ -z "$session" ] && session="${pos[1]}"
+
     if [ -z "$target" ]; then
         print_hosts
         return 0
     fi
+
+    # Resolve an ssh target (+ optional port) once, for both CNC and provider hops.
     # The CNC is not a tailnet node: a manager reaches it over its existing admin
     # SSH. Accept the literal 'cnc' or the CNC's ssh remote name (e.g. 'nyc'), so
     # you can use the same name you linked it with.
+    local ssh_target="" port=""
     if is_cnc_target "$target"; then
         is_cnc && die "This machine is the CNC."
         is_manager || die "Only a manager can hop to the CNC (link one: connector link ...)."
         load_cnc_link
         [ -n "${CNC_SSH:-}" ] || die "No CNC link found."
-        local p=""; [ -n "${CNC_PORT:-}" ] && p="-p $CNC_PORT"
-        # shellcheck disable=SC2086
-        ssh $p "$CNC_SSH"
+        ssh_target="$CNC_SSH"; port="${CNC_PORT:-}"
+    elif [[ "$target" == *"@"* ]]; then
+        ssh_target="$target"
+    else
+        ssh_target="$(id -un)@${target}"
+    fi
+
+    if [ "$tmux" = 1 ]; then
+        hop_tmux "$ssh_target" "$port" "$tflag" "$session"
         return $?
     fi
-    if [[ "$target" == *"@"* ]]; then
-        ssh "$target"
-    else
-        ssh "$(id -un)@${target}"
+
+    local p=""; [ -n "$port" ] && p="-p $port"
+    # shellcheck disable=SC2086
+    ssh $p "$ssh_target"
+}
+
+# SSH to a host and attach/manage a persistent tmux session there. The heavy
+# lifting runs on the remote via its own 'connector tmux' worker (connector is
+# already installed on every provider/CNC), so dependency install + persistence
+# setup reuse that machine's helpers. tflag is '' | '-a' | '-l' | '-k'.
+hop_tmux() {
+    local ssh_target="$1" port="$2" tflag="$3" session="$4"
+    have ssh || die "ssh not found"
+    local p=""; [ -n "$port" ] && p="-p $port"
+
+    # The remote needs a connector new enough to define cmd_tmux (older ones
+    # would mistake 'tmux' for an implicit hop target and try to SSH onwards).
+    # shellcheck disable=SC2086
+    if ! ssh $p "$ssh_target" "grep -q '^cmd_tmux()' '$CONNECTOR_BIN' 2>/dev/null"; then
+        log_error "'connector' on ${ssh_target} is missing the 'tmux' command (out of date)."
+        die "Update it from a manager:  connector propagate-update"
     fi
+
+    # Push our local tmux config so it follows us, without clobbering the remote's
+    # own ~/.tmux.conf (the remote layers this copy in via 'tmux -f'). Paths are
+    # expanded on the REMOTE (single-quoted) so they honour its $HOME/XDG dir.
+    if [ -f "$HOME/.tmux.conf" ]; then
+        # shellcheck disable=SC2086
+        ssh $p "$ssh_target" \
+            'd="${XDG_CONFIG_HOME:-$HOME/.config}/connector"; mkdir -p "$d" && cat > "$d/tmux.user.conf"' \
+            < "$HOME/.tmux.conf" 2>/dev/null \
+            || log_warn "Could not push ~/.tmux.conf to ${ssh_target} (continuing)."
+    fi
+
+    local rcmd="$CONNECTOR_BIN tmux"
+    [ -n "$tflag" ] && rcmd="$rcmd $tflag"
+    [ -n "$session" ] && rcmd="$rcmd $(printf '%q' "$session")"
+    # shellcheck disable=SC2086
+    ssh -t $p "$ssh_target" "$rcmd"
+}
+
+# Clone a tmux plugin repo if absent (idempotent, shallow). Never fatal.
+clone_tmux_plugin() {
+    local url="$1" dir="$2"
+    [ -d "$dir/.git" ] && return 0
+    git clone --depth 1 "$url" "$dir" >/dev/null 2>&1 || log_warn "Could not clone ${url}."
+}
+
+# Install TPM + tmux-resurrect + tmux-continuum, write the connector-managed
+# tmux config (layering your personal config), and wire reboot persistence.
+# Idempotent: safe to run on every hop. Runs on the host owning the session.
+setup_persistent_tmux() {
+    local plugins="$HOME/.tmux/plugins" tpm
+    tpm="$plugins/tpm"
+    mkdir -p "$STATE_DIR" "$TMUX_RESURRECT_DIR" "$plugins"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+    clone_tmux_plugin https://github.com/tmux-plugins/tpm "$tpm"
+    clone_tmux_plugin https://github.com/tmux-plugins/tmux-resurrect "$plugins/tmux-resurrect"
+    clone_tmux_plugin https://github.com/tmux-plugins/tmux-continuum "$plugins/tmux-continuum"
+
+    # Rewritten each run so config/path changes propagate. We never touch the
+    # host's own ~/.tmux.conf; we only source it as a fallback personal config.
+    cat > "$TMUX_CONF" <<EOF
+# Managed by connector - do not edit (your edits belong in ~/.tmux.conf).
+# Layer a personal config: the pushed copy if present, else this host's own.
+if-shell '[ -f "$TMUX_USER_CONF" ]' 'source-file "$TMUX_USER_CONF"'
+if-shell '[ ! -f "$TMUX_USER_CONF" ] && [ -f "$HOME/.tmux.conf" ]' 'source-file "$HOME/.tmux.conf"'
+
+# Persistence: tmux-resurrect + tmux-continuum (auto save/restore).
+set -g @resurrect-dir '$TMUX_RESURRECT_DIR'
+set -g @continuum-restore 'on'
+set -g @continuum-save-interval '15'
+set -g @continuum-boot 'off'
+set -g @plugin 'tmux-plugins/tpm'
+set -g @plugin 'tmux-plugins/tmux-resurrect'
+set -g @plugin 'tmux-plugins/tmux-continuum'
+run '$tpm/tpm'
+EOF
+    chmod 600 "$TMUX_CONF" 2>/dev/null || true
+
+    setup_tmux_boot
+}
+
+# Reboot persistence via a systemd --user service + linger. Best-effort: on
+# non-systemd hosts we keep disconnect-persistence and warn.
+setup_tmux_boot() {
+    if ! have systemctl || [ ! -d /run/systemd/system ]; then
+        log_warn "No systemd here: tmux sessions persist across disconnects but not reboots."
+        return 0
+    fi
+    local tmux_bin unit_dir unit user
+    tmux_bin="$(command -v tmux)"; user="$(id -un)"
+    unit_dir="$HOME/.config/systemd/user"; unit="$unit_dir/connector-tmux.service"
+    mkdir -p "$unit_dir"
+    cat > "$unit" <<EOF
+[Unit]
+Description=connector persistent tmux server
+Documentation=man:tmux(1)
+After=network-online.target
+
+[Service]
+Type=forking
+ExecStart=${tmux_bin} -L ${TMUX_SOCKET} -f ${TMUX_CONF} new-session -d -s main
+ExecStop=${tmux_bin} -L ${TMUX_SOCKET} kill-server
+KillMode=control-group
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user enable connector-tmux.service >/dev/null 2>&1 \
+        || log_warn "Could not enable the systemd user service (sessions still survive disconnects)."
+    # Linger lets the user service start (and restore) at boot without a login.
+    if ! loginctl show-user "$user" 2>/dev/null | grep -q '^Linger=yes'; then
+        loginctl enable-linger "$user" >/dev/null 2>&1 \
+            || as_root loginctl enable-linger "$user" >/dev/null 2>&1 \
+            || log_warn "Could not enable linger; for reboot persistence run: sudo loginctl enable-linger $user"
+    fi
+}
+
+# Populate TMUX_SES_NAMES / TMUX_SES_LABELS with this host's connector sessions.
+collect_tmux_sessions() {
+    TMUX_SES_NAMES=(); TMUX_SES_LABELS=()
+    local name wins att plural
+    while IFS='|' read -r name wins att; do
+        [ -n "$name" ] || continue
+        plural="windows"; [ "$wins" = "1" ] && plural="window"
+        TMUX_SES_NAMES+=("$name")
+        TMUX_SES_LABELS+=("$name ($wins $plural${att:+, $att})")
+    done < <(tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" ls \
+        -F '#{session_name}|#{session_windows}|#{?session_attached,attached,}' 2>/dev/null)
+}
+
+# Interactive attach picker. Execs into the chosen/new session; returns (so the
+# caller creates the default) when there are no sessions; exits 0 on cancel.
+tmux_pick() {
+    collect_tmux_sessions
+    [ "${#TMUX_SES_NAMES[@]}" -gt 0 ] || return 0
+    echo "Sessions on $(node_name):"
+    local i
+    for i in "${!TMUX_SES_NAMES[@]}"; do
+        printf '  [%d] %s\n' "$((i+1))" "${TMUX_SES_LABELS[$i]}"
+    done
+    echo "  [n] new session"
+    echo "  [q] cancel"
+    local sel; read -r -p "Select: " sel </dev/tty || sel="q"
+    case "$sel" in
+        ''|q|Q) exit 0 ;;
+        n|N)
+            local name; read -r -p "New session name: " name </dev/tty || name=""
+            [ -n "$name" ] || name="main"
+            exec tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" new-session -A -s "$name"
+            ;;
+        *[!0-9]*) die "Invalid selection." ;;
+        *)
+            { [ "$sel" -ge 1 ] && [ "$sel" -le "${#TMUX_SES_NAMES[@]}" ]; } || die "Invalid selection."
+            exec tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" attach -t "${TMUX_SES_NAMES[$((sel-1))]}"
+            ;;
+    esac
+}
+
+# Kill a session (named, or chosen from a picker) after confirmation.
+tmux_kill() {
+    local session="$1"
+    if [ -z "$session" ]; then
+        collect_tmux_sessions
+        [ "${#TMUX_SES_NAMES[@]}" -gt 0 ] || { echo "No sessions to kill."; return 0; }
+        echo "Sessions on $(node_name):"
+        local i
+        for i in "${!TMUX_SES_NAMES[@]}"; do
+            printf '  [%d] %s\n' "$((i+1))" "${TMUX_SES_LABELS[$i]}"
+        done
+        echo "  [q] cancel"
+        local sel; read -r -p "Kill which? " sel </dev/tty || sel="q"
+        case "$sel" in
+            ''|q|Q) return 0 ;;
+            *[!0-9]*) die "Invalid selection." ;;
+            *) { [ "$sel" -ge 1 ] && [ "$sel" -le "${#TMUX_SES_NAMES[@]}" ]; } || die "Invalid selection."
+               session="${TMUX_SES_NAMES[$((sel-1))]}" ;;
+        esac
+    fi
+    tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" has-session -t "$session" 2>/dev/null \
+        || die "No tmux session '$session' on $(node_name)."
+    confirm "Kill tmux session '$session'?" || { log_info "Cancelled."; return 0; }
+    tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" kill-session -t "$session" \
+        && log_success "Killed session '$session'."
+}
+
+# Worker that owns the session (runs on the remote via 'hop -t', or locally).
+# Ensures tmux + persistence are set up, then attaches/creates/lists/kills.
+cmd_tmux() {
+    local mode="create" session=""
+    local -a pos=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -a|--attach)  mode="attach" ;;
+            -l|--list)    mode="list" ;;
+            -k|--kill)    mode="kill" ;;
+            -s|--session) session="${2:-}"; shift ;;
+            -*) die "Unknown tmux option: $1" ;;
+            *) pos+=("$1") ;;
+        esac
+        shift
+    done
+    [ "${#pos[@]}" -ge 1 ] && [ -z "$session" ] && session="${pos[0]}"
+
+    ensure_deps tmux git
+    setup_persistent_tmux
+
+    case "$mode" in
+        list)
+            tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" ls 2>/dev/null || echo "No sessions."
+            return 0
+            ;;
+        kill)
+            tmux_kill "$session"
+            return $?
+            ;;
+        attach)
+            # Strict attach: never auto-create a named session.
+            if [ -n "$session" ]; then
+                if tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" has-session -t "$session" 2>/dev/null; then
+                    exec tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" attach -t "$session"
+                fi
+                log_warn "No tmux session '$session' on $(node_name)."
+                die "Create it by dropping -a, e.g.:  connector hop -t <host> $session"
+            fi
+            tmux_pick   # execs on choice; returns here only when no sessions exist
+            ;;
+    esac
+
+    # default / -s / picker-with-no-sessions: attach-or-create.
+    exec tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" new-session -A -s "${session:-main}"
 }
 
 is_reserved() { local n; for n in "${RESERVED_COMMANDS[@]}"; do [ "$1" = "$n" ] && return 0; done; return 1; }
@@ -1854,12 +2115,17 @@ USE
   whoami               Detected role(s) + linked CNC.
   list | ls            [admin] List nodes (role, IP, online, connectable).
   revoke <node>        [admin] Remove a node.
-  hop [user@name|name|cnc]
+  hop [user@name|name|cnc] [-t|--tmux] [-s name] [-a] [-l] [-k [name]]
                        SSH to a provider by MagicDNS name (no arg = list the
                        hosts you can connect to). Managers reach the control
                        server via 'cnc' or its ssh remote name (e.g. 'connector
                        nyc'). Aliases: 'connector ssh <name>'; any non-command
                        word is an implicit hop -> 'connector <name>'.
+                       -t/--tmux opens a persistent tmux session (survives
+                       disconnects, and reboots on systemd hosts; uses your
+                       ~/.tmux.conf). Default session is 'main'; name it with a
+                       second word or -s. -a picks an existing session (a name
+                       attaches strictly), -l lists, -k [name] kills.
   alias <name> <user@name> | alias list | alias rm <name>
                        Save an SSH shortcut (optionally writes ~/.ssh/config).
   cleanup              Disconnect this machine from the tailnet.
@@ -1872,6 +2138,7 @@ Examples
   connector invite consumer
   connector register consumer https://203.0.113.1:${HS_TLS_PORT_DEFAULT} --authkey hskey-xxxx --ca-sha256 ab12...
   connector hop my-laptop
+  connector hop -t my-laptop work                # persistent tmux session 'work'
 EOF
     echo
     print_hosts
@@ -1921,6 +2188,7 @@ main() {
         status)         cmd_status "$@" ;;
         whoami)         cmd_whoami "$@" ;;
         hop|ssh)        cmd_hop "$@" ;;
+        tmux)           cmd_tmux "$@" ;;
         alias)          cmd_alias "$@" ;;
         cleanup)        cmd_cleanup "$@" ;;
         cleanup-cnc)    cmd_cleanup_cnc "$@" ;;
