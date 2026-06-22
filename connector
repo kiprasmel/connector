@@ -1738,14 +1738,19 @@ hop_tmux() {
     fi
 
     # Push our local tmux config so it follows us, without clobbering the remote's
-    # own ~/.tmux.conf (the remote layers this copy in via 'tmux -f'). Paths are
-    # expanded on the REMOTE (single-quoted) so they honour its $HOME/XDG dir.
-    if [ -f "$HOME/.tmux.conf" ]; then
+    # own config (the remote layers this copy in via 'tmux -f'). Support both the
+    # classic ~/.tmux.conf and the XDG path (~/.config/tmux/tmux.conf). The write
+    # path is expanded on the REMOTE (single-quoted) so it honours its $HOME/XDG.
+    local lconf="" c
+    for c in "$HOME/.tmux.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"; do
+        [ -f "$c" ] && { lconf="$c"; break; }
+    done
+    if [ -n "$lconf" ]; then
         # shellcheck disable=SC2086
         ssh $p "$ssh_target" \
             'd="${XDG_CONFIG_HOME:-$HOME/.config}/connector"; mkdir -p "$d" && cat > "$d/tmux.user.conf"' \
-            < "$HOME/.tmux.conf" 2>/dev/null \
-            || log_warn "Could not push ~/.tmux.conf to ${ssh_target} (continuing)."
+            < "$lconf" 2>/dev/null \
+            || log_warn "Could not push ${lconf} to ${ssh_target} (continuing)."
     fi
 
     local rcmd="$CONNECTOR_BIN tmux"
@@ -1778,13 +1783,25 @@ setup_persistent_tmux() {
     clone_tmux_plugin https://github.com/tmux-plugins/tmux-resurrect "$plugins/tmux-resurrect"
     clone_tmux_plugin https://github.com/tmux-plugins/tmux-continuum "$plugins/tmux-continuum"
 
+    # The host's own personal config (classic or XDG path), used only as a
+    # fallback when the client didn't push one. We never modify it.
+    local host_conf="" c
+    for c in "$HOME/.tmux.conf" "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"; do
+        [ -f "$c" ] && { host_conf="$c"; break; }
+    done
+    local personal_block
+    personal_block="if-shell '[ -f \"$TMUX_USER_CONF\" ]' 'source-file \"$TMUX_USER_CONF\"'"
+    if [ -n "$host_conf" ]; then
+        personal_block="$personal_block
+if-shell '[ ! -f \"$TMUX_USER_CONF\" ] && [ -f \"$host_conf\" ]' 'source-file \"$host_conf\"'"
+    fi
+
     # Rewritten each run so config/path changes propagate. We never touch the
-    # host's own ~/.tmux.conf; we only source it as a fallback personal config.
+    # host's own config; we only source it as a fallback personal config.
     cat > "$TMUX_CONF" <<EOF
-# Managed by connector - do not edit (your edits belong in ~/.tmux.conf).
-# Layer a personal config: the pushed copy if present, else this host's own.
-if-shell '[ -f "$TMUX_USER_CONF" ]' 'source-file "$TMUX_USER_CONF"'
-if-shell '[ ! -f "$TMUX_USER_CONF" ] && [ -f "$HOME/.tmux.conf" ]' 'source-file "$HOME/.tmux.conf"'
+# Managed by connector - do not edit (your tmux edits belong in your own config).
+# Layer a personal config: the pushed client copy if present, else this host's own.
+$personal_block
 
 # Persistence: tmux-resurrect + tmux-continuum (auto save/restore).
 set -g @resurrect-dir '$TMUX_RESURRECT_DIR'
