@@ -37,11 +37,23 @@ RESERVED_COMMANDS=(
 )
 
 # --- Logging -----------------------------------------------------------------
+# warn/error lines are also buffered so they can be replayed after a tmux session
+# hands the TTY back (tmux's alternate screen otherwise scrolls them out of view).
+LOG_NOTES=()
 log_info()    { echo "[INFO] $*"; }
 log_success() { echo "[OK] $*"; }
-log_warn()    { echo "[WARN] $*"; }
-log_error()   { echo "[ERROR] $*" >&2; }
+log_warn()    { echo "[WARN] $*"; LOG_NOTES+=("[WARN] $*"); }
+log_error()   { echo "[ERROR] $*" >&2; LOG_NOTES+=("[ERROR] $*"); }
 die()         { log_error "$*"; exit 1; }
+
+# Replay buffered warnings/errors. Call after a full-screen child (tmux) returns,
+# so problems printed before it took the screen are still surfaced to the user.
+flush_notes() {
+    [ "${#LOG_NOTES[@]}" -gt 0 ] || return 0
+    printf '\n[i] %d warning(s)/error(s) during this session:\n' "${#LOG_NOTES[@]}" >&2
+    local n; for n in "${LOG_NOTES[@]}"; do printf '    %s\n' "$n" >&2; done
+    LOG_NOTES=()
+}
 
 # --- Small helpers -----------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -1740,7 +1752,10 @@ hop_tmux() {
     [ -n "$tflag" ] && rcmd="$rcmd $tflag"
     [ -n "$session" ] && rcmd="$rcmd $(printf '%q' "$session")"
     # shellcheck disable=SC2086
-    ssh -t $p "$ssh_target" "$rcmd"
+    local rc=0
+    ssh -t $p "$ssh_target" "$rcmd" || rc=$?
+    flush_notes   # surface any local push warnings now that tmux released the TTY
+    return $rc
 }
 
 # Clone a tmux plugin repo if absent (idempotent, shallow). Never fatal.
@@ -1830,6 +1845,16 @@ EOF
         || log_warn "Could not enable the systemd user service (sessions still survive disconnects)."
 }
 
+# Launch the connector tmux server in the foreground; when it hands the TTY back
+# (detach/exit), replay any buffered warnings, then end. Use instead of a bare
+# 'exec tmux' so setup notes aren't lost behind tmux's alternate screen.
+tmux_exec() {
+    local rc=0
+    tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" "$@" || rc=$?
+    flush_notes
+    exit "$rc"
+}
+
 # Populate TMUX_SES_NAMES / TMUX_SES_LABELS with this host's connector sessions.
 collect_tmux_sessions() {
     TMUX_SES_NAMES=(); TMUX_SES_LABELS=()
@@ -1861,12 +1886,12 @@ tmux_pick() {
         n|N)
             local name; read -r -p "New session name: " name </dev/tty || name=""
             [ -n "$name" ] || name="main"
-            exec tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" new-session -A -s "$name"
+            tmux_exec new-session -A -s "$name"
             ;;
         *[!0-9]*) die "Invalid selection." ;;
         *)
             { [ "$sel" -ge 1 ] && [ "$sel" -le "${#TMUX_SES_NAMES[@]}" ]; } || die "Invalid selection."
-            exec tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" attach -t "${TMUX_SES_NAMES[$((sel-1))]}"
+            tmux_exec attach -t "${TMUX_SES_NAMES[$((sel-1))]}"
             ;;
     esac
 }
@@ -1954,7 +1979,7 @@ cmd_tmux() {
             # Strict attach: never auto-create a named session.
             if [ -n "$session" ]; then
                 if tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" has-session -t "$session" 2>/dev/null; then
-                    exec tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" attach -t "$session"
+                    tmux_exec attach -t "$session"
                 fi
                 log_warn "No tmux session '$session' on $(node_name)."
                 die "Create it by dropping -a, e.g.:  connector hop -t <host> $session"
@@ -1964,7 +1989,7 @@ cmd_tmux() {
     esac
 
     # default / -s / picker-with-no-sessions: attach-or-create.
-    exec tmux -L "$TMUX_SOCKET" -f "$TMUX_CONF" new-session -A -s "${session:-main}"
+    tmux_exec new-session -A -s "${session:-main}"
 }
 
 is_reserved() { local n; for n in "${RESERVED_COMMANDS[@]}"; do [ "$1" = "$n" ] && return 0; done; return 1; }
