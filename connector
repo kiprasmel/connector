@@ -1671,6 +1671,11 @@ cmd_hop() {
         return 0
     fi
 
+    # Resolve a saved alias (name -> user@magicdns-name) on the target token, so
+    # 'connector <alias>' and 'connector hop <alias>' behave identically.
+    local _aline; _aline="$(alias_lookup "$target" || true)"
+    [ -n "$_aline" ] && target="${_aline#*|}"
+
     # Resolve an ssh target (+ optional port) once, for both CNC and provider hops.
     # The CNC is not a tailnet node: a manager reaches it over its existing admin
     # SSH. Accept the literal 'cnc' or the CNC's ssh remote name (e.g. 'nyc'), so
@@ -2194,13 +2199,11 @@ main() {
         cleanup-cnc)    cmd_cleanup_cnc "$@" ;;
         help|--help|-h) cmd_help ;;
         *)
-            # Not a built-in: treat it as an implicit hop target. A saved alias
-            # maps to its full user@host; otherwise hop straight to the name
-            # (so 'connector <name>' == 'connector hop <name>').
-            local line target="$cmd"
-            line="$(alias_lookup "$cmd" || true)"
-            [ -n "$line" ] && target="${line#*|}"
-            cmd_hop "$target"
+            # Not a built-in: treat the whole line as an implicit hop, so
+            # 'connector <name>' == 'connector hop <name>' and flags work in
+            # any position (e.g. 'connector -t <name>' or 'connector <name> -t').
+            # cmd_hop resolves saved aliases on the target token itself.
+            cmd_hop "$cmd" "$@"
             exit $?
             ;;
     esac
