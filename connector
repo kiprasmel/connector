@@ -970,6 +970,16 @@ cmd_propagate_update() {
     have ssh || die "ssh not found"; have scp || die "scp not found"
     load_cnc_link
 
+    local all=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -a|--all) all=1 ;;
+            -*)       die "Unknown propagate-update option: $1 (use -a/--all for all targets)" ;;
+            *)        die "propagate-update takes no positional targets (use -a/--all, or choose interactively)" ;;
+        esac
+        shift
+    done
+
     local -a names=() kinds=()
     names+=("$CNC_SSH"); kinds+=("cnc")
     local nm on
@@ -994,7 +1004,7 @@ cmd_propagate_update() {
     local opts="A"
     for i in "${!names[@]}"; do opts+="/$((i+1))"; done
     local sel="a"
-    if [ "${ASSUME_YES:-0}" != "1" ]; then
+    if [ "$all" != 1 ] && [ "${ASSUME_YES:-0}" != "1" ]; then
         read -r -p "Select [${opts}]: " sel </dev/tty || sel="a"
     fi
 
@@ -2167,8 +2177,8 @@ SETUP
                        Attach to an existing CNC (become a manager).
   cnc-update           [manager] Push this machine's connector script to
                        the linked CNC and install it there.
-  propagate-update     [manager] Update connector on the CNC and provider
-                       nodes; pick from a list (or 0 for all).
+  propagate-update [-a] [manager] Update connector on the CNC and provider
+                       nodes; pick from a list, or pass -a/--all for all.
 
 ONBOARD                [admin: run on the CNC or a linked manager]
   invite [roles] [name]
