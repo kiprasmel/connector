@@ -25,6 +25,7 @@ TMUX_SOCKET="connector"                       # dedicated tmux server socket (-L
 TMUX_CONF="${STATE_DIR}/tmux.conf"            # connector-managed tmux config
 TMUX_USER_CONF="${STATE_DIR}/tmux.user.conf"  # your pushed ~/.tmux.conf
 TMUX_RESURRECT_DIR="${STATE_DIR}/resurrect"   # tmux-resurrect save dir (isolated)
+TMUX_PUSH_CACHE="${STATE_DIR}/tmux-push.cache"  # per-remote sha of last pushed tmux.user.conf
 SSH_CONFIG_FILE="${HOME}/.ssh/config"
 KEY_EXPIRY="${CONNECTOR_KEY_EXPIRY:-1h}"
 WSL_MTU="1280"
@@ -1730,6 +1731,20 @@ cmd_hop() {
     ssh $p "$ssh_target"
 }
 
+# Local record of which tmux.user.conf sha we last pushed to each ssh target.
+tmux_push_cache_get() {
+    [ -f "$TMUX_PUSH_CACHE" ] || return 0
+    awk -F '\t' -v t="$1" '$1==t {print $2; exit}' "$TMUX_PUSH_CACHE" 2>/dev/null
+}
+tmux_push_cache_set() {
+    local target="$1" sha="$2" tmp
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+    tmp="$(mktemp)"
+    [ -f "$TMUX_PUSH_CACHE" ] && awk -F '\t' -v t="$target" '$1!=t' "$TMUX_PUSH_CACHE" > "$tmp" 2>/dev/null
+    printf '%s\t%s\n' "$target" "$sha" >> "$tmp"
+    mv "$tmp" "$TMUX_PUSH_CACHE"; chmod 600 "$TMUX_PUSH_CACHE" 2>/dev/null || true
+}
+
 # SSH to a host and attach/manage a persistent tmux session there. The heavy
 # lifting runs on the remote via its own 'connector tmux' worker (connector is
 # already installed on every provider/CNC), so dependency install + persistence
@@ -1738,14 +1753,6 @@ hop_tmux() {
     local ssh_target="$1" port="$2" tflag="$3" session="$4"
     have ssh || die "ssh not found"
     local p=""; [ -n "$port" ] && p="-p $port"
-
-    # The remote needs a connector new enough to define cmd_tmux (older ones
-    # would mistake 'tmux' for an implicit hop target and try to SSH onwards).
-    # shellcheck disable=SC2086
-    if ! ssh $p "$ssh_target" "grep -q '^cmd_tmux()' '$CONNECTOR_BIN' 2>/dev/null"; then
-        log_error "'connector' on ${ssh_target} is missing the 'tmux' command (out of date)."
-        die "Update it from a manager:  connector propagate-update"
-    fi
 
     # Push our local tmux config so it follows us, without clobbering the remote's
     # own config (the remote layers this copy in via 'tmux -f'). Support both the
@@ -1756,20 +1763,37 @@ hop_tmux() {
         [ -f "$c" ] && { lconf="$c"; break; }
     done
     if [ -n "$lconf" ]; then
+        local lsum cached
+        lsum="$(file_sha256 "$lconf")"
+        cached="$(tmux_push_cache_get "$ssh_target")"
         # shellcheck disable=SC2086
-        ssh $p "$ssh_target" \
-            'd="${XDG_CONFIG_HOME:-$HOME/.config}/connector"; mkdir -p "$d" && cat > "$d/tmux.user.conf"' \
-            < "$lconf" 2>/dev/null \
-            || log_warn "Could not push ${lconf} to ${ssh_target} (continuing)."
+        if [ -n "$lsum" ] && [ "$lsum" = "$cached" ] && [ "${CONNECTOR_TMUX_FORCE_PUSH:-0}" != "1" ]; then
+            :   # remote already has this exact config (per local cache); skip the copy
+        elif ssh $p "$ssh_target" \
+                'd="${XDG_CONFIG_HOME:-$HOME/.config}/connector"; mkdir -p "$d" && cat > "$d/tmux.user.conf"' \
+                < "$lconf" 2>/dev/null; then
+            [ -n "$lsum" ] && tmux_push_cache_set "$ssh_target" "$lsum"
+        else
+            log_warn "Could not push ${lconf} to ${ssh_target} (continuing)."
+        fi
     fi
 
     local rcmd="$CONNECTOR_BIN tmux"
     [ -n "$tflag" ] && rcmd="$rcmd $tflag"
     [ -n "$session" ] && rcmd="$rcmd $(printf '%q' "$session")"
-    # shellcheck disable=SC2086
+    # Capability check is folded into this single SSH: the remote needs a
+    # connector new enough to define cmd_tmux (older ones would mistake 'tmux'
+    # for an implicit hop target and SSH onwards). 'grep && exec ... || exit 97'
+    # keeps that guard without a separate round trip; exit 97 is reserved so it's
+    # distinguishable from a connection failure (255) or normal tmux exit codes.
     local rc=0
-    ssh -t $p "$ssh_target" "$rcmd" || rc=$?
+    # shellcheck disable=SC2086
+    ssh -t $p "$ssh_target" "grep -q '^cmd_tmux()' '$CONNECTOR_BIN' 2>/dev/null && exec $rcmd || exit 97" || rc=$?
     flush_notes   # surface any local push warnings now that tmux released the TTY
+    if [ "$rc" = 97 ]; then
+        log_error "'connector' on ${ssh_target} is missing the 'tmux' command (out of date)."
+        die "Update it from a manager:  connector propagate-update"
+    fi
     return $rc
 }
 
