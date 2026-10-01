@@ -318,6 +318,18 @@ again, and the docker tier's image (`test/helpers.bash`) at the same version.
 Read headscale's upgrade notes for every minor release in between, and take
 a backup first (`connector backup`).
 
+## Linux nodes: where tailscale comes from
+
+`register` installs tailscale from **tailscale's apt repository** on Debian,
+Ubuntu, Raspbian and their derivatives (by the distribution they are like,
+`/etc/os-release`): the key is fetched from pkgs.tailscale.com and checked to
+be the one pinned in connector (`2596A99EAAB33821893C0A79458CA832957F5868`,
+"Tailscale Inc. (Package repository signing key)") and no other before apt
+is told of the repository, and the source names that keyring alone
+(`signed-by`), so it vouches for tailscale's packages and nothing else; apt
+then verifies what it installs. Arch, Alpine, openSUSE and Fedora install
+their own distribution's package. connector never pipes a script to a shell.
+
 ## WSL specifics (auto-handled)
 
 `register` detects WSL and:

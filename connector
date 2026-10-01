@@ -44,7 +44,13 @@ TMUX_PUSH_CACHE="${STATE_DIR}/tmux-push.cache"  # per-remote sha of last pushed 
 SSH_CONFIG_FILE="${HOME}/.ssh/config"
 KEY_EXPIRY="${CONNECTOR_KEY_EXPIRY:-1h}"
 WSL_MTU="1280"
-TS_INSTALL_URL="https://tailscale.com/install.sh"
+# tailscale's apt repository, trusted by the one key whose fingerprint is
+# pinned here ("Tailscale Inc. (Package repository signing key)", the same for
+# every release pkgs.tailscale.com serves), named alone by its source.
+TS_APT_KEY_FPR="2596A99EAAB33821893C0A79458CA832957F5868"
+TS_APT_KEYRING="/usr/share/keyrings/tailscale-archive-keyring.gpg"
+TS_APT_LIST="/etc/apt/sources.list.d/tailscale.list"
+OS_RELEASE="/etc/os-release"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
@@ -1408,18 +1414,72 @@ cmd_manager_key() {
 is_wsl()        { grep -qiE "(microsoft|wsl)" /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; }
 systemd_active() { [ -d /run/systemd/system ]; }
 
+# A field of /etc/os-release, unquoted. Args: field
+os_release_field() {
+    awk -F= -v k="$1" '$1 == k { gsub(/^"|"$/, "", $2); print $2; exit }' "$OS_RELEASE" 2>/dev/null
+}
+
+# The apt distribution tailscale publishes for this machine, "<distro>
+# <codename>": ubuntu, debian or raspbian, a derivative by the one it is
+# like. Rc 1 when there is none.
+ts_apt_dist() {
+    local id like codename
+    id="$(os_release_field ID)"; like=" $(os_release_field ID_LIKE) "
+    case "$id" in
+        ubuntu|debian|raspbian) codename="$(os_release_field VERSION_CODENAME)" ;;
+        *)
+            case "$like" in
+                *" ubuntu "*) id=ubuntu; codename="$(os_release_field UBUNTU_CODENAME)" ;;
+                *" debian "*) id=debian; codename="$(os_release_field VERSION_CODENAME)" ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+    [[ "$codename" =~ ^[a-z0-9]+$ ]] || return 1
+    printf '%s %s\n' "$id" "$codename"
+}
+
+# tailscale from its apt repository: the key fetched, checked to be the pinned
+# one and no other before apt is told of it, and named alone by the source
+# (signed-by) -- it vouches for that repository and nothing else.
+install_tailscale_apt() {
+    local dist codename key got arch
+    read -r dist codename < <(ts_apt_dist) || true
+    [ -n "${codename:-}" ] || die "No tailscale apt repository for this machine (${OS_RELEASE})."
+    have gpg || pkg_install gnupg >/dev/null 2>&1 || die "gpg checks tailscale's key: install gnupg, then re-run register."
+    key="$(mktemp)"
+    curl -fsSL -o "$key" "https://pkgs.tailscale.com/stable/${dist}/${codename}.noarmor.gpg" \
+        || { rm -f "$key"; die "Could not fetch tailscale's apt key."; }
+    # every primary key the file holds: a second one would sign for the repository too
+    got="$(gpg --show-keys --with-colons "$key" 2>/dev/null | awk -F: '/^pub:/ { p = 1; next } p && /^fpr:/ { printf "%s%s", s, $10; s = " "; p = 0 }')"
+    [ "$got" = "$TS_APT_KEY_FPR" ] || { rm -f "$key"; die "tailscale's apt key is ${got:-unreadable}, not the pinned ${TS_APT_KEY_FPR}; nothing installed."; }
+    arch="$(dpkg --print-architecture)"
+    if ! { as_root install -d -m 755 "${TS_APT_KEYRING%/*}" && as_root install -m 644 "$key" "$TS_APT_KEYRING"; }; then
+        rm -f "$key"; die "Could not put tailscale's key in place."
+    fi
+    rm -f "$key"
+    printf 'deb [arch=%s signed-by=%s] https://pkgs.tailscale.com/stable/%s %s main\n' "$arch" "$TS_APT_KEYRING" "$dist" "$codename" \
+        | as_root tee "$TS_APT_LIST" >/dev/null
+    as_root apt-get update -q >/dev/null || die "apt-get update failed with tailscale's repository."
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y tailscale
+}
+
+# tailscale on Linux: from its apt repository by its pinned key where apt is,
+# else the distribution's own package -- never a script piped to a shell.
 install_tailscale() {
     have tailscale && return 0
     log_info "Installing tailscale..."
-    # Arch mirrors keep only the newest build, so a stale local pacman DB makes
-    # the upstream installer request a 404'd version. Refresh it first.
-    # (apt-based installs are refreshed by the upstream script itself.)
-    if have pacman; then
-        log_info "Refreshing pacman database (Arch)..."
-        as_root pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    if have apt-get && ts_apt_dist >/dev/null; then
+        install_tailscale_apt
+    else
+        case "$(pkg_mgr)" in
+            # Arch mirrors keep only the newest build: -Sy refreshes the database first
+            pacman)         as_root pacman -Sy --needed --noconfirm tailscale ;;
+            apk|zypper|dnf) pkg_install tailscale ;;
+            *) die "No tailscale package here: install it (https://tailscale.com/download), then re-run register." ;;
+        esac
     fi
-    curl -fsSL "$TS_INSTALL_URL" | sh
-    have tailscale || die "tailscale installation failed. On Arch, run 'sudo pacman -Syu' then re-run register."
+    have tailscale || die "tailscale installation failed; install it (https://tailscale.com/download), then re-run register."
 }
 
 install_tailscale_macos_app() {
