@@ -2323,4 +2323,5 @@ main() {
     esac
 }
 
-main "$@"
+# Sourced (the tests) rather than run: define everything, do nothing.
+[ "${BASH_SOURCE[0]}" != "$0" ] || main "$@"

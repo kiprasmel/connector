@@ -39,3 +39,6 @@ revoked/
 *.swo
 *~
 .DS_Store
+
+# Vendored test tools (./test/setup.sh)
+test/vendor/
