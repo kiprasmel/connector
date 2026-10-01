@@ -103,3 +103,17 @@ linked() {
     run calls_of ssh
     assert_line --partial "preauthkeys create --user 1 --expiration 1h --output json --tags tag:consumer"
 }
+
+@test "invite --migrate on a CNC that holds no old certificate prints the command, naming no root" {
+    # a CNC that moves from one name to another: no older connector's root on it
+    linked https://hs.example.com
+    stub ssh 'case "$*" in
+        *"users list"*) echo "[{\"id\":1,\"name\":\"mesh\"}]" ;;
+        *"preauthkeys create"*) echo "{\"key\":\"hskey-fresh\"}" ;;
+        *"cat /var/lib/headscale/certs/cnc.crt"*) echo "cat: /var/lib/headscale/certs/cnc.crt: No such file or directory" >&2; exit 1 ;;
+    esac'
+    run connector_fn cmd_invite --migrate consumer
+    assert_success
+    assert_output --partial "connector migrate-cnc https://hs.example.com --authkey hskey-fresh"
+    refute_output --partial "--old-sha256"
+}

@@ -233,9 +233,10 @@ url_port() {
     esac
 }
 
-# SHA-256 fingerprint (lowercase hex, no colons) of a PEM cert on stdin.
+# SHA-256 fingerprint (lowercase hex, no colons) of a PEM cert on stdin;
+# nothing, and rc 0, when stdin holds none.
 fp_of_pem() {
-    openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+    { openssl x509 -noout -fingerprint -sha256 2>/dev/null || true; } \
         | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f' | tr -d '[:space:]'
 }
 
@@ -551,9 +552,9 @@ cnc_url_ok() {
 }
 
 # SHA-1 (uppercase hex, no colons) of a PEM cert on stdin: what macOS's
-# security(1) names a certificate by.
+# security(1) names a certificate by. Nothing, and rc 0, when stdin holds none.
 sha1_of_pem() {
-    openssl x509 -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F' | tr -d '[:space:]'
+    { openssl x509 -noout -fingerprint -sha1 2>/dev/null || true; } | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F' | tr -d '[:space:]'
 }
 
 # p11-kit anchor directories used by Fedora/RHEL, Arch, and SUSE respectively.
