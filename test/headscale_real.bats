@@ -92,6 +92,10 @@ configtest() {
         grep "^  base_domain:" /etc/headscale/config.yaml
         grep -c "server_url cannot be part of base_domain" /tmp/second
         grep -c "restart headscale" /tmp/systemctl
+        # a base domain of its own, kept by a re-run that names none (every node'"'"'s name with it)
+        ( cnc_init_local https://hs.example.com corp.mesh tls-alpn-01 ) >/tmp/third 2>&1; echo "third rc=$?"
+        ( cnc_init_local https://hs.example.com "" tls-alpn-01 ) >/tmp/fourth 2>&1; echo "fourth rc=$?"
+        grep "^  base_domain:" /etc/headscale/config.yaml
     '
     assert_success
     assert_line "first rc=0"
@@ -101,6 +105,9 @@ configtest() {
     assert_line --index 4 "1"
     # headscale was restarted onto the config it took, never onto the one it refused
     assert_line --index 5 "1"
+    assert_line "third rc=0"
+    assert_line "fourth rc=0"
+    assert_line --index 8 "  base_domain: corp.mesh"
 }
 
 @test "a Linux provider follows the CNC to its new name, and its CA store loses the old root" {

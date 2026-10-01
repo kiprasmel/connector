@@ -913,12 +913,28 @@ ensure_headscale_user() {
     fi
 }
 
+# Is <d> a base domain (MagicDNS's suffix): a DNS name of labels.
+base_domain_ok() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]]
+}
+
+# The base domain cnc-init renders: <given>, else the one the CNC's config
+# has -- a re-run keeps it, every node's MagicDNS name with it -- else
+# connector.mesh. Args: given
+cnc_base_domain() {
+    local d="$1"
+    [ -n "$d" ] || d="$(awk '/^[[:space:]]+base_domain:/ { gsub(/["\047]/, "", $2); print $2; exit }' "$HEADSCALE_CONFIG" 2>/dev/null || true)"
+    base_domain_ok "$d" || d="connector.mesh"
+    printf '%s\n' "$d"
+}
+
 cnc_init_local() {
     local url="$1" base_domain="$2" challenge="${3:-$HS_ACME_DEFAULT}"
     require_root cnc-init
     [ -n "$url" ] || die "Usage: connector cnc-init --url https://<name>[:port] [--acme tls-alpn-01|http-01]"
     cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
-    [ -n "$base_domain" ] || base_domain="connector.mesh"
+    [ -z "$base_domain" ] || base_domain_ok "$base_domain" || die "'$base_domain' is not a base domain (a DNS name)."
+    base_domain="$(cnc_base_domain "$base_domain")"
 
     local host port p taken
     host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
@@ -941,7 +957,7 @@ cnc_init_local() {
     have curl || as_root apt-get install -y curl >/dev/null 2>&1 || true
     have jq || as_root apt-get install -y jq >/dev/null 2>&1 || true
     install_headscale
-    apply_headscale_config "$url" "$base_domain" "$challenge" || die "Nothing on the CNC changed."
+    apply_headscale_config "$url" "$base_domain" "$challenge" || die "The CNC's config and policy are as they were."
     log_info "Enabling + starting headscale..."
     as_root systemctl enable headscale >/dev/null 2>&1 || true
     as_root systemctl restart headscale
@@ -976,8 +992,9 @@ cmd_cnc_init() {
         esac
     done
     case "$acme" in tls-alpn-01|http-01) ;; *) die "Unknown --acme '$acme' (tls-alpn-01 or http-01)." ;; esac
+    [ -z "$base_domain" ] || base_domain_ok "$base_domain" || die "'$base_domain' is not a base domain (a DNS name)."
     if [ -n "$host" ]; then
-        cnc_init_remote "$host" "$url" "$port" "$acme" "$reinit"
+        cnc_init_remote "$host" "$url" "$port" "$acme" "$reinit" "$base_domain"
     else
         cnc_init_local "$url" "$base_domain" "$acme"
     fi
@@ -1036,7 +1053,7 @@ check_cnc_reachable() {
 }
 
 cnc_init_remote() {
-    local host="$1" url="$2" port="$3" acme="${4:-$HS_ACME_DEFAULT}" reinit="${5:-0}" sshflag configured=0
+    local host="$1" url="$2" port="$3" acme="${4:-$HS_ACME_DEFAULT}" reinit="${5:-0}" base_domain="${6:-}" sshflag configured=0
     have ssh || die "ssh not found"; have scp || die "scp not found"
     sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
 
@@ -1076,7 +1093,9 @@ cnc_init_remote() {
         log_info "Copying connector to $host and running cnc-init..."
         push_connector "$host" "$rsudo" 0 "$port" || die "Could not install connector on $host."
         # shellcheck disable=SC2086
-        ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url' --acme '$acme'" || die "Remote cnc-init failed"
+        # no --base-domain: the CNC keeps the one it has (cnc_base_domain)
+        ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url' --acme '$acme'${base_domain:+ --base-domain '$base_domain'}" \
+            || die "Remote cnc-init failed"
     fi
 
     save_cnc_link "$host" "$url" "$port"
@@ -2992,7 +3011,7 @@ This machine: $(current_roles)
 
 SETUP
   cnc-init [user@host] --url https://NAME[:PORT] [--acme tls-alpn-01|http-01]
-           [--reinit] [-p SSH_PORT]
+           [--base-domain D] [--reinit] [-p SSH_PORT]
                        Set up the CNC (headscale) on a DNS name: headscale gets
                        NAME's certificate from Let's Encrypt (tls-alpn-01 on
                        :443, the default; or http-01 on :80, for another port)
@@ -3001,6 +3020,8 @@ SETUP
                        a manager; a CNC already set up keeps its URL unless
                        --url names another (then every node follows with
                        migrate-cnc), and --reinit re-applies this connector.
+                       --base-domain is MagicDNS's suffix (connector.mesh); a
+                       re-run keeps the CNC's unless it names another.
   link <user@host> --url https://HOST[:PORT] [-p SSH_PORT]
                        Attach to an existing CNC (become a manager).
   cnc-update           [manager] Push this machine's connector script to

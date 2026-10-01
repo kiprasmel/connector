@@ -272,8 +272,10 @@ one name to another), and every node follows it:
 1. **DNS**: an A record for the new name pointing at the CNC.
 2. **The CNC**: from the admin's manager, `connector cnc-init <ssh-host> --url
    https://<name>` (it asks before moving a CNC that already serves another
-   URL). headscale keeps its database, keys and nodes; only the URL, its
-   certificate (Let's Encrypt, on first connection) and the port change.
+   URL). headscale keeps its database, keys and nodes, and its base domain
+   (every node's MagicDNS name) unless `--base-domain` names another; only
+   the URL, its certificate (Let's Encrypt, on first connection) and the port
+   change.
    Tunnels between nodes keep working; until a node follows, its control
    plane is the old URL, which no longer answers.
 3. **Each node**: the admin runs `connector invite --migrate <roles> <node>`

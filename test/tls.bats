@@ -183,3 +183,37 @@ linked() {
     run cat "$HOME/.config/connector/cnc"
     assert_line 'CNC_URL="https://hs.example.com"'
 }
+
+@test "a CNC moved to its new name keeps its base domain, and is told one only when one is given" {
+    # nyc: a CNC already serving the old URL, logged in to as root
+    stub ssh 'case "$*" in
+        *"sed -n"*server_url*) echo "https://hs.example.com" ;;
+        *"mktemp -d"*) echo /tmp/connector.AbCdEfGhIj ;;
+    esac'
+    stub scp
+    local stubs='port_open() { return 0; }; check_cnc_reachable() { :; }'
+    run connector_eval "$stubs; ASSUME_YES=1 cnc_init_remote nyc https://hs2.example.com '' tls-alpn-01 0 '' </dev/null"
+    assert_success
+    run calls_of ssh
+    assert_line "ssh -t nyc /usr/local/bin/connector\\ cnc-init\\ --url\\ \\'https://hs2.example.com\\'\\ --acme\\ \\'tls-alpn-01\\'"
+    : >"$CALLS"
+    run connector_eval "$stubs; ASSUME_YES=1 cmd_cnc_init nyc --url https://hs3.example.com --base-domain corp.mesh </dev/null"
+    assert_success
+    run calls_of ssh
+    assert_line --partial "cnc-init\\ --url\\ \\'https://hs3.example.com\\'\\ --acme\\ \\'tls-alpn-01\\'\\ --base-domain\\ \\'corp.mesh\\'"
+    # and one that is no DNS name never reaches the far side
+    : >"$CALLS"
+    run connector_eval "$stubs; cmd_cnc_init nyc --url https://hs3.example.com --base-domain \"x';id;'\" </dev/null"
+    assert_failure
+    assert_output --partial "is not a base domain"
+    [ -z "$(calls_of ssh)" ]
+}
+
+@test "the base domain cnc-init renders: the one given, else the CNC's, else connector.mesh" {
+    printf 'dns:\n  magic_dns: true\n  base_domain: corp.mesh\n' >"$BATS_TEST_TMPDIR/config.yaml"
+    run connector_eval "HEADSCALE_CONFIG='$BATS_TEST_TMPDIR/config.yaml'; cnc_base_domain ''; cnc_base_domain other.mesh"
+    assert_output "$(printf 'corp.mesh\nother.mesh')"
+    printf 'dns:\n  base_domain: "x;id"\n' >"$BATS_TEST_TMPDIR/config.yaml"
+    run connector_eval "HEADSCALE_CONFIG='$BATS_TEST_TMPDIR/config.yaml'; cnc_base_domain ''; HEADSCALE_CONFIG=/nonexistent; cnc_base_domain ''"
+    assert_output "$(printf 'connector.mesh\nconnector.mesh')"
+}
