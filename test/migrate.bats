@@ -101,5 +101,5 @@ linked() {
     assert_success
     assert_output --partial "connector migrate-cnc https://hs.example.com --authkey hskey-fresh --old-sha256 $(cert_sha256 "$BATS_TEST_TMPDIR/old.pem")"
     run calls_of ssh
-    assert_line --partial "preauthkeys create --user 1 --tags tag:consumer"
+    assert_line --partial "preauthkeys create --user 1 --expiration 1h --output json --tags tag:consumer"
 }

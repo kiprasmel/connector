@@ -251,21 +251,29 @@ node_role() {
 }
 is_provider() { role_has "$(node_role)" provider; }
 is_consumer() { role_has "$(node_role)" consumer; }
+is_ops()      { role_has "$(node_role)" ops; }
 is_node()     { have tailscale && tailscale status >/dev/null 2>&1; }
 
 # Canonicalize a comma/space separated node-role spec into an ordered, de-duped
 # CSV of tailnet roles (provider[,consumer]). 'both' stays as a legacy alias.
 # Dies on any unknown role. Empty input yields empty output (no error).
 parse_node_roles() {
-    local tok p=0 c=0 out=""
+    local tok p=0 c=0 o=0 out=""
     for tok in $(printf '%s' "${1:-}" | tr ',' ' '); do
         case "$tok" in
             provider) p=1 ;;
             consumer) c=1 ;;
             both)     p=1; c=1 ;;
-            *) die "Invalid role: '$tok' (expected provider and/or consumer)" ;;
+            ops)      o=1 ;;
+            *) die "Invalid role: '$tok' (expected provider and/or consumer, or ops)" ;;
         esac
     done
+    if [ "$o" = 1 ]; then
+        # an operator's machine is untagged (headscale user ops); tags would make it someone else
+        [ "$p$c" = 00 ] || die "ops is a machine of its own (an operator's, untagged): not with provider or consumer."
+        printf 'ops'
+        return 0
+    fi
     [ "$p" = 1 ] && out="provider"
     [ "$c" = 1 ] && out="${out:+$out,}consumer"
     printf '%s' "$out"
@@ -285,6 +293,7 @@ current_roles() {
     is_manager && roles+=("manager")
     is_provider   && roles+=("provider")
     is_consumer   && roles+=("consumer")
+    is_ops        && roles+=("ops")
     if [ "${#roles[@]}" -eq 0 ]; then
         if is_node; then roles+=("node (untagged)"); else roles+=("unconfigured"); fi
     fi
@@ -1167,31 +1176,45 @@ cmd_propagate_update() {
 }
 
 # --- Invite ------------------------------------------------------------------
+# A headscale user's numeric id (default: connector's own user), created when
+# it is the operators' and does not exist yet. Args: [name]
 hs_user_id() {
-    local out
+    local name="${1:-$HEADSCALE_USER}" out id
     out="$(hs users list --output json 2>/dev/null)" || return 1
+    id="$(printf '%s' "$out" | user_id_in "$name")"
+    if [ -z "$id" ] && [ "$name" = "$HEADSCALE_OPS_USER" ]; then
+        hs users create "$name" >/dev/null 2>&1 || return 1
+        out="$(hs users list --output json 2>/dev/null)" || return 1
+        id="$(printf '%s' "$out" | user_id_in "$name")"
+    fi
+    printf '%s\n' "$id"
+}
+
+# The id of user <name> in headscale's `users list --output json` on stdin.
+user_id_in() {
     if have jq; then
-        printf '%s' "$out" | jq -r --arg n "$HEADSCALE_USER" \
-            'first(.[] | select(.name==$n) | .id) // empty' 2>/dev/null | head -n1
+        jq -r --arg n "$1" 'first(.[] | select(.name==$n) | .id) // empty' 2>/dev/null
         return 0
     fi
     # Fallback for pretty-printed JSON: each user object lists "id" then "name".
-    printf '%s' "$out" | tr '\n\t' '  ' | sed 's/  */ /g' \
-        | grep -o "\"id\": *[0-9]* *, *\"name\": *\"$HEADSCALE_USER\"" \
+    tr '\n\t' '  ' | sed 's/  */ /g' \
+        | grep -o "\"id\": *[0-9]* *, *\"name\": *\"$1\"" \
         | sed -n 's/.*"id": *\([0-9]*\).*/\1/p' | head -n1
 }
 
 # Mint a single-use, short-expiry pre-auth key for a role spec; echo the key.
-# headscale's --user takes a numeric user ID, so we always resolve it.
+# headscale's --user takes a numeric user ID, so we always resolve it. An
+# operator's machine (ops) is the ops user's and carries no tag.
 mint_key() {
-    local roles tags uid out key
+    local roles key_tags="" user="$HEADSCALE_USER" uid out key
     roles="$(parse_node_roles "$1")"
-    [ -n "$roles" ] || die "No roles given for key (expected provider and/or consumer)."
-    tags="$(tags_for_roles "$roles")"
-    uid="$(hs_user_id 2>/dev/null || true)"
-    [ -n "$uid" ] || die "Could not resolve headscale user '$HEADSCALE_USER' on the CNC (is headscale running? try: connector status)"
-    out="$(hs preauthkeys create --user "$uid" --tags "$tags" --expiration "$KEY_EXPIRY" --output json 2>/dev/null)" \
-        || die "Failed to create pre-auth key on CNC"
+    [ -n "$roles" ] || die "No roles given for key (expected provider and/or consumer, or ops)."
+    if [ "$roles" = ops ]; then user="$HEADSCALE_OPS_USER"; else key_tags="$(tags_for_roles "$roles")"; fi
+    uid="$(hs_user_id "$user" 2>/dev/null || true)"
+    [ -n "$uid" ] || die "Could not resolve headscale user '$user' on the CNC (is headscale running? try: connector status)"
+    local -a create=(preauthkeys create --user "$uid" --expiration "$KEY_EXPIRY" --output json)
+    [ -z "$key_tags" ] || create+=(--tags "$key_tags")
+    out="$(hs "${create[@]}" 2>/dev/null)" || die "Failed to create pre-auth key on CNC"
     key="$(printf '%s' "$out" | json_str key)"
     [ -n "$key" ] || die "Could not parse pre-auth key from headscale output"
     printf '%s\n' "$key"
@@ -1208,6 +1231,7 @@ cmd_invite() {
             provider) types+=("provider") ;;
             consumer) types+=("consumer") ;;
             both)     types+=("provider"); types+=("consumer") ;;
+            ops)      types+=("ops") ;;
             manager|controller|commander) want_manager=1 ;;
             *) name="$tok" ;;
         esac
@@ -1218,6 +1242,7 @@ cmd_invite() {
         echo "  [1] provider"
         echo "  [2] consumer"
         echo "  [3] manager (commands the CNC over SSH)"
+        echo "  [4] ops (an operator's machine: reaches prod on ssh and https)"
         local sel n
         read -r -p 'Enter roles: ' sel || sel=""
         for n in $(printf '%s' "$sel" | tr ',' ' '); do
@@ -1225,6 +1250,7 @@ cmd_invite() {
                 1|provider) types+=("provider") ;;
                 2|consumer) types+=("consumer") ;;
                 3|manager|controller|commander) want_manager=1 ;;
+                4|ops) types+=("ops") ;;
                 *) log_warn "Ignoring invalid choice: $n" ;;
             esac
         done
@@ -1571,7 +1597,7 @@ install_self_local() {
 cmd_register() {
     local roles
     roles="$(parse_node_roles "${1:-}")"
-    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY|-] [--hostname N] [--tailscale app|oss] [--yes]"
+    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer|ops> <url> [--authkey KEY|-] [--hostname N] [--tailscale app|oss] [--yes]"
     shift || true
     local url="" key="" hostname="" ts_variant="" reauth=0
     while [ $# -gt 0 ]; do
@@ -1586,7 +1612,7 @@ cmd_register() {
             *) [ -z "$url" ] && url="$1" || die "Unexpected argument: $1"; shift ;;
         esac
     done
-    [ -n "$url" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY|-]"
+    [ -n "$url" ] || die "Usage: connector register <provider|consumer|provider,consumer|ops> <url> [--authkey KEY|-]"
     # `--authkey -`: the key on stdin, never on an argv
     if [ "$key" = "-" ]; then IFS= read -r key || true; [ -n "$key" ] || die "No key on stdin."; fi
 
@@ -1851,7 +1877,7 @@ hs_nodes_tsv() {
 print_node_table() {
     local rows="$1" self_ip="" me_consumer=0
     [ -n "$rows" ] || { echo "No nodes found."; return 0; }
-    is_consumer && me_consumer=1
+    { is_consumer || is_ops; } && me_consumer=1
     have jq && self_ip="$(ts_cli status --json 2>/dev/null | jq -r '(.Self.TailscaleIPs // [])[0] // empty' 2>/dev/null || true)"
     {
         printf 'ID\tNAME\tROLE\tIP\tONLINE\tCONNECTABLE\n'
@@ -1885,7 +1911,7 @@ print_hosts() {
             out+="  ${cnc_name}  (cnc)"$'\n'
         fi
     fi
-    if have_ts && is_consumer && have jq; then
+    if have_ts && { is_consumer || is_ops; } && have jq; then
         names="$(ts_cli status --json 2>/dev/null | jq -r '
             (.Peer // {}) | to_entries[] | .value
             | select((.Tags // []) | index("tag:provider"))
@@ -2446,8 +2472,9 @@ SETUP
 
 ONBOARD                [admin: run on the CNC or a linked manager]
   invite [--migrate] [roles] [name]
-                       roles is comma-separated: provider, consumer, manager
-                       (e.g. 'invite provider,consumer'). No args -> menu.
+                       roles is comma-separated: provider, consumer, manager,
+                       or ops alone (an operator's machine: untagged, it
+                       reaches prod on ssh and https). No args -> menu.
                        Mints a single-use key and prints the register command;
                        with --migrate, the migrate-cnc command a node already
                        registered follows the CNC to its new name with.
@@ -2459,7 +2486,7 @@ ONBOARD                [admin: run on the CNC or a linked manager]
 
 JOIN
   register <roles> <url> [--authkey KEY|-] [--hostname N] [--tailscale app|oss] [--yes]
-                       roles is comma-separated: provider[,consumer].
+                       roles is comma-separated: provider[,consumer], or ops.
                        Join the tailnet (just paste the command 'invite' prints;
                        '--authkey -' reads the key from stdin). The key reaches
                        tailscale in a 0600 file, never on its command line.

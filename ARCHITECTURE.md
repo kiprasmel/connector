@@ -86,6 +86,14 @@ already connected. `register` hands the key to `tailscale up` in a 0600 file
 (`--auth-key file:…`), never on its command line, where any local user's `ps`
 would see it; `--authkey -` reads it from stdin.
 
+### Operators' machines (ops)
+
+`connector invite ops [name]` mints a key for headscale user `ops` with no
+tag: the machine is that user's, so it is in `group:ops`, and the site's
+policy (below) lets it reach prod machines on ssh and https, and what a
+consumer reaches. `ops` is a machine of its own: a tag would make it the
+tag's, not the user's, so it is never combined with provider or consumer.
+
 ### Manager invites
 
 A manager commands the CNC over SSH, so promoting one is the single place
