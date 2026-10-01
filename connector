@@ -11,6 +11,9 @@ HEADSCALE_ACL="/etc/headscale/acl.hujson"         # what headscale reads: compos
 HEADSCALE_ACL_SITE="/etc/headscale/acl.site.json"  # the site's own rules: never overwritten
 HEADSCALE_OPS_USER="ops"                           # operators' machines: untagged, this user's
 HEADSCALE_BACKUP_RECIPIENTS="/etc/headscale/backup.recipients"  # public keys a backup is encrypted to
+HEADSCALE_BACKUP_DIR="/var/backups/headscale"     # the CNC's daily backups (backup-schedule)
+HEADSCALE_BACKUP_KEEP=14                          # how many of them stay
+BACKUP_UNIT_DIR="/etc/systemd/system"
 HEADSCALE_LIB="/var/lib/headscale"
 HEADSCALE_BIN="/usr/local/bin/headscale"
 # headscale, pinned: a release is this version and the sha256 of each artifact
@@ -54,7 +57,7 @@ OS_RELEASE="/etc/os-release"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
-    cnc-init cnc-update propagate-update link invite manager-key commander-key register migrate-cnc prod-key backup restore backup-stream restore-stream approve list ls revoke
+    cnc-init cnc-update propagate-update link invite manager-key commander-key register migrate-cnc prod-key backup restore backup-stream restore-stream backup-schedule backup-schedule-local backup-local approve list ls revoke
     status whoami hop ssh tmux cnc alias cleanup cleanup-cnc help --help -h
 )
 
@@ -906,6 +909,8 @@ cnc_init_local() {
     sleep 2
     ensure_headscale_user
     if [ "$challenge" = http-01 ]; then open_firewall "$port" 80; else open_firewall "$port"; fi
+    # a daily backup that is scheduled runs as this connector writes it
+    ( backup_schedule_local --refresh ) || log_warn "The daily backup's units are as they were: connector backup-schedule"
 
     echo
     if as_root systemctl is-active --quiet headscale; then
@@ -1133,6 +1138,9 @@ cnc_update_push() {
     else
         log_warn "   installed, but checksum unverified (local=${lsum:-?} cnc=${rsum:-?})."
     fi
+    # a daily backup that is scheduled there runs as this connector writes it
+    ssh_cnc "${rsudo}${CONNECTOR_BIN} backup-schedule-local --refresh" </dev/null >/dev/null 2>&1 \
+        || log_warn "   its daily backup's units are as they were: connector backup-schedule"
 }
 
 # Push this machine's connector to a provider node over Tailscale SSH. Returns 0/1.
@@ -2029,6 +2037,155 @@ cmd_restore() {
     fi
 }
 
+# --- Scheduled backups -------------------------------------------------------
+# The CNC backs itself up every day: the archive `backup` makes, encrypted to
+# the public keys in /etc/headscale/backup.recipients, into a new 0600 file
+# under /var/backups/headscale (0700), the newest <keep> kept -- a day whose
+# backup failed deletes none. The private half is never on the CNC: a copy
+# goes off it with scp, and `restore` takes it as it takes any backup.
+
+# The service the daily timer starts. Args: keep
+backup_service_unit() {
+    cat <<EOF
+# Written by connector backup-schedule: an edit here is replaced.
+[Unit]
+Description=connector: headscale's state, encrypted to its backup recipients
+After=headscale.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=${CONNECTOR_BIN} backup-local --dir ${HEADSCALE_BACKUP_DIR} --keep $1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+EOF
+}
+
+backup_timer_unit() {
+    cat <<'EOF'
+# Written by connector backup-schedule: an edit here is replaced.
+[Unit]
+Description=connector: a daily encrypted backup of headscale's state
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Is <n> how many backups may stay?
+backup_keep_ok() {
+    [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]]
+}
+
+# On the CNC, as root, from the timer: one backup into <dir>, and the newest
+# <keep> kept, by the time in their names.
+backup_local() {
+    local dir="$HEADSCALE_BACKUP_DIR" keep="$HEADSCALE_BACKUP_KEEP" out f n=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir)  dir="$2"; shift 2 ;;
+            --keep) keep="$2"; shift 2 ;;
+            *) die "Usage: connector backup-local [--dir DIR] [--keep N]" ;;
+        esac
+    done
+    require_root backup-local
+    backup_keep_ok "$keep" || die "--keep is how many backups stay, 1 or more: not '$keep'"
+    install -d -m 0700 "$dir" || die "Could not make $dir."
+    out="$dir/headscale-$(date -u +%Y%m%dT%H%M%SZ).tar.age"
+    [ ! -e "$out" ] || die "$out exists: a backup goes into a new file only."
+    ( umask 077; set -o noclobber; backup_stream_local >"$out.part" ) || { rm -f "$out.part"; die "The backup failed; nothing kept."; }
+    [ "$(head -c 21 "$out.part")" = "age-encryption.org/v1" ] || { rm -f "$out.part"; die "That is not an encrypted backup; nothing kept."; }
+    mv -f "$out.part" "$out" || die "Could not keep $out."
+    while IFS= read -r f; do
+        n=$((n + 1))
+        [ "$n" -le "$keep" ] || rm -f -- "$f"
+    done < <(find "$dir" -maxdepth 1 -type f -name 'headscale-*.tar.age' | sort -r)
+    log_success "Backup: $out ($(wc -c <"$out" | tr -d ' ') bytes, 0600)."
+}
+
+# On the CNC, as root: the daily backup, encrypted to <recipient>s (written
+# to the recipients file) or, with none given, to those it lists; --off takes
+# the timer away (the backups, and their recipients, stay); --refresh writes
+# the units of a timer that is there as this connector does (cnc-init and
+# cnc-update), and puts none in.
+backup_schedule_local() {
+    local keep="" off=0 refresh=0 r tmp unit n=0
+    local -a rcpts=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --recipient) rcpts+=("$2"); shift 2 ;;
+            --keep)      keep="$2"; shift 2 ;;
+            --off)       off=1; shift ;;
+            --refresh)   refresh=1; shift ;;
+            *) die "Usage: connector backup-schedule [--recipient <age1...|ssh-ed25519 ...>]... [--keep N] | --off" ;;
+        esac
+    done
+    require_root backup-schedule
+    unit="$BACKUP_UNIT_DIR/connector-backup.service"
+    if [ "$off" = 1 ]; then
+        systemctl disable --now connector-backup.timer >/dev/null 2>&1 || true
+        rm -f "$unit" "$BACKUP_UNIT_DIR/connector-backup.timer"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        log_success "No more daily backups; those in ${HEADSCALE_BACKUP_DIR} stay."
+        return 0
+    fi
+    if [ "$refresh" = 1 ]; then
+        [ -f "$unit" ] || return 0
+        [ -n "$keep" ] || keep="$(sed -n 's/^ExecStart=.* --keep \([0-9]*\)$/\1/p' "$unit")"
+    fi
+    keep="${keep:-$HEADSCALE_BACKUP_KEEP}"
+    backup_keep_ok "$keep" || die "--keep is how many backups stay, 1 or more: not '$keep'"
+    for r in "${rcpts[@]+"${rcpts[@]}"}"; do backup_recipient_ok "$r" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone"; done
+    if [ "${#rcpts[@]}" -gt 0 ]; then
+        tmp="$(mktemp)"
+        { echo "# connector backup-schedule: the public keys a backup is encrypted to"; printf '%s\n' "${rcpts[@]}"; } >"$tmp"
+        { mkdir -p "$(dirname "$HEADSCALE_BACKUP_RECIPIENTS")" && install -m 0644 "$tmp" "$HEADSCALE_BACKUP_RECIPIENTS"; } \
+            || { rm -f "$tmp"; die "Could not write ${HEADSCALE_BACKUP_RECIPIENTS}."; }
+        rm -f "$tmp"
+    fi
+    while IFS= read -r r; do
+        backup_recipient_ok "$r" || die "${HEADSCALE_BACKUP_RECIPIENTS} holds a line that is no age1... or ssh-ed25519 public key"
+        n=$((n + 1))
+    done < <(grep -v '^[[:space:]]*#' "$HEADSCALE_BACKUP_RECIPIENTS" 2>/dev/null | awk 'NF')
+    [ "$n" -gt 0 ] || die "No recipient: pass --recipient <age1...|ssh-ed25519 ...> (a key whose private half is not on this machine)."
+    have age || pkg_install age >/dev/null 2>&1 || die "age encrypts the backups: apt-get install age"
+    have sqlite3 || pkg_install sqlite3 >/dev/null 2>&1 || die "sqlite3 copies the database: apt-get install sqlite3"
+    mkdir -p "$BACKUP_UNIT_DIR" || die "Could not make $BACKUP_UNIT_DIR."
+    { backup_service_unit "$keep" >"$unit" && backup_timer_unit >"$BACKUP_UNIT_DIR/connector-backup.timer"; } \
+        || die "Could not write the backup's units."
+    { systemctl daemon-reload && systemctl enable --now connector-backup.timer >/dev/null 2>&1; } \
+        || die "systemd did not take connector-backup.timer."
+    log_success "A backup every day into ${HEADSCALE_BACKUP_DIR}, the newest ${keep} kept, encrypted to ${n} recipient(s)."
+}
+
+# Where the daily backup is put, or taken away: on the CNC itself, or from a
+# manager over SSH.
+cmd_backup_schedule() {
+    local sudo="sudo " a prev=""
+    # checked here first: a private key passed by mistake never leaves this machine
+    for a in "$@"; do
+        [ "$prev" != --recipient ] || backup_recipient_ok "$a" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone (nothing of it was sent)"
+        [ "$prev" != --keep ] || backup_keep_ok "$a" || die "--keep is how many backups stay, 1 or more: not '$a'"
+        prev="$a"
+    done
+    if is_cnc; then
+        backup_schedule_local "$@"
+    elif is_manager; then
+        load_cnc_link
+        [ "$CNC_USER" != root ] || sudo=""
+        ssh_cnc "${sudo}${CONNECTOR_BIN} backup-schedule-local $(printf '%q ' "$@")"
+    else
+        die "Only a CNC or manager schedules the CNC's backups."
+    fi
+}
+
 # --- Admin: list / approve / revoke -----------------------------------------
 cmd_list() {
     is_admin || die "Only a CNC or manager can list nodes."
@@ -2819,6 +2976,12 @@ USE
                        [admin] Decrypt here, where the private key is, and put
                        the state in place on the CNC: the state before is kept
                        aside, and back if headscale cannot run what came.
+  backup-schedule [--recipient <age1...|ssh-ed25519 ...>]... [--keep N] | --off
+                       [admin] The CNC backs itself up every day, as backup
+                       does, encrypted to the recipients (written to
+                       /etc/headscale/backup.recipients; none given: those it
+                       lists) into /var/backups/headscale, the newest N (14)
+                       kept. --off stops it; the backups stay.
   cleanup              Disconnect this machine from the tailnet.
   cleanup-cnc          [admin] Delete all nodes + stop headscale.
   help                 This help.
@@ -2877,6 +3040,9 @@ main() {
         backup)         cmd_backup "$@" ;;
         restore)        cmd_restore "$@" ;;
         backup-stream)  backup_stream_local "$@" ;;     # over SSH, from a manager's backup
+        backup-schedule) cmd_backup_schedule "$@" ;;
+        backup-schedule-local) backup_schedule_local "$@" ;;  # over SSH, from a manager's backup-schedule
+        backup-local)   backup_local "$@" ;;            # the daily timer's
         restore-stream) restore_stream_local "$@" ;;    # over SSH, from a manager's restore
         approve)        cmd_approve "$@" ;;
         list|ls)        cmd_list "$@" ;;

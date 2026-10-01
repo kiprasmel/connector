@@ -70,3 +70,25 @@ ciphertext"
     run cat "$BATS_TEST_TMPDIR/restored"
     assert_output "the decrypted tar"
 }
+
+@test "a manager schedules the CNC's daily backup over SSH, to public keys alone, checked here before they go" {
+    run connector_fn cmd_backup_schedule --recipient "$RCPT" --keep 7
+    assert_success
+    run calls_of ssh
+    assert_line "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-schedule-local\\ --recipient\\ ${RCPT}\\ --keep\\ 7\\ "
+    : >"$CALLS"
+    local secret="AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"
+    run connector_fn cmd_backup_schedule --recipient "$secret"
+    assert_failure
+    assert_output --partial "Not a recipient"
+    refute_output --partial "$secret"
+    run connector_fn cmd_backup_schedule --recipient "$RCPT" --keep 0
+    assert_failure
+    assert_output --partial "--keep is how many backups stay, 1 or more: not '0'"
+    [ -z "$(calls_of ssh)" ]
+    # and off, the same way
+    run connector_fn cmd_backup_schedule --off
+    assert_success
+    run calls_of ssh
+    assert_line "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-schedule-local\\ --off\\ "
+}

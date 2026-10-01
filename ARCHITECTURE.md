@@ -47,7 +47,8 @@ an ops machine and keeps reaching providers. What that relies on:
 - headscale is a pinned release, and the policy a site writes is its own and
   can never open a prod machine;
 - prod keys are minted by `prod-key` alone, and reach a machine on stdin;
-- the CNC's state has an encrypted backup whose private key is not on it.
+- the CNC's state has an encrypted backup whose private key is not on it,
+  taken every day (`backup-schedule`);
 
 **Exit criterion.** This mesh has one admin. The day connector gets a second
 admin, or users from outside, prod moves to a headscale of its own: the
@@ -283,6 +284,7 @@ one name to another), and every node follows it:
 ```
 connector backup --recipient age1...            # a manager: a new 0600 headscale-<UTC>.tar.age here
 connector restore headscale-<UTC>.tar.age --identity ~/.config/age/admin.key
+connector backup-schedule --recipient age1...   # the CNC backs itself up every day
 ```
 
 A backup is the CNC's state -- headscale's database (a consistent copy,
@@ -293,8 +295,20 @@ public keys alone: `--recipient` (an `age1…` key or an `ssh-ed25519` one) and
 those listed in `/etc/headscale/backup.recipients`. The private half never
 needs to be on the CNC, and a secret key passed by mistake is refused. From a
 manager it streams over SSH into a new 0600 file (never over one, and only if
-what came is an age file); schedule it from the admin's machine (cron, say)
-for copies off the CNC.
+what came is an age file).
+
+`backup-schedule` has the CNC take one every day itself (`connector-backup.timer`,
+a random hour after midnight, and a day the CNC was down for once it is up):
+the same archive, encrypted to the recipients it names -- written to
+`backup.recipients`, or, with none given, those already listed -- into a new
+0600 file in `/var/backups/headscale` (0700), the newest 14 kept (`--keep N`)
+by the time in their names, so a day whose backup failed deletes none.
+`--off` stops it and leaves the backups. Its units are rewritten by `cnc-init`
+and `cnc-update` as the connector they install writes them, and never put in by
+either. Copies off the CNC are the admin's: `scp` the newest from
+`/var/backups/headscale`, or a manager's `connector backup` (cron, say). A
+recipient is checked on the machine it is typed on, so a private key passed
+by mistake never reaches the CNC.
 
 A restore is decrypted where the private key is -- the admin's machine -- and
 streamed to the CNC over SSH. The CNC takes only what a backup holds (files
@@ -358,6 +372,8 @@ If both are present it asks which to use; if neither, it asks which to install
 | `/etc/headscale/acl.hujson`            | CNC: the policy headscale reads (composed) |
 | `/etc/headscale/acl.site.json`         | CNC: the site's own rules (never overwritten) |
 | `/etc/headscale/backup.recipients`     | CNC: public keys a backup is encrypted to (optional) |
+| `/var/backups/headscale/`              | CNC: its daily backups (`backup-schedule`), 0700, each 0600 |
+| `/etc/systemd/system/connector-backup.{service,timer}` | CNC: the daily backup (`backup-schedule`) |
 | `/var/lib/headscale/`                  | CNC: keys + sqlite DB                      |
 | `/var/lib/headscale/cache/`            | CNC: headscale's Let's Encrypt account + certificate |
 | `/var/lib/headscale/certs/`            | CNC: an older connector's self-signed `cnc.crt` (until removed) |

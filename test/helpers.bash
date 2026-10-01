@@ -85,6 +85,18 @@ node_image() {
     printf '%s\n' "$tag"
 }
 
+# An image with systemd in it, for systemd-analyze (test/docker/systemd),
+# built once per content of its Dockerfile. Stdout: its tag.
+systemd_image() {
+    local df="$REPO_ROOT/test/docker/systemd/Dockerfile" sum tag
+    sum="$( { sha256sum 2>/dev/null || shasum -a 256; } <"$df" | cut -c1-12)"
+    tag="connector-test-systemd:$sum"
+    docker image inspect "$tag" >/dev/null 2>&1 \
+        || docker build -q --build-arg BASE="$UBUNTU_IMAGE" -t "$tag" "$REPO_ROOT/test/docker/systemd" >/dev/null \
+        || return 1
+    printf '%s\n' "$tag"
+}
+
 # Run <script> as root in a fresh node container, connector at
 # /usr/local/bin/connector and its functions loaded. Extra docker run
 # arguments before the script. Args: [docker args...] script
