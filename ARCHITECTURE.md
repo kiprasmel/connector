@@ -155,6 +155,16 @@ key from the CNC admin's `authorized_keys`.
 Interactive prompts (the invite menu, etc.) happen locally; only concrete
 commands are sent to the CNC.
 
+## Putting connector on another machine
+
+`cnc-init <host>`, `cnc-update` and `propagate-update` copy this machine's
+connector to the CNC or a provider: into a directory of its own there --
+`mktemp -d`, made by that machine and the login user's alone, whose path is
+checked before anything is copied -- then install it from there as
+`/usr/local/bin/connector` (and `con`) and remove the directory in the same
+command, whatever happened. Never a fixed name in `/tmp`, which anyone on that
+host could make first, or swap before root installs what it holds.
+
 ## ACL policy
 
 headscale reads `/etc/headscale/acl.hujson`, which connector composes from two

@@ -954,10 +954,9 @@ check_cnc_reachable() {
 }
 
 cnc_init_remote() {
-    local host="$1" url="$2" port="$3" acme="${4:-$HS_ACME_DEFAULT}" reinit="${5:-0}" sshflag scpflag self configured=0
+    local host="$1" url="$2" port="$3" acme="${4:-$HS_ACME_DEFAULT}" reinit="${5:-0}" sshflag configured=0
     have ssh || die "ssh not found"; have scp || die "scp not found"
     sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
-    scpflag="$([ -n "$port" ] && echo "-P $port" || true)"
 
     log_info "Checking SSH access to $host..."
     # shellcheck disable=SC2086
@@ -993,11 +992,7 @@ cnc_init_remote() {
             confirm "Move the CNC to ${url}?" || die "Declined."
         fi
         log_info "Copying connector to $host and running cnc-init..."
-        self="$(self_path)"
-        # shellcheck disable=SC2086
-        scp $scpflag "$self" "$host:/tmp/connector.$$" >/dev/null
-        # shellcheck disable=SC2086
-        ssh $sshflag "$host" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$"
+        push_connector "$host" "$rsudo" 0 "$port" || die "Could not install connector on $host."
         # shellcheck disable=SC2086
         ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url' --acme '$acme'" || die "Remote cnc-init failed"
     fi
@@ -1051,21 +1046,46 @@ cmd_link() {
     echo "Try: connector list"
 }
 
+# Put this machine's connector on <target> as CONNECTOR_BIN, with the con
+# link: copied into a directory of its own there (mktemp -d, the login user's
+# alone), installed from it, and the directory removed in the same command
+# whatever happened -- never a fixed name in /tmp, which anyone on that host
+# could make first, or swap before root installs what it holds. stdin is
+# closed unless sudo there may ask for a password. Returns 0/1.
+# Args: target, sudo ("sudo " or ""), tty (1: sudo may prompt), [ssh port]
+push_connector() {
+    local target="$1" rsudo="$2" tty="$3" port="${4:-}" self dir cmd
+    local -a ssh_o=(-o ConnectTimeout=10) scp_o=(-o ConnectTimeout=10)
+    if [ -n "$port" ]; then ssh_o+=(-p "$port"); scp_o+=(-P "$port"); fi
+    self="$(self_path)"
+    dir="$(ssh "${ssh_o[@]}" "$target" 'mktemp -d /tmp/connector.XXXXXXXXXX' </dev/null 2>/dev/null | tr -d '\r')" || dir=""
+    if ! [[ "$dir" =~ ^/tmp/connector\.[A-Za-z0-9]{10}$ ]]; then
+        log_warn "   ${target} made no directory of its own to copy into (it said '${dir:0:40}')."
+        return 1
+    fi
+    if ! scp -q "${scp_o[@]}" "$self" "$target:$dir/connector" </dev/null >/dev/null 2>&1; then
+        ssh "${ssh_o[@]}" "$target" "rm -rf $dir" </dev/null >/dev/null 2>&1 || true
+        log_warn "   copy to ${target} failed."
+        return 1
+    fi
+    cmd="${rsudo}install -m 0755 $dir/connector ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN}; rc=\$?; rm -rf $dir; exit \$rc"
+    if [ "$tty" = 1 ]; then
+        ssh -t "${ssh_o[@]}" "$target" "$cmd"
+    else
+        ssh "${ssh_o[@]}" "$target" "$cmd" </dev/null
+    fi
+}
+
 # Push this machine's connector to the linked CNC and install it. Returns 0/1.
 cnc_update_push() {
     load_cnc_link
-    local self sshflag scpflag rsudo="sudo " lsum rsum
+    local self sshflag rsudo="sudo " lsum rsum
     self="$(self_path)"
     sshflag="$([ -n "${CNC_PORT:-}" ] && echo "-p $CNC_PORT" || true)"
-    scpflag="$([ -n "${CNC_PORT:-}" ] && echo "-P $CNC_PORT" || true)"
     [ "${CNC_USER:-}" = "root" ] && rsudo=""
 
     log_info "-> CNC ${CNC_SSH} (${CONNECTOR_BIN})"
-    # shellcheck disable=SC2086
-    scp $scpflag "$self" "$CNC_SSH:/tmp/connector.$$" >/dev/null 2>&1 || { log_warn "   copy to CNC failed."; return 1; }
-    # shellcheck disable=SC2086
-    ssh $sshflag "$CNC_SSH" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$" \
-        || { log_warn "   install on CNC failed."; return 1; }
+    push_connector "$CNC_SSH" "$rsudo" 0 "${CNC_PORT:-}" || { log_warn "   install on CNC failed."; return 1; }
 
     lsum="$(file_sha256 "$self")"
     # shellcheck disable=SC2086
@@ -1079,14 +1099,11 @@ cnc_update_push() {
 
 # Push this machine's connector to a provider node over Tailscale SSH. Returns 0/1.
 provider_update_push() {
-    local name="$1" user self
-    user="$(id -un)"; self="$(self_path)"
+    local name="$1" user
+    user="$(id -un)"
     log_info "-> provider ${name} (ssh ${user}@${name})"
-    scp -o ConnectTimeout=10 "$self" "${user}@${name}:/tmp/connector.$$" >/dev/null 2>&1 \
-        || { log_warn "   copy failed (online + SSH-reachable?)."; return 1; }
-    ssh -t -o ConnectTimeout=10 "${user}@${name}" \
-        "sudo install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && sudo ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$" \
-        || { log_warn "   remote install failed (sudo rights?)."; return 1; }
+    push_connector "${user}@${name}" "sudo " 1 \
+        || { log_warn "   remote install failed (online + SSH-reachable? sudo rights?)."; return 1; }
     log_success "   updated."
 }
 
