@@ -57,6 +57,12 @@ install() {
     [ ! -e "$BATS_TEST_TMPDIR/keyrings/ts.gpg" ]
     run calls_of apt-get
     refute_output --partial "install -y tailscale"
+    # what gpg cannot read at all is said to be so, not left unsaid
+    echo "<html>not a key</html>" >"$SERVED"
+    run install "$VENDOR_FPR"
+    assert_failure
+    assert_output --partial "tailscale's apt key is unreadable, not the pinned"
+    [ ! -e "$BATS_TEST_TMPDIR/ts.list" ]
 }
 
 @test "a derivative gets the repository of the distribution it is like; others their own package, or nothing" {

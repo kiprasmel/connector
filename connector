@@ -449,7 +449,7 @@ detect_arch() {
 # The installed headscale's version (x.y.z), or nothing.
 headscale_installed_version() {
     have headscale || return 0
-    headscale version 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^v?[0-9]+[.][0-9]+[.][0-9]+$/) { sub(/^v/, "", $i); print $i; exit } }'
+    { headscale version 2>/dev/null || true; } | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^v?[0-9]+[.][0-9]+[.][0-9]+$/) { sub(/^v/, "", $i); print $i; exit } }'
 }
 
 # Is version <a> older than <b>?
@@ -1549,7 +1549,7 @@ install_tailscale_apt() {
     curl -fsSL -o "$key" "https://pkgs.tailscale.com/stable/${dist}/${codename}.noarmor.gpg" \
         || { rm -f "$key"; die "Could not fetch tailscale's apt key."; }
     # every primary key the file holds: a second one would sign for the repository too
-    got="$(gpg --show-keys --with-colons "$key" 2>/dev/null | awk -F: '/^pub:/ { p = 1; next } p && /^fpr:/ { printf "%s%s", s, $10; s = " "; p = 0 }')"
+    got="$( { gpg --show-keys --with-colons "$key" 2>/dev/null || true; } | awk -F: '/^pub:/ { p = 1; next } p && /^fpr:/ { printf "%s%s", s, $10; s = " "; p = 0 }')"
     [ "$got" = "$TS_APT_KEY_FPR" ] || { rm -f "$key"; die "tailscale's apt key is ${got:-unreadable}, not the pinned ${TS_APT_KEY_FPR}; nothing installed."; }
     arch="$(dpkg --print-architecture)"
     if ! { as_root install -d -m 755 "${TS_APT_KEYRING%/*}" && as_root install -m 644 "$key" "$TS_APT_KEYRING"; }; then
@@ -1674,20 +1674,23 @@ macos_tailscale_cli() {
 
 # `<cli...> <args...>`: tailscale up, the auth key (if any) read by tailscale
 # from a 0600 file rather than from its argv, where any local user's ps would
-# see it. Args: key ('' for none), cli words..., --, args...
+# see it. The file goes when tailscale is done, or when connector is
+# interrupted waiting for it. Args: key ('' for none), cli words..., --, args...
+TS_KEY_FILE=""
 ts_up() {
-    local key="$1" f="" rc=0
+    local key="$1" rc=0
     local -a runner=()
     shift
     while [ "$1" != -- ]; do runner+=("$1"); shift; done
     shift
     if [ -n "$key" ]; then
-        f="$(umask 077; mktemp)" || return 1
-        printf '%s\n' "$key" >"$f"
-        set -- "$@" --auth-key "file:$f"
+        TS_KEY_FILE="$(umask 077; mktemp)" || return 1
+        trap '[ -z "$TS_KEY_FILE" ] || rm -f "$TS_KEY_FILE"' EXIT
+        printf '%s\n' "$key" >"$TS_KEY_FILE"
+        set -- "$@" --auth-key "file:$TS_KEY_FILE"
     fi
     "${runner[@]}" "$@" || rc=$?
-    [ -z "$f" ] || rm -f "$f"
+    if [ -n "$TS_KEY_FILE" ]; then rm -f "$TS_KEY_FILE"; TS_KEY_FILE=""; trap - EXIT; fi
     return "$rc"
 }
 

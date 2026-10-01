@@ -68,3 +68,11 @@ setup() {
     assert_output --partial "never downgrades it"
     [ -z "$(calls_of curl)" ]
 }
+
+@test "a headscale that cannot say its version is not the pinned one: the pinned release is fetched for it" {
+    stub headscale 'exit 1'
+    run connector_fn install_headscale
+    assert_failure
+    assert_output --partial "Installing headscale"
+    assert_output --partial "is not the pinned release"
+}

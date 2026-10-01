@@ -115,7 +115,8 @@ by the admin:
 `finalize` from the old tool is gone: after a successful `register`, the node is
 already connected. `register` hands the key to `tailscale up` in a 0600 file
 (`--auth-key file:…`), never on its command line, where any local user's `ps`
-would see it; `--authkey -` reads it from stdin.
+would see it, and removes the file when tailscale is done or connector is
+stopped waiting for it; `--authkey -` reads it from stdin.
 
 ### Operators' machines (ops)
 

@@ -118,3 +118,19 @@ setup() {
     run cat "$KEY_SEEN"
     assert_output hskey-stdin
 }
+
+@test "the key's file goes when connector is stopped while tailscale waits" {
+    stub uname 'echo Linux'
+    stub tailscale '[ "$1" != up ] || { : >"$BATS_TEST_TMPDIR/waiting"; sleep 3; }'
+    export BATS_TEST_TMPDIR
+    # shellcheck disable=SC2016  # expands in the child
+    bash -c 'source "$CONNECTOR"; CONNECTOR_BIN="$HOME/bin/connector" CON_BIN="$HOME/bin/con"
+        cmd_register consumer https://hs.example.com --authkey hskey-wait --yes' >/dev/null 2>&1 &
+    local pid=$! f i
+    for i in $(seq 1 100); do [ -e "$BATS_TEST_TMPDIR/waiting" ] && break; sleep 0.1; done
+    f="$(grep -o 'file:[^ ]*' "$CALLS" | head -n 1 | cut -d: -f2)"
+    [ -n "$f" ] && [ -e "$f" ]
+    kill -TERM "$pid"
+    wait "$pid" || true
+    [ ! -e "$f" ]
+}
