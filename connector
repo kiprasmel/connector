@@ -19,8 +19,10 @@ HEADSCALE_SHA256_AMD64_DEB="1f65364716ae1fcc3845b1a65a47583469022e9c6f194dfdfeb2
 HEADSCALE_SHA256_ARM64_DEB="021a4aeb2106d09c0e6fb5f936acffcbcdea213ef8882b19ea91b03783e1f816"
 HEADSCALE_SHA256_AMD64_BIN="212ed0a884c0d3541e094c4bebbe94397df6f4e01bd3d7f059c520cb55e0d757"
 HEADSCALE_SHA256_ARM64_BIN="cbad8f02524cc6a94955a107a72e1d4cc652ae3f22e740d5c60884e7f384d60e"
-# Where an older connector kept a bare-IP CNC's self-signed certificate.
+# Where an older connector kept a bare-IP CNC's self-signed certificate: read
+# to say which root its nodes must stop trusting (invite --migrate).
 HEADSCALE_CERT_DIR="${HEADSCALE_LIB}/certs"
+HEADSCALE_CERT="${HEADSCALE_CERT_DIR}/cnc.crt"
 # How headscale proves the CNC's name to Let's Encrypt: tls-alpn-01, answered
 # on the TLS listener at :443, or http-01, answered on :80.
 HS_ACME_DEFAULT="tls-alpn-01"
@@ -43,7 +45,7 @@ TS_INSTALL_URL="https://tailscale.com/install.sh"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
-    cnc-init cnc-update propagate-update link invite manager-key commander-key register approve list ls revoke
+    cnc-init cnc-update propagate-update link invite manager-key commander-key register migrate-cnc approve list ls revoke
     status whoami hop ssh tmux cnc alias cleanup cleanup-cnc help --help -h
 )
 
@@ -476,7 +478,8 @@ EOF
 # server against the public roots it already has, and connector installs no
 # trust root on any machine. (An older connector served a bare IP with a
 # self-signed CA:TRUE certificate and trusted it as a root on every node:
-# whoever held its key could pass for any site to all of them.)
+# whoever held its key could pass for any site to all of them. migrate-cnc
+# takes a node off it.)
 
 # Can <url> be the CNC's? https, a DNS name, a port or none. Says why not.
 cnc_url_ok() {
@@ -485,7 +488,7 @@ cnc_url_ok() {
     host="$(url_host "$url")"; port="$(url_port "$url")"
     if is_ip "$host"; then
         log_error "The CNC is a DNS name, not an address ($host): point an A record at it and use https://<name>."
-        log_error "(connector no longer makes every node trust a certificate of its own.)"
+        log_error "(connector no longer makes every node trust a certificate of its own; 'connector migrate-cnc' moves a node off one.)"
         return 1
     fi
     [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] \
@@ -902,7 +905,8 @@ cnc_init_remote() {
         log_info "CNC already configured on $host at ${url}; skipping install (--reinit applies this connector to it)."
     else
         if [ "$configured" = 1 ] && [ "$url" != "$existing" ]; then
-            log_warn "This moves the CNC from ${existing} to ${url}: every node then has to follow it there."
+            log_warn "This moves the CNC from ${existing} to ${url}. Every node then follows with"
+            log_warn "'connector migrate-cnc' (a fresh key from 'connector invite --migrate <roles> <node>')."
             confirm "Move the CNC to ${url}?" || die "Declined."
         fi
         log_info "Copying connector to $host and running cnc-init..."
@@ -1125,9 +1129,10 @@ cmd_invite() {
     is_admin || die "Only a CNC or manager can invite. Link one: connector link <host> --url ..."
     # Roles may be given comma- or space-separated, e.g. 'provider,consumer'.
     # Any non-role token is treated as the new machine's hostname.
-    local types=() name="" want_manager=0 tok
+    local types=() name="" want_manager=0 migrate=0 tok
     for tok in $(printf '%s ' "$@" | tr ',' ' '); do
         case "$tok" in
+            --migrate) migrate=1 ;;
             provider) types+=("provider") ;;
             consumer) types+=("consumer") ;;
             both)     types+=("provider"); types+=("consumer") ;;
@@ -1165,11 +1170,33 @@ cmd_invite() {
         key="$(mint_key "$roles")"
         [ -n "$name" ] && hostarg=" --hostname $name"
         echo
-        log_success "Single-use invite created (roles: ${roles}, expires in ${KEY_EXPIRY})."
-        echo "Run this on the new machine:"
+        if [ "$migrate" = 1 ]; then
+            local fp oldarg=""
+            fp="$(old_cnc_cert_pem | fp_of_pem)"
+            [ -n "$fp" ] && oldarg=" --old-sha256 ${fp}"
+            log_success "Single-use key to follow the CNC (roles: ${roles}, expires in ${KEY_EXPIRY})."
+            echo "Run this on that machine:"
+            echo
+            echo "    connector migrate-cnc ${url} --authkey ${key}${oldarg}"
+        else
+            log_success "Single-use invite created (roles: ${roles}, expires in ${KEY_EXPIRY})."
+            echo "Run this on the new machine:"
+            echo
+            echo "    connector register ${roles} ${url} --authkey ${key}${hostarg}"
+        fi
         echo
-        echo "    connector register ${roles} ${url} --authkey ${key}${hostarg}"
-        echo
+    fi
+}
+
+# The self-signed certificate an older connector served the CNC's bare IP
+# with, if the CNC still holds it (local, or over SSH): stdout, PEM.
+old_cnc_cert_pem() {
+    if is_cnc; then
+        as_root cat "$HEADSCALE_CERT" 2>/dev/null || true
+    elif is_manager; then
+        load_cnc_link
+        if [ "$CNC_USER" = "root" ]; then ssh_cnc cat "$HEADSCALE_CERT" 2>/dev/null || true
+        else ssh_cnc sudo cat "$HEADSCALE_CERT" 2>/dev/null || true; fi
     fi
 }
 
@@ -1351,7 +1378,7 @@ register_summary() {
 }
 
 register_macos() {
-    local roles="$1" url="$2" key="$3" hostname="$4" variant="$5" cli needs_ssh=0
+    local roles="$1" url="$2" key="$3" hostname="$4" variant="$5" reauth="${6:-0}" cli needs_ssh=0
     [ -n "$hostname" ] || hostname="$(node_name)"
     # Providers must host Tailscale SSH, which the sandboxed GUI app can't do;
     # let the CLI chooser steer to open-source tailscaled in that case.
@@ -1386,6 +1413,7 @@ register_macos() {
     # user-scoped key combined with --advertise-tags, so only advertise the tags
     # for interactive (keyless) registration where the admin owns them.
     local up_args=(up --reset --login-server "$url" --accept-dns=true)
+    [ "$reauth" = 1 ] && up_args+=(--force-reauth)
     [ -n "$hostname" ] && up_args+=(--hostname "$hostname")
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
     if [ -n "$key" ]; then
@@ -1458,10 +1486,11 @@ cmd_register() {
     roles="$(parse_node_roles "${1:-}")"
     [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY] [--hostname N] [--tailscale app|oss] [--yes]"
     shift || true
-    local url="" key="" hostname="" ts_variant=""
+    local url="" key="" hostname="" ts_variant="" reauth=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --authkey)   key="$2"; shift 2 ;;
+            --force-reauth) reauth=1; shift ;;
             --hostname)  hostname="$2"; shift 2 ;;
             --ca-sha256) die "--ca-sha256 is gone: the CNC is a DNS name with a public certificate, and connector installs no trust root. Ask your admin for a fresh invite." ;;
             --tailscale) ts_variant="$2"; shift 2 ;;
@@ -1479,7 +1508,7 @@ cmd_register() {
     cnc_url_ok "$url" || die "Ask your admin for the CNC's https://<name> (a fresh invite)."
 
     if [ "$(os_kind)" = "macos" ]; then
-        register_macos "$roles" "$url" "$key" "$hostname" "$ts_variant"
+        register_macos "$roles" "$url" "$key" "$hostname" "$ts_variant" "$reauth"
         return $?
     fi
 
@@ -1499,6 +1528,7 @@ cmd_register() {
     # user-scoped key combined with --advertise-tags, so only advertise the tags
     # for interactive (keyless) registration where the admin owns them.
     local up_args=(--reset --login-server "$url" --accept-dns=true)
+    [ "$reauth" = 1 ] && up_args+=(--force-reauth)
     [ -n "$hostname" ] && up_args+=(--hostname "$hostname")
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
     if [ -n "$key" ]; then
@@ -1520,6 +1550,88 @@ cmd_register() {
     maybe_fix_wsl_mtu
     install_self_local
     register_summary "$roles" "tailscale" "$hostname"
+}
+
+# --- Migrate: a node follows the CNC to its new name ------------------------
+# The CNC moved (an older connector's bare IP to a DNS name, or one name to
+# another): this node joins it there with a fresh key, as the roles and name
+# it had, and stops trusting the root an older connector installed for the
+# old address -- that certificate, by its fingerprint, and nothing else.
+
+# This node's tailscale prefs as JSON: what it is logged in to, and as what.
+ts_prefs_json() {
+    local variant="$1"
+    if [ "$(os_kind)" = "macos" ] && { [ "$variant" = app ] || { [ -z "$variant" ] && [ -x "$TS_MAC_APP_CLI" ]; }; }; then
+        "$TS_MAC_APP_CLI" debug prefs 2>/dev/null
+    else
+        as_root tailscale debug prefs 2>/dev/null
+    fi
+}
+
+# A top-level JSON field of <json> (jq, else sed). Args: json, field
+json_field() {
+    if have jq; then printf '%s' "$1" | jq -r --arg f "$2" '.[$f] // empty' 2>/dev/null
+    else printf '%s' "$1" | tr -d '\n' | json_str "$2"; fi
+}
+
+# The manager link, pointed at <url>; the ssh side of it is unchanged.
+set_cnc_link_url() {
+    local tmp
+    tmp="$(mktemp "${CNC_LINK_FILE}.XXXXXX")" || return 1
+    awk -v u="$1" '/^CNC_URL=/ { print "CNC_URL=\"" u "\""; next } { print }' "$CNC_LINK_FILE" >"$tmp" \
+        && chmod 600 "$tmp" && mv -f "$tmp" "$CNC_LINK_FILE"
+}
+
+cmd_migrate_cnc() {
+    local url="" key="" old="" variant="" roles prefs current hostname kept=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --authkey)    key="$2"; shift 2 ;;
+            --old-sha256) old="$(printf '%s' "$2" | tr 'A-F' 'a-f' | tr -d ': ')"; shift 2 ;;
+            --tailscale)  variant="$2"; shift 2 ;;
+            --yes|-y)     ASSUME_YES=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) if [ -z "$url" ]; then url="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+    [ -n "$url" ] || die "Usage: connector migrate-cnc <https://new-name> --authkey KEY [--old-sha256 FP] [--tailscale app|oss] [--yes]"
+    cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
+    roles="$(node_role)"
+    [ -n "$roles" ] || die "This machine never registered with connector (no role); join it: connector register <roles> ${url} --authkey KEY"
+    # The root to take away: the one this node recorded, and the one the admin names, agree.
+    [ -s "$CNC_CA_FILE" ] && kept="$(fp_of_pem <"$CNC_CA_FILE")"
+    if [ -n "$old" ] && [ -n "$kept" ] && [ "$old" != "$kept" ]; then
+        die "The certificate this node trusted (${kept}) is not the one named (${old}); nothing changed."
+    fi
+    [ -n "$old" ] || old="$kept"
+
+    prefs="$(ts_prefs_json "$variant")"
+    current="$(json_field "$prefs" ControlURL)"
+    hostname="$(json_field "$prefs" Hostname)"
+    if [ "$current" = "$url" ]; then
+        log_info "Already on ${url}; not re-joining."
+    else
+        [ -n "$key" ] || die "Re-joining at ${url} needs a fresh key: ask the admin for 'connector invite --migrate ${roles}'."
+        log_info "Moving this node from ${current:-its old CNC} to ${url} (roles: ${roles})..."
+        local -a args=("$roles" "$url" --authkey "$key" --force-reauth --yes)
+        [ -n "$hostname" ] && args+=(--hostname "$hostname")
+        [ -n "$variant" ] && args+=(--tailscale "$variant")
+        cmd_register "${args[@]}"
+    fi
+    if [ -n "$old" ]; then
+        untrust_cert_sha256 "$old" || die "The old CNC certificate is still trusted; see above."
+        rm -f "$CNC_CA_FILE"
+    else
+        log_info "No old CNC certificate known here; nothing to stop trusting."
+    fi
+    if is_manager; then
+        load_cnc_link
+        if [ "$CNC_URL" != "$url" ]; then
+            set_cnc_link_url "$url" || die "Could not point the manager link at ${url}."
+            log_success "The manager link now names ${url}."
+        fi
+    fi
+    log_success "Migrated to ${url}."
 }
 
 # --- Admin: list / approve / revoke -----------------------------------------
@@ -2238,8 +2350,8 @@ SETUP
                        and renews it itself; nodes install no trust root. With
                        user@host it runs remotely over SSH and links this PC as
                        a manager; a CNC already set up keeps its URL unless
-                       --url names another (then every node must follow), and
-                       --reinit re-applies this connector.
+                       --url names another (then every node follows with
+                       migrate-cnc), and --reinit re-applies this connector.
   link <user@host> --url https://HOST[:PORT] [-p SSH_PORT]
                        Attach to an existing CNC (become a manager).
   cnc-update           [manager] Push this machine's connector script to
@@ -2248,10 +2360,12 @@ SETUP
                        nodes; pick from a list, or pass -a/--all for all.
 
 ONBOARD                [admin: run on the CNC or a linked manager]
-  invite [roles] [name]
+  invite [--migrate] [roles] [name]
                        roles is comma-separated: provider, consumer, manager
                        (e.g. 'invite provider,consumer'). No args -> menu.
-                       Mints a single-use key and prints the register command.
+                       Mints a single-use key and prints the register command;
+                       with --migrate, the migrate-cnc command a node already
+                       registered follows the CNC to its new name with.
   manager-key          Print this machine's SSH public key (for a
                        'manager' invite).
   approve [node] [roles]
@@ -2265,6 +2379,13 @@ JOIN
                        Auto-handles WSL systemd (asks first), and on macOS
                        auto-detects the GUI app or open-source tailscaled
                        (override: --tailscale).
+
+  migrate-cnc <url> --authkey KEY [--old-sha256 FP] [--tailscale app|oss] [--yes]
+                       Follow the CNC to its new name (what 'invite --migrate'
+                       prints): re-join with a fresh key as the roles and name
+                       this node had, stop trusting the root an older connector
+                       installed for the old address (that certificate, by its
+                       SHA-256), and point a manager's link at the new URL.
 
 USE
   status               Roles + tailscale/headscale status.
@@ -2337,6 +2458,7 @@ main() {
         invite)         cmd_invite "$@" ;;
         manager-key|commander-key)  cmd_manager_key "$@" ;;
         register)       cmd_register "$@" ;;
+        migrate-cnc)    cmd_migrate_cnc "$@" ;;
         approve)        cmd_approve "$@" ;;
         list|ls)        cmd_list "$@" ;;
         revoke)         cmd_revoke "$@" ;;

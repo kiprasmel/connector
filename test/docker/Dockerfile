@@ -5,5 +5,5 @@ ARG BASE
 FROM ${BASE}
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates openssl jq sqlite3 age iproute2 \
+        ca-certificates curl openssl jq sqlite3 age iproute2 \
     && rm -rf /var/lib/apt/lists/*

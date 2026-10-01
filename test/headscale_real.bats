@@ -102,3 +102,26 @@ configtest() {
     # headscale was restarted onto the config it took, never onto the one it refused
     assert_line --index 5 "1"
 }
+
+@test "a Linux provider follows the CNC to its new name, and its CA store loses the old root" {
+    run in_node '
+        tailscale() { echo "tailscale $*" >>/tmp/ts; [ "$1" != debug ] || echo "{\"ControlURL\":\"https://203.0.113.1:8443\",\"Hostname\":\"box1\"}"; }
+        cd /tmp
+        openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 30 \
+            -subj /CN=203.0.113.1 -addext subjectAltName=IP:203.0.113.1 -keyout old.key -out old.pem >/dev/null 2>&1
+        install -m 0644 old.pem /usr/local/share/ca-certificates/headscale-cnc.crt
+        update-ca-certificates >/dev/null 2>&1
+        mkdir -p ~/.config/connector; echo provider >~/.config/connector/role; cp old.pem ~/.config/connector/cnc-ca.crt
+        ( cmd_migrate_cnc https://hs.example.com --authkey hskey-m ) >/tmp/out 2>&1; echo "rc=$?"
+        grep " up " /tmp/ts
+        [ -e /usr/local/share/ca-certificates/headscale-cnc.crt ] && echo "root kept" || echo "root gone"
+        grep -c -F "$(sed -n 2p old.pem)" /etc/ssl/certs/ca-certificates.crt
+        [ -e ~/.config/connector/cnc-ca.crt ] && echo "record kept" || echo "record gone"
+    '
+    assert_success
+    assert_line "rc=0"
+    assert_line "tailscale up --reset --login-server https://hs.example.com --accept-dns=true --force-reauth --hostname box1 --ssh --authkey hskey-m"
+    assert_line "root gone"
+    assert_line --index 3 "0"
+    assert_line "record gone"
+}

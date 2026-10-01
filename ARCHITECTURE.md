@@ -157,11 +157,37 @@ served a bare IP (`https://<ip>:8443`) with a self-signed **CA:TRUE**
 certificate and made every node trust it as a root (the macOS System
 keychain, the Linux CA store): whoever held its key could pass for any site
 to all of them. That mode is gone -- `cnc-init`, `register` and `link` refuse
-an address -- and `cleanup` removes the old root: that certificate, matched
-by its SHA-256 and nothing else (on macOS every
+an address -- and `cleanup` and `migrate-cnc` (below) remove the old root:
+that certificate, matched by its SHA-256 and nothing else (on macOS every
 certificate in the System keychain is hashed and only the match is deleted,
 with its trust setting; on Linux only a file connector wrote that holds that
 certificate is removed, and the store is rebuilt).
+
+## Moving the CNC to a new name
+
+A CNC moves once from an older connector's bare IP to its DNS name (or from
+one name to another), and every node follows it:
+
+1. **DNS**: an A record for the new name pointing at the CNC.
+2. **The CNC**: from the admin's manager, `connector cnc-init <ssh-host> --url
+   https://<name>` (it asks before moving a CNC that already serves another
+   URL). headscale keeps its database, keys and nodes; only the URL, its
+   certificate (Let's Encrypt, on first connection) and the port change.
+   Tunnels between nodes keep working; until a node follows, its control
+   plane is the old URL, which no longer answers.
+3. **Each node**: the admin runs `connector invite --migrate <roles> <node>`
+   (a fresh single-use key) and the node runs what it prints:
+   `connector migrate-cnc https://<name> --authkey KEY --old-sha256 FP`.
+   It re-joins with `--force-reauth` (tailscale will not change its login
+   server otherwise) as the roles it registered with and the tailnet
+   hostname it had -- headscale knows the machine, so it keeps its node and
+   address -- then stops trusting the old root: the certificate whose SHA-256
+   the CNC still holds (`/var/lib/headscale/certs/cnc.crt`), which must agree
+   with the one the node recorded; nothing changes when they differ. A
+   manager's link moves to the new URL too. Run again, it re-joins nothing
+   and removes nothing that is already gone.
+4. **Last**: once every node has followed, remove the old certificate from
+   the CNC (`/var/lib/headscale/certs/`).
 
 ## The headscale release
 
@@ -207,7 +233,7 @@ If both are present it asks which to use; if neither, it asks which to install
 | `/var/lib/headscale/certs/`            | CNC: an older connector's self-signed `cnc.crt` (until removed) |
 | `~/.config/connector/cnc`             | manager: linked CNC (`CNC_SSH/URL/PORT`)|
 | `~/.config/connector/role`            | node: last registered role (provider/…)    |
-| `~/.config/connector/cnc-ca.crt`      | node: an older connector's trusted CNC cert (`cleanup` removes it) |
+| `~/.config/connector/cnc-ca.crt`      | node: an older connector's trusted CNC cert (`cleanup`/`migrate-cnc` remove it) |
 | `~/.config/connector/aliases.conf`    | saved `connector <name>` SSH shortcuts     |
 | `~/.ssh/config`                       | optional Host entries written by `alias`   |
 
