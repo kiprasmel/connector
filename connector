@@ -1882,12 +1882,13 @@ cmd_register() {
 # old address -- that certificate, by its fingerprint, and nothing else.
 
 # This node's tailscale prefs as JSON: what it is logged in to, and as what.
+# Nothing when tailscale cannot say (its daemon down, say).
 ts_prefs_json() {
     local variant="$1"
     if [ "$(os_kind)" = "macos" ] && { [ "$variant" = app ] || { [ -z "$variant" ] && [ -x "$TS_MAC_APP_CLI" ]; }; }; then
-        "$TS_MAC_APP_CLI" debug prefs 2>/dev/null
+        "$TS_MAC_APP_CLI" debug prefs 2>/dev/null || true
     else
-        as_root tailscale debug prefs 2>/dev/null
+        as_root tailscale debug prefs 2>/dev/null || true
     fi
 }
 
@@ -1922,7 +1923,8 @@ cmd_migrate_cnc() {
     [ -n "$url" ] || die "Usage: connector migrate-cnc <https://new-name> --authkey KEY [--old-sha256 FP] [--tailscale app|oss] [--yes]"
     cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
     roles="$(node_role)"
-    [ -n "$roles" ] || die "This machine never registered with connector (no role); join it: connector register <roles> ${url} --authkey KEY"
+    # a manager that is no node: its link follows, and nothing joins
+    [ -n "$roles" ] || is_manager || die "This machine never registered with connector (no role); join it: connector register <roles> ${url} --authkey KEY"
     # The root to take away: the one this node recorded, and the one the admin names, agree.
     [ -s "$CNC_CA_FILE" ] && kept="$(fp_of_pem <"$CNC_CA_FILE")"
     if [ -n "$old" ] && [ -n "$kept" ] && [ "$old" != "$kept" ]; then
@@ -1930,18 +1932,22 @@ cmd_migrate_cnc() {
     fi
     [ -n "$old" ] || old="$kept"
 
-    prefs="$(ts_prefs_json "$variant")"
-    current="$(json_field "$prefs" ControlURL)"
-    hostname="$(json_field "$prefs" Hostname)"
-    if [ "$current" = "$url" ]; then
-        log_info "Already on ${url}; not re-joining."
+    if [ -z "$roles" ]; then
+        log_info "Not a node here (no role): only the manager link follows."
     else
-        [ -n "$key" ] || die "Re-joining at ${url} needs a fresh key: ask the admin for 'connector invite --migrate ${roles}'."
-        log_info "Moving this node from ${current:-its old CNC} to ${url} (roles: ${roles})..."
-        local -a args=("$roles" "$url" --authkey "$key" --force-reauth --yes)
-        [ -n "$hostname" ] && args+=(--hostname "$hostname")
-        [ -n "$variant" ] && args+=(--tailscale "$variant")
-        cmd_register "${args[@]}"
+        prefs="$(ts_prefs_json "$variant")"
+        current="$(json_field "$prefs" ControlURL)"
+        hostname="$(json_field "$prefs" Hostname)"
+        if [ "$current" = "$url" ]; then
+            log_info "Already on ${url}; not re-joining."
+        else
+            [ -n "$key" ] || die "Re-joining at ${url} needs a fresh key: ask the admin for 'connector invite --migrate ${roles}'."
+            log_info "Moving this node from ${current:-its old CNC} to ${url} (roles: ${roles})..."
+            local -a args=("$roles" "$url" --authkey "$key" --force-reauth --yes)
+            [ -n "$hostname" ] && args+=(--hostname "$hostname")
+            [ -n "$variant" ] && args+=(--tailscale "$variant")
+            cmd_register "${args[@]}"
+        fi
     fi
     if [ -n "$old" ]; then
         untrust_cert_sha256 "$old" || die "The old CNC certificate is still trusted; see above."
@@ -3065,7 +3071,9 @@ JOIN
                        prints): re-join with a fresh key as the roles and name
                        this node had, stop trusting the root an older connector
                        installed for the old address (that certificate, by its
-                       SHA-256), and point a manager's link at the new URL.
+                       SHA-256), and point a manager's link at the new URL
+                       (a manager that is no node needs no key: only its link
+                       follows).
 
 USE
   status               Roles + tailscale/headscale status.

@@ -287,7 +287,8 @@ one name to another), and every node follows it:
    address -- then stops trusting the old root: the certificate whose SHA-256
    the CNC still holds (`/var/lib/headscale/certs/cnc.crt`), which must agree
    with the one the node recorded; nothing changes when they differ. A
-   manager's link moves to the new URL too. Run again, it re-joins nothing
+   manager's link moves to the new URL too (a manager that is no node runs
+   it with no key, and only its link follows). Run again, it re-joins nothing
    and removes nothing that is already gone.
 4. **Last**: once every node has followed, remove the old certificate from
    the CNC (`/var/lib/headscale/certs/`).

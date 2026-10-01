@@ -127,3 +127,24 @@ linked() {
     assert_output --partial "connector migrate-cnc https://hs.example.com --authkey hskey-fresh"
     refute_output --partial "--old-sha256"
 }
+
+@test "a manager that is no node follows the CNC with its link alone" {
+    rm "$HOME/.config/connector/role" "$HOME/.config/connector/cnc-ca.crt"
+    linked https://203.0.113.1:8443
+    run migrate https://hs.example.com --tailscale app
+    assert_success
+    assert_output --partial "only the manager link follows"
+    assert_output --partial "The manager link now names https://hs.example.com"
+    run calls_of Tailscale
+    refute_output --partial " up "
+}
+
+@test "a node whose tailscale cannot say what it is on is re-joined, not stopped without a word" {
+    stub Tailscale '[ "$1" != debug ] || exit 1
+'"$TS_STUB"
+    run migrate https://hs.example.com --authkey hskey-m --tailscale app
+    assert_success
+    assert_output --partial "Moving this node from its old CNC to https://hs.example.com"
+    run calls_of Tailscale
+    assert_line --regexp "^Tailscale up --reset --login-server https://hs\.example\.com .*--force-reauth"
+}
