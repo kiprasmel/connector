@@ -1,0 +1,36 @@
+# A headscale for the docker tier to ask: plain HTTP on loopback, the embedded
+# DERP (headscale needs a DERP map to start), state under /tmp/hs. Its policy
+# is the one connector wrote.
+server_url: http://127.0.0.1:8080
+listen_addr: 127.0.0.1:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+noise:
+  private_key_path: /tmp/hs/noise.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: "test"
+    region_name: "test"
+    stun_listen_addr: "127.0.0.1:3478"
+    private_key_path: /tmp/hs/derp.key
+    automatically_add_embedded_derp_region: true
+  urls: []
+  paths: []
+database:
+  type: sqlite
+  sqlite:
+    path: /tmp/hs/db.sqlite
+policy:
+  mode: file
+  path: /etc/headscale/acl.hujson
+dns:
+  magic_dns: false
+  base_domain: connector.mesh
+  override_local_dns: false
+unix_socket: /tmp/hs/headscale.sock
+unix_socket_permission: "0770"

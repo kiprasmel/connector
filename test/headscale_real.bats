@@ -125,3 +125,63 @@ configtest() {
     assert_line --index 3 "0"
     assert_line "record gone"
 }
+
+# A script fragment: headscale serving /tmp/hs-config.yaml in the node, with
+# connector's users, so `hs_check <policy>` asks it what it makes of a policy.
+HS_SERVE='
+    mkdir -p /tmp/hs
+    /usr/local/bin/headscale -c /tmp/hs-config.yaml serve >/tmp/hs/serve.log 2>&1 &
+    for _ in $(seq 1 100); do [ -S /tmp/hs/headscale.sock ] && break; sleep 0.1; done
+    for u in mesh ops; do /usr/local/bin/headscale -c /tmp/hs-config.yaml users create "$u" >/dev/null 2>&1; done
+    hs_check() { /usr/local/bin/headscale -c /tmp/hs-config.yaml policy check -f "$1" 2>&1 | tail -n 1; return "${PIPESTATUS[0]}"; }
+'
+
+@test "the policy connector writes keeps the site's rules, never overwrites them, and headscale takes it" {
+    local bin
+    bin="$(headscale_bin)"
+    run in_node -v "$bin:/usr/local/bin/headscale:ro" -v "$REPO_ROOT/test/docker/headscale-test.yaml:/tmp/hs-config.yaml:ro" '
+        # the site made the fragment its own: a rule of its own in it
+        mkdir -p /etc/headscale
+        render_site_acl | jq ".acls += [{\"action\":\"accept\",\"src\":[\"group:ops\"],\"dst\":[\"tag:consumer:22\"]}]" >/etc/headscale/acl.site.json
+        before="$(sha256sum /etc/headscale/acl.site.json)"
+        ( write_acl ) && ( write_acl ); echo "write rc=$?"
+        [ "$(sha256sum /etc/headscale/acl.site.json)" = "$before" ] && echo "site as it was"
+        jq -c ".acls[-1]" /etc/headscale/acl.hujson
+        '"$HS_SERVE"'
+        hs_check /etc/headscale/acl.hujson; echo "check rc=$?"
+        # and the check bites: a tag no one owns
+        jq ".acls += [{\"action\":\"accept\",\"src\":[\"group:ops\"],\"dst\":[\"tag:nobody:22\"]}]" /etc/headscale/acl.hujson >/tmp/bad.json
+        hs_check /tmp/bad.json; echo "bad rc=$?"
+    '
+    assert_success
+    assert_line "write rc=0"
+    assert_line "site as it was"
+    assert_line '{"action":"accept","src":["group:ops"],"dst":["tag:consumer:22"]}'
+    assert_line "Policy is valid"
+    assert_line "check rc=0"
+    assert_line --partial 'tag not found: "tag:nobody"'
+    assert_line "bad rc=1"
+}
+
+@test "cnc-init keeps the policy before when the site fragment would open a prod machine" {
+    local bin
+    bin="$(headscale_bin)"
+    run in_node -v "$bin:/usr/local/bin/headscale:ro" '
+        systemctl() { :; }
+        ss() { :; }
+        headscale() { case "$1" in users) echo "[]" ;; *) /usr/local/bin/headscale "$@" ;; esac; }
+        export ASSUME_YES=1
+        ( cnc_init_local https://hs.example.com connector.mesh tls-alpn-01 ) >/tmp/first 2>&1; echo "first rc=$?"
+        before="$(sha256sum /etc/headscale/acl.hujson)"
+        jq ".ssh += [{\"action\":\"accept\",\"src\":[\"group:ops\"],\"dst\":[\"tag:prod\"],\"users\":[\"root\"]}]" \
+            /etc/headscale/acl.site.json >/tmp/site && cp /tmp/site /etc/headscale/acl.site.json
+        ( cnc_init_local https://hs.example.com connector.mesh tls-alpn-01 ) >/tmp/second 2>&1; echo "second rc=$?"
+        [ "$(sha256sum /etc/headscale/acl.hujson)" = "$before" ] && echo "policy as it was"
+        grep -c "no one gets SSH to one; refused" /tmp/second
+    '
+    assert_success
+    assert_line "first rc=0"
+    assert_line "second rc=1"
+    assert_line "policy as it was"
+    assert_line --index 3 "1"
+}

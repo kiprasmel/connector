@@ -104,27 +104,55 @@ key from the CNC admin's `authorized_keys`.
 Interactive prompts (the invite menu, etc.) happen locally; only concrete
 commands are sent to the CNC.
 
-## ACL policy (`/etc/headscale/acl.hujson`)
+## ACL policy
 
-Note: headscale policy v2 (0.26+) requires usernames to be written with a
-trailing `@` (the owner `mesh@` refers to the user registered as `mesh`).
+headscale reads `/etc/headscale/acl.hujson`, which connector composes from two
+parts, and writes only when the result passes the guards below and headscale's
+`configtest` (otherwise the policy before stays):
 
-```hujson
-{
-  "tagOwners": { "tag:provider": ["mesh@"], "tag:consumer": ["mesh@"] },
-  "acls": [
-    { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider:*"] }
-  ],
-  "ssh": [
-    { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider"],
-      "users": ["autogroup:nonroot"] }
-  ]
-}
-```
+- **connector's own rules** (`render_acl`), the same on every CNC:
+
+  ```json
+  {
+    "tagOwners": { "tag:provider": ["mesh@"], "tag:consumer": ["mesh@"] },
+    "acls": [ { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider:*"] } ],
+    "ssh":  [ { "action": "accept", "src": ["tag:consumer"], "dst": ["tag:provider"],
+                "users": ["autogroup:nonroot"] } ]
+  }
+  ```
+
+- **the site's own rules**, `/etc/headscale/acl.site.json` (strict JSON):
+  written once, where there is none, and never overwritten by `cnc-init`, an
+  update or anything else -- the site edits it. Its groups, tagOwners and
+  hosts join connector's (the site's winning a name both use); its acls and
+  ssh rules follow connector's. The default is the operators':
+
+  ```json
+  {
+    "groups": { "group:ops": ["ops@"] },
+    "tagOwners": { "tag:prod": ["group:ops"] },
+    "acls": [
+      { "action": "accept", "src": ["group:ops"], "dst": ["tag:prod:22,443"] },
+      { "action": "accept", "src": ["group:ops"], "dst": ["tag:provider:*"] }
+    ],
+    "ssh": [ { "action": "accept", "src": ["group:ops"], "dst": ["tag:provider"],
+               "users": ["autogroup:nonroot"] } ]
+  }
+  ```
+
+  An operator's machine (an untagged machine of headscale user `ops`) reaches
+  a prod machine (`tag:prod`) on ssh and https, and what a consumer reaches.
+
+Whatever the site writes, the composed policy is refused when it grants a prod
+machine anything (an acl whose source is a `tag:prod…` tag, `*` or
+`autogroup:tagged`), or gives anyone Tailscale SSH to one (an ssh rule whose
+destination is one of those): a prod machine is only ever a destination, and
+OpenSSH keys stay the way in. Note: headscale policy v2 (0.26+) requires
+usernames to be written with a trailing `@` (`mesh@` is the user `mesh`).
 
 Tailnet membership is already gated at join time (invite key / approve), so
 network access here is a static, tag-based policy instead of per-host
-`sshd_config`/`authorized_keys` edits. Switching the SSH rule to
+`sshd_config`/`authorized_keys` edits. Switching an SSH rule to
 `"action": "check"` additionally requires re-auth per SSH session.
 
 ## TLS / control URL
@@ -227,7 +255,8 @@ If both are present it asks which to use; if neither, it asks which to install
 | Location                               | Purpose                                    |
 |----------------------------------------|--------------------------------------------|
 | `/etc/headscale/config.yaml`           | CNC: headscale config (written by `cnc-init`) |
-| `/etc/headscale/acl.hujson`            | CNC: tag/SSH ACL policy                    |
+| `/etc/headscale/acl.hujson`            | CNC: the policy headscale reads (composed) |
+| `/etc/headscale/acl.site.json`         | CNC: the site's own rules (never overwritten) |
 | `/var/lib/headscale/`                  | CNC: keys + sqlite DB                      |
 | `/var/lib/headscale/cache/`            | CNC: headscale's Let's Encrypt account + certificate |
 | `/var/lib/headscale/certs/`            | CNC: an older connector's self-signed `cnc.crt` (until removed) |

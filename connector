@@ -7,7 +7,9 @@ VERSION="2.2.0"
 # --- Constants ---------------------------------------------------------------
 HEADSCALE_USER="mesh"
 HEADSCALE_CONFIG="/etc/headscale/config.yaml"
-HEADSCALE_ACL="/etc/headscale/acl.hujson"
+HEADSCALE_ACL="/etc/headscale/acl.hujson"         # what headscale reads: composed (write_acl)
+HEADSCALE_ACL_SITE="/etc/headscale/acl.site.json"  # the site's own rules: never overwritten
+HEADSCALE_OPS_USER="ops"                           # operators' machines: untagged, this user's
 HEADSCALE_LIB="/var/lib/headscale"
 HEADSCALE_BIN="/usr/local/bin/headscale"
 # headscale, pinned: a release is this version and the sha256 of each artifact
@@ -650,8 +652,8 @@ write_headscale_config() {
     as_root chmod 644 "$HEADSCALE_CONFIG"
 }
 
-# The tailnet's policy: consumers reach providers, and SSH to them as a
-# non-root user. Stdout.
+# connector's own policy: consumers reach providers, and SSH to them as a
+# non-root user. Stdout (strict JSON).
 render_acl() {
     cat <<EOF
 {
@@ -674,10 +676,79 @@ render_acl() {
 EOF
 }
 
+# The site's own rules, written only where there are none and never
+# overwritten: the site edits them (strict JSON). This default is the
+# operators' (machines of headscale user ops, group:ops): they reach prod
+# machines (tag:prod) on ssh and https and nothing else of them, and what a
+# consumer reaches. A prod machine is granted nothing, and no one has
+# Tailscale SSH to one: OpenSSH keys stay the way in. Stdout.
+render_site_acl() {
+    cat <<EOF
+{
+  "groups": { "group:ops": ["${HEADSCALE_OPS_USER}@"] },
+  "tagOwners": { "tag:prod": ["group:ops"] },
+  "acls": [
+    { "action": "accept", "src": ["group:ops"], "dst": ["tag:prod:22,443"] },
+    { "action": "accept", "src": ["group:ops"], "dst": ["tag:provider:*"] }
+  ],
+  "ssh": [
+    { "action": "accept", "src": ["group:ops"], "dst": ["tag:provider"], "users": ["autogroup:nonroot"] }
+  ]
+}
+EOF
+}
+
+# connector's rules and the site's, as headscale reads them: groups,
+# tagOwners and hosts from both (the site's winning a name both use), acls
+# and ssh rules connector's, then the site's. Args: base file, site file. Stdout.
+compose_acl() {
+    jq -n --slurpfile b "$1" --slurpfile s "$2" '
+        $b[0] as $b | $s[0] as $s
+        | { groups:    (($b.groups // {}) + ($s.groups // {})),
+            tagOwners: (($b.tagOwners // {}) + ($s.tagOwners // {})),
+            hosts:     (($b.hosts // {}) + ($s.hosts // {})),
+            acls:      (($b.acls // []) + ($s.acls // [])),
+            ssh:       (($b.ssh // []) + ($s.ssh // [])) }
+        | with_entries(select(.value | length > 0))'
+}
+
+# Does the policy in <file> grant a prod machine (tag:prod...) nothing, and
+# give no one SSH to one? A source of "*" or autogroup:tagged takes prod
+# machines in too. Says which rules when not.
+acl_keeps_prod_closed() {
+    local bad
+    bad="$(jq -c '
+        def takes_prod: startswith("tag:prod") or . == "*" or . == "autogroup:tagged";
+        ((.acls // [])[] | select(any(.src[]?; takes_prod))),
+        ((.ssh // [])[] | select(any(.dst[]?; takes_prod)))' "$1")" || return 1
+    [ -n "$bad" ] || return 0
+    log_error "A prod machine is granted nothing, and no one gets SSH to one; refused:"
+    printf '%s\n' "$bad" | sed 's/^/    /' >&2
+    return 1
+}
+
+# The policy headscale reads: connector's rules and the site's, composed --
+# the site's written first where there are none, never overwritten -- and
+# refused when it would open a prod machine (acl_keeps_prod_closed).
 write_acl() {
-    as_root mkdir -p /etc/headscale
-    render_acl | as_root tee "$HEADSCALE_ACL" >/dev/null
-    as_root chmod 644 "$HEADSCALE_ACL"
+    local tmp
+    have jq || { log_error "jq composes the policy: apt-get install jq"; return 1; }
+    tmp="$(mktemp -d)"
+    render_acl >"$tmp/base.json"
+    if ! as_root test -e "$HEADSCALE_ACL_SITE"; then
+        as_root mkdir -p /etc/headscale
+        render_site_acl | as_root tee "$HEADSCALE_ACL_SITE" >/dev/null
+        as_root chmod 644 "$HEADSCALE_ACL_SITE"
+        log_info "Wrote the site's policy ${HEADSCALE_ACL_SITE}: yours from now on (connector never overwrites it)."
+    fi
+    as_root cat "$HEADSCALE_ACL_SITE" >"$tmp/site.json"
+    if ! compose_acl "$tmp/base.json" "$tmp/site.json" >"$tmp/acl.json" 2>"$tmp/err"; then
+        log_error "${HEADSCALE_ACL_SITE} is not strict JSON: $(cat "$tmp/err")"
+        rm -rf "$tmp"; return 1
+    fi
+    acl_keeps_prod_closed "$tmp/acl.json" || { rm -rf "$tmp"; return 1; }
+    as_root install -m 644 "$tmp/acl.json" "$HEADSCALE_ACL"
+    rm -rf "$tmp"
 }
 
 # headscale's new config and policy, put in place only if headscale takes
@@ -693,8 +764,8 @@ apply_headscale_config() {
     for f in "$HEADSCALE_CONFIG" "$HEADSCALE_ACL"; do
         if as_root test -f "$f.prev"; then as_root mv -f "$f.prev" "$f"; else as_root rm -f "$f"; fi
     done
-    log_error "headscale refuses the new config; the one before is back in place:"
-    printf '%s\n' "${err:-}" | awk '/[Ee]rror|[Ff]atal|not found/' >&2
+    log_error "Not applied; the config and policy before are back in place."
+    [ -z "${err:-}" ] || printf '%s\n' "$err" | awk '/[Ee]rror|[Ff]atal|not found/' >&2
     return 1
 }
 
@@ -777,6 +848,7 @@ cnc_init_local() {
 
     log_info "Initialising CNC (headscale) for ${url}: Let's Encrypt, ${challenge}"
     have curl || as_root apt-get install -y curl >/dev/null 2>&1 || true
+    have jq || as_root apt-get install -y jq >/dev/null 2>&1 || true
     install_headscale
     apply_headscale_config "$url" "$base_domain" "$challenge" || die "Nothing on the CNC changed."
     log_info "Enabling + starting headscale..."
