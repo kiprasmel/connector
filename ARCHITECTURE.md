@@ -39,9 +39,9 @@ manager. A plain provider/consumer has no admin authority.
                        │  connector invite / approve / list / revoke
                        ▼
    ┌─────────────────────────────────────────┐
-   │ VPS = CNC                                │
-   │  headscale (systemd)  HTTPS :8443        │
-   │   self-signed IP cert  (or :443 + domain)│
+   │ VPS = CNC  (a DNS name)                  │
+   │  headscale (systemd)  HTTPS :443         │
+   │   Let's Encrypt cert, renewed in-process │
    │  embedded DERP relay  STUN :3478         │
    │  ACL policy: tag:provider / tag:consumer │
    │              + Tailscale SSH rules       │
@@ -129,30 +129,36 @@ network access here is a static, tag-based policy instead of per-host
 
 ## TLS / control URL
 
-Tailscale clients require HTTPS to the control server. `cnc-init` picks the TLS
-mode from the `--url` (or, for a remote, the IP resolved from your SSH config):
+Tailscale clients require HTTPS to the control server, and verify it against
+the public roots their OS already has. The CNC is therefore a **DNS name**,
+and headscale gets that name's certificate from Let's Encrypt itself (ACME)
+and renews it in-process -- no certbot, no proxy, no cron:
 
-**Default — no domain, self-signed IP cert.** When the host is a bare IP,
-`cnc-init` generates a long-lived self-signed cert (P-256, `subjectAltName=IP:…`)
-and headscale serves its own TLS on a dedicated port (`:8443` by default) via
-`tls_cert_path`/`tls_key_path`. This never collides with an existing `:443`
-(e.g. nginx/certbot) on the box. `server_url` becomes `https://<ip>:8443`.
+```
+connector cnc-init root@203.0.113.1 --url https://vpn.example.com   # A record -> 203.0.113.1
+```
 
-Clients trust this cert by **fingerprint pinning**, not blind acceptance:
-- `invite` reads the cert's SHA-256 and bakes `--ca-sha256 <fp>` into the printed
-  `register` command.
-- `register` fetches the live cert from `<ip>:8443`, verifies it matches the pin,
-  then installs it into the OS trust store (macOS System keychain via
-  `security add-trusted-cert`; Linux `/usr/local/share/ca-certificates` +
-  `update-ca-certificates`). A linked manager instead reads the cert straight
-  off the CNC over SSH (already-trusted channel), so no pin is needed there.
-- `cleanup` removes the cert from the trust store again.
+- **`--acme tls-alpn-01`** (the default): the challenge is answered on the
+  TLS listener itself, so headscale serves `:443` and nothing else needs to.
+- **`--acme http-01`**: answered on `:80` (headscale binds it for the
+  challenge), for when `:443` belongs to something else; the control port is
+  then the one in `--url` (`https://vpn.example.com:8443`).
 
-**Optional — public domain.** `cnc-init --url https://vpn.example.com` uses
-headscale's built-in Let's Encrypt (`tls_letsencrypt_hostname`, `TLS-ALPN-01` on
-`:443`). No client-side pinning/trust step is needed (publicly-trusted CA).
-Other options: `HTTP-01` challenge (needs `:80`), or terminate TLS at a reverse
-proxy and point `server_url` at it.
+`cnc-init` refuses to bind over a port another process already holds (it
+would take the control plane down), warns when the name does not resolve to
+the machine (Let's Encrypt validates at whatever it resolves to), and needs a
+URL of exactly `https://<name>[:port]`.
+
+**connector installs no trust root on any machine.** An older connector
+served a bare IP (`https://<ip>:8443`) with a self-signed **CA:TRUE**
+certificate and made every node trust it as a root (the macOS System
+keychain, the Linux CA store): whoever held its key could pass for any site
+to all of them. That mode is gone -- `cnc-init`, `register` and `link` refuse
+an address -- and `cleanup` removes the old root: that certificate, matched
+by its SHA-256 and nothing else (on macOS every
+certificate in the System keychain is hashed and only the match is deleted,
+with its trust setting; on Linux only a file connector wrote that holds that
+certificate is removed, and the store is rebuilt).
 
 ## WSL specifics (auto-handled)
 
@@ -172,8 +178,7 @@ proxy and point `server_url` at it.
   `sudo brew services start tailscale`) — driven with `sudo`.
 
 If both are present it asks which to use; if neither, it asks which to install
-(`--tailscale app|oss` skips the prompt). For an IP CNC it trusts the pinned
-self-signed cert in the System keychain before `tailscale up`.
+(`--tailscale app|oss` skips the prompt).
 
 ## State & files
 
@@ -182,10 +187,11 @@ self-signed cert in the System keychain before `tailscale up`.
 | `/etc/headscale/config.yaml`           | CNC: headscale config (written by `cnc-init`) |
 | `/etc/headscale/acl.hujson`            | CNC: tag/SSH ACL policy                    |
 | `/var/lib/headscale/`                  | CNC: keys + sqlite DB                      |
-| `/var/lib/headscale/certs/`            | CNC: self-signed `cnc.crt`/`cnc.key` (IP mode) |
+| `/var/lib/headscale/cache/`            | CNC: headscale's Let's Encrypt account + certificate |
+| `/var/lib/headscale/certs/`            | CNC: an older connector's self-signed `cnc.crt` (until removed) |
 | `~/.config/connector/cnc`             | manager: linked CNC (`CNC_SSH/URL/PORT`)|
 | `~/.config/connector/role`            | node: last registered role (provider/…)    |
-| `~/.config/connector/cnc-ca.crt`      | node: trusted self-signed CNC cert (for cleanup) |
+| `~/.config/connector/cnc-ca.crt`      | node: an older connector's trusted CNC cert (`cleanup` removes it) |
 | `~/.config/connector/aliases.conf`    | saved `connector <name>` SSH shortcuts     |
 | `~/.ssh/config`                       | optional Host entries written by `alias`   |
 
@@ -196,7 +202,8 @@ CNC. Everything else is read live from headscale/tailscale.
 
 | Port         | Use                                          |
 |--------------|----------------------------------------------|
-| 8443/tcp     | headscale control + DERP (HTTPS, self-signed; `:443` with a domain) |
+| 443/tcp      | headscale control + DERP (HTTPS, Let's Encrypt; another port with `--acme http-01`) |
+| 80/tcp       | only with `--acme http-01`: the ACME challenge |
 | 3478/udp     | STUN (NAT traversal)                         |
 | 41641/udp    | tailscale direct connections                 |
 

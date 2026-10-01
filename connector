@@ -10,16 +10,17 @@ HEADSCALE_CONFIG="/etc/headscale/config.yaml"
 HEADSCALE_ACL="/etc/headscale/acl.hujson"
 HEADSCALE_LIB="/var/lib/headscale"
 HEADSCALE_BIN="/usr/local/bin/headscale"
+# Where an older connector kept a bare-IP CNC's self-signed certificate.
 HEADSCALE_CERT_DIR="${HEADSCALE_LIB}/certs"
-HEADSCALE_CERT="${HEADSCALE_CERT_DIR}/cnc.crt"
-HEADSCALE_KEY="${HEADSCALE_CERT_DIR}/cnc.key"
-HS_TLS_PORT_DEFAULT="8443"
+# How headscale proves the CNC's name to Let's Encrypt: tls-alpn-01, answered
+# on the TLS listener at :443, or http-01, answered on :80.
+HS_ACME_DEFAULT="tls-alpn-01"
 CONNECTOR_BIN="/usr/local/bin/connector"
 CON_BIN="/usr/local/bin/con"        # short 'con' shortcut, symlinked to connector
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/connector"
 CNC_LINK_FILE="${STATE_DIR}/cnc"
 ROLE_FILE="${STATE_DIR}/role"
-CNC_CA_FILE="${STATE_DIR}/cnc-ca.crt"
+CNC_CA_FILE="${STATE_DIR}/cnc-ca.crt"        # an older connector's trusted CNC cert
 ALIASES_FILE="${STATE_DIR}/aliases.conf"
 TMUX_SOCKET="connector"                       # dedicated tmux server socket (-L)
 TMUX_CONF="${STATE_DIR}/tmux.conf"            # connector-managed tmux config
@@ -432,157 +433,116 @@ EOF
     as_root systemctl daemon-reload
 }
 
-# Generate a long-lived self-signed cert with the IP in the SAN (idempotent).
-gen_self_signed() {
-    local ip="$1"
-    if [ -s "$HEADSCALE_CERT" ] && [ -s "$HEADSCALE_KEY" ] \
-        && as_root openssl x509 -in "$HEADSCALE_CERT" -noout -text 2>/dev/null | grep -q "IP Address:${ip}\b"; then
-        log_info "Reusing existing self-signed cert for ${ip}"
-    else
-        have openssl || as_root apt-get install -y openssl >/dev/null 2>&1 || true
-        log_info "Generating self-signed TLS cert for ${ip} (10y, P-256)..."
-        as_root mkdir -p "$HEADSCALE_CERT_DIR"
-        as_root openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-            -days 3650 -subj "/CN=${ip}" -addext "subjectAltName=IP:${ip}" \
-            -keyout "$HEADSCALE_KEY" -out "$HEADSCALE_CERT" >/dev/null 2>&1 \
-            || die "openssl certificate generation failed"
+# --- The CNC's name and certificate -------------------------------------------
+# The CNC is a DNS name, and headscale gets that name's certificate from Let's
+# Encrypt itself (ACME) and renews it in-process: a node verifies the control
+# server against the public roots it already has, and connector installs no
+# trust root on any machine. (An older connector served a bare IP with a
+# self-signed CA:TRUE certificate and trusted it as a root on every node:
+# whoever held its key could pass for any site to all of them.)
+
+# Can <url> be the CNC's? https, a DNS name, a port or none. Says why not.
+cnc_url_ok() {
+    local url="$1" host port
+    [[ "$url" =~ ^https://[^/\'\"[:space:]]+/?$ ]] || { log_error "The CNC's URL is https://<name>[:port], not '$url'."; return 1; }
+    host="$(url_host "$url")"; port="$(url_port "$url")"
+    if is_ip "$host"; then
+        log_error "The CNC is a DNS name, not an address ($host): point an A record at it and use https://<name>."
+        log_error "(connector no longer makes every node trust a certificate of its own.)"
+        return 1
     fi
-    # headscale (.deb) runs as user 'headscale'; binary install runs as root.
-    as_root chown -R headscale:headscale "$HEADSCALE_CERT_DIR" 2>/dev/null || true
-    as_root chmod 750 "$HEADSCALE_CERT_DIR" 2>/dev/null || true
-    as_root chmod 640 "$HEADSCALE_KEY"  2>/dev/null || true
-    as_root chmod 644 "$HEADSCALE_CERT" 2>/dev/null || true
+    [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] \
+        || { log_error "'$host' is not a DNS name."; return 1; }
+    [[ -z "$port" || "$port" =~ ^[0-9]{1,5}$ ]] || { log_error "'$port' is not a port."; return 1; }
 }
 
-# Print the CNC's self-signed cert PEM (local file on cnc, or over SSH).
-cnc_cert_pem() {
-    if is_cnc; then
-        as_root cat "$HEADSCALE_CERT" 2>/dev/null
-    elif is_manager; then
-        load_cnc_link
-        if [ "$CNC_USER" = "root" ]; then ssh_cnc cat "$HEADSCALE_CERT" 2>/dev/null
-        else ssh_cnc sudo cat "$HEADSCALE_CERT" 2>/dev/null; fi
-    fi
+# SHA-1 (uppercase hex, no colons) of a PEM cert on stdin: what macOS's
+# security(1) names a certificate by.
+sha1_of_pem() {
+    openssl x509 -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F' | tr -d '[:space:]'
 }
-
-cnc_cert_fingerprint() { cnc_cert_pem | fp_of_pem; }
 
 # p11-kit anchor directories used by Fedora/RHEL, Arch, and SUSE respectively.
 CA_ANCHOR_DIRS="/etc/pki/ca-trust/source/anchors /etc/ca-certificates/trust-source/anchors /etc/pki/trust/anchors"
+MACOS_SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
 
-# Add a PEM CA file to the Linux system trust store across distro families.
-# Returns non-zero if no trust mechanism could be used.
-linux_trust_ca() {
-    local crt="$1" d=""
-    # Nothing to drive the store yet? Try to install the standard package.
-    if ! have update-ca-certificates && ! have update-ca-trust && ! have trust; then
-        pkg_install ca-certificates >/dev/null 2>&1 || true
-    fi
-    if have update-ca-certificates; then            # Debian/Ubuntu (incl. WSL)
-        as_root mkdir -p /usr/local/share/ca-certificates || return 1
-        as_root install -m 0644 "$crt" /usr/local/share/ca-certificates/headscale-cnc.crt || return 1
-        as_root update-ca-certificates >/dev/null 2>&1 || return 1
-    elif have update-ca-trust; then                 # Fedora/RHEL/Arch/SUSE (p11-kit)
-        for c in $CA_ANCHOR_DIRS; do [ -d "$c" ] && { d="$c"; break; }; done
-        [ -n "$d" ] || { d="/etc/ca-certificates/trust-source/anchors"; as_root mkdir -p "$d" || return 1; }
-        as_root install -m 0644 "$crt" "$d/headscale-cnc.crt" || return 1
-        as_root update-ca-trust extract >/dev/null 2>&1 || as_root update-ca-trust >/dev/null 2>&1 || return 1
-    elif have trust; then                            # generic p11-kit
-        as_root trust anchor --store "$crt" >/dev/null 2>&1 || return 1
-    else
-        return 1
-    fi
-}
-
-# Install + trust a CNC cert (PEM on stdin) in this machine's trust store.
-# The local marker (CNC_CA_FILE) is only kept when trust actually succeeds, so
-# a failed attempt is retried on the next run instead of being skipped.
-trust_cnc_cert() {
-    local pem; pem="$(cat)"
-    [ -n "$pem" ] || { log_warn "No CNC certificate to trust."; return 1; }
-    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-    printf '%s\n' "$pem" > "$CNC_CA_FILE"; chmod 644 "$CNC_CA_FILE"
+# Stop trusting the certificate whose SHA-256 is <want>, which an older
+# connector made this machine trust as a root: that certificate, matched by
+# its fingerprint, and nothing else. Rc 0 whether it was there or not.
+# Args: sha256 (lowercase hex)
+untrust_cert_sha256() {
+    local want="$1"
+    [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { log_error "'$want' is not a SHA-256 fingerprint."; return 1; }
     case "$(os_kind)" in
-        macos)
-            log_info "Trusting the CNC certificate in the macOS System keychain (needs sudo)..."
-            sudo security add-trusted-cert -d -r trustRoot -p ssl \
-                -k /Library/Keychains/System.keychain "$CNC_CA_FILE" \
-                || { rm -f "$CNC_CA_FILE"; log_error "Failed to add the cert to the System keychain."; return 1; }
-            ;;
-        linux)
-            linux_trust_ca "$CNC_CA_FILE" \
-                || { rm -f "$CNC_CA_FILE"; log_error "Could not add the cert to the system trust store."; return 1; }
-            ;;
-        *) log_warn "Unknown OS; trust $CNC_CA_FILE manually." ;;
+        macos) untrust_macos_sha256 "$want" ;;
+        linux) untrust_linux_sha256 "$want" ;;
+        *)     log_warn "Unknown OS; remove the certificate $want from its trust store by hand." ;;
     esac
-    log_success "Trusted the CNC certificate."
 }
 
-# Remove a previously-trusted CNC cert. untrust_cnc_cert [common-name]
-untrust_cnc_cert() {
-    local cn="${1:-}" d
-    case "$(os_kind)" in
-        macos) [ -n "$cn" ] && sudo security delete-certificate -c "$cn" /Library/Keychains/System.keychain 2>/dev/null || true ;;
-        linux)
-            as_root rm -f /usr/local/share/ca-certificates/headscale-cnc.crt 2>/dev/null || true
-            have update-ca-certificates && as_root update-ca-certificates --fresh >/dev/null 2>&1 || true
-            for d in $CA_ANCHOR_DIRS; do as_root rm -f "$d/headscale-cnc.crt" 2>/dev/null || true; done
-            have update-ca-trust && { as_root update-ca-trust extract >/dev/null 2>&1 || as_root update-ca-trust >/dev/null 2>&1 || true; }
-            ;;
-    esac
-    rm -f "$CNC_CA_FILE" 2>/dev/null || true
+# macOS: every certificate in the System keychain, each hashed here, and the
+# one that matches removed with its trust setting.
+untrust_macos_sha256() {
+    local want="$1" dir f sha1 found=0
+    dir="$(mktemp -d)"
+    security find-certificate -a -p "$MACOS_SYSTEM_KEYCHAIN" 2>/dev/null \
+        | awk -v d="$dir" '/-----BEGIN CERTIFICATE-----/ { n++; f = d "/" n ".pem" } f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" }'
+    for f in "$dir"/*.pem; do
+        [ -f "$f" ] || continue
+        [ "$(fp_of_pem <"$f")" = "$want" ] || continue
+        sha1="$(sha1_of_pem <"$f")"
+        log_info "Removing the old CNC certificate from the System keychain (SHA-1 ${sha1}; needs sudo)..."
+        sudo security remove-trusted-cert -d "$f" 2>/dev/null || true
+        sudo security delete-certificate -Z "$sha1" "$MACOS_SYSTEM_KEYCHAIN" \
+            || { rm -rf "$dir"; log_error "Could not remove it; by hand: sudo security delete-certificate -Z $sha1 $MACOS_SYSTEM_KEYCHAIN"; return 1; }
+        found=1
+    done
+    rm -rf "$dir"
+    if [ "$found" = 1 ]; then log_success "The old CNC certificate is no longer trusted."
+    else log_info "No certificate ${want:0:16}... in the System keychain; nothing to remove."; fi
 }
 
-# Ensure this machine trusts the CNC's self-signed cert (only for IP CNCs).
-# establish_cnc_trust <url> [pin-sha256]
-establish_cnc_trust() {
-    local url="$1" pin="${2:-}" host port pem livefp
-    [ "${url%%://*}" = "https" ] || return 0
-    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
-    is_ip "$host" || return 0                      # public-domain CNC = publicly-trusted cert
-    [ -s "$CNC_CA_FILE" ] && return 0              # already trusted
-    if is_manager; then
-        pem="$(cnc_cert_pem)"
-        [ -n "$pem" ] || die "Could not read the CNC cert over SSH."
-    else
-        pem="$(fetch_live_cert "$host" "$port")"
-        [ -n "$pem" ] || die "Could not fetch a TLS cert from ${host}:${port}."
-        livefp="$(printf '%s\n' "$pem" | fp_of_pem)"
-        if [ -n "$pin" ]; then
-            [ "$livefp" = "$pin" ] || die "CNC cert fingerprint mismatch (pinned $pin, got $livefp)."
-        else
-            log_warn "No --ca-sha256 pin given; cert presented by ${host}:${port} has fingerprint:"
-            log_warn "  $livefp"
-            confirm "Trust this CNC certificate?" || die "Declined."
+# Linux: the files an older connector wrote into the CA store, each only if it
+# is that certificate, then the store rebuilt; and p11-kit's own copy.
+untrust_linux_sha256() {
+    local want="$1" f d removed=0
+    for f in /usr/local/share/ca-certificates/headscale-cnc.crt $(for d in $CA_ANCHOR_DIRS; do printf '%s/headscale-cnc.crt ' "$d"; done); do
+        [ -f "$f" ] || continue
+        if [ "$(fp_of_pem <"$f")" != "$want" ]; then
+            log_warn "$f is not the certificate ${want:0:16}...; left as it is."
+            continue
+        fi
+        as_root rm -f "$f" || return 1
+        removed=1
+    done
+    if [ "$removed" = 1 ]; then
+        if have update-ca-certificates; then as_root update-ca-certificates --fresh >/dev/null 2>&1 || return 1; fi
+        if have update-ca-trust; then
+            as_root update-ca-trust extract >/dev/null 2>&1 || as_root update-ca-trust >/dev/null 2>&1 || return 1
         fi
     fi
-    printf '%s\n' "$pem" | trust_cnc_cert
+    # `trust anchor --store` kept a copy under a name of its own; it is removed by the certificate itself.
+    if have trust && [ -s "$CNC_CA_FILE" ] && [ "$(fp_of_pem <"$CNC_CA_FILE")" = "$want" ]; then
+        as_root trust anchor --remove "$CNC_CA_FILE" >/dev/null 2>&1 && removed=1
+    fi
+    if [ "$removed" = 1 ]; then log_success "The old CNC certificate is no longer trusted."
+    else log_info "No certificate ${want:0:16}... in the CA store; nothing to remove."; fi
 }
 
-write_headscale_config() {
-    local url="$1" base_domain="$2" host scheme port listen_addr tls_block
-    host="$(url_host "$url")"; port="$(url_port "$url")"
-    scheme="${url%%://*}"
-    if [ "$scheme" = "https" ] && is_ip "$host"; then
-        [ -n "$port" ] || port="$HS_TLS_PORT_DEFAULT"
-        listen_addr="0.0.0.0:${port}"
-        gen_self_signed "$host"
-        tls_block=$(printf 'tls_cert_path: "%s"\ntls_key_path: "%s"\ntls_letsencrypt_hostname: ""' "$HEADSCALE_CERT" "$HEADSCALE_KEY")
-    elif [ "$scheme" = "https" ]; then
-        [ -n "$port" ] || port="443"
-        listen_addr="0.0.0.0:${port}"
-        tls_block=$(printf 'tls_letsencrypt_hostname: "%s"\ntls_letsencrypt_cache_dir: %s/cache\ntls_letsencrypt_challenge_type: TLS-ALPN-01' "$host" "$HEADSCALE_LIB")
-    else
-        [ -n "$port" ] || port="8080"
-        listen_addr="0.0.0.0:${port}"
-        tls_block='tls_letsencrypt_hostname: ""'
-        log_warn "URL is not https; headscale will serve plain HTTP on :${port} (clients need an https endpoint or a TLS proxy)."
-    fi
-    as_root mkdir -p /etc/headscale "$HEADSCALE_LIB"
-    as_root tee "$HEADSCALE_CONFIG" >/dev/null <<EOF
-# Generated by connector $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# headscale's config for <url>, a DNS name whose certificate headscale gets by
+# ACME <challenge> (tls-alpn-01 | http-01). Stdout. Args: url, base_domain, challenge
+render_headscale_config() {
+    local url="$1" base_domain="$2" challenge="$3" host port acme
+    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
+    case "$challenge" in
+        tls-alpn-01) acme="tls_letsencrypt_challenge_type: TLS-ALPN-01" ;;
+        http-01)     acme="$(printf 'tls_letsencrypt_challenge_type: HTTP-01\ntls_letsencrypt_listen: ":http"')" ;;
+        *) log_error "Unknown ACME challenge '$challenge' (tls-alpn-01 or http-01)."; return 1 ;;
+    esac
+    cat <<EOF
+# Written by connector cnc-init: an edit here is replaced on its next run.
 server_url: ${url}
-listen_addr: ${listen_addr}
+listen_addr: 0.0.0.0:${port}
 metrics_listen_addr: 127.0.0.1:9090
 grpc_listen_addr: 127.0.0.1:50443
 grpc_allow_insecure: false
@@ -616,7 +576,9 @@ database:
   sqlite:
     path: ${HEADSCALE_LIB}/db.sqlite
 
-${tls_block}
+tls_letsencrypt_hostname: "${host}"
+tls_letsencrypt_cache_dir: ${HEADSCALE_LIB}/cache
+${acme}
 
 log:
   level: info
@@ -638,12 +600,20 @@ dns:
 unix_socket: /var/run/headscale/headscale.sock
 unix_socket_permission: "0770"
 EOF
+}
+
+write_headscale_config() {
+    local cfg
+    cfg="$(render_headscale_config "$1" "$2" "$3")" || return 1
+    as_root mkdir -p /etc/headscale "$HEADSCALE_LIB"
+    printf '%s\n' "$cfg" | as_root tee "$HEADSCALE_CONFIG" >/dev/null
     as_root chmod 644 "$HEADSCALE_CONFIG"
 }
 
-write_acl() {
-    as_root mkdir -p /etc/headscale
-    as_root tee "$HEADSCALE_ACL" >/dev/null <<EOF
+# The tailnet's policy: consumers reach providers, and SSH to them as a
+# non-root user. Stdout.
+render_acl() {
+    cat <<EOF
 {
   "tagOwners": {
     "tag:provider": ["${HEADSCALE_USER}@"],
@@ -662,28 +632,55 @@ write_acl() {
   ]
 }
 EOF
+}
+
+write_acl() {
+    as_root mkdir -p /etc/headscale
+    render_acl | as_root tee "$HEADSCALE_ACL" >/dev/null
     as_root chmod 644 "$HEADSCALE_ACL"
 }
 
+# Open what headscale serves on a host firewall that is already active, never
+# enabling one (lockout risk). Args: tcp port...
 open_firewall() {
-    local tcp_port="${1:-$HS_TLS_PORT_DEFAULT}" desc
-    desc="${tcp_port}/tcp, 3478/udp, 41641/udp"
+    local -a rules=() ; local p
+    for p in "$@"; do rules+=("${p}/tcp"); done
+    rules+=(3478/udp 41641/udp)
     if have ufw && as_root ufw status 2>/dev/null | grep -q "Status: active"; then
-        as_root ufw allow "${tcp_port}/tcp" >/dev/null 2>&1 || true
-        as_root ufw allow 3478/udp  >/dev/null 2>&1 || true
-        as_root ufw allow 41641/udp >/dev/null 2>&1 || true
-        log_success "ufw rules added (${desc})"
+        for p in "${rules[@]}"; do as_root ufw allow "$p" >/dev/null 2>&1 || true; done
+        log_success "ufw rules added (${rules[*]})"
     elif have firewall-cmd && as_root firewall-cmd --state >/dev/null 2>&1; then
-        as_root firewall-cmd --permanent --add-port="${tcp_port}/tcp" >/dev/null 2>&1 || true
-        as_root firewall-cmd --permanent --add-port=3478/udp  >/dev/null 2>&1 || true
-        as_root firewall-cmd --permanent --add-port=41641/udp >/dev/null 2>&1 || true
+        for p in "${rules[@]}"; do as_root firewall-cmd --permanent --add-port="$p" >/dev/null 2>&1 || true; done
         as_root firewall-cmd --reload >/dev/null 2>&1 || true
-        log_success "firewalld rules added (${desc})"
+        log_success "firewalld rules added (${rules[*]})"
     else
-        # No active host firewall (e.g. ufw inactive) - do NOT enable one (lockout risk).
         log_info "No active host firewall detected; not enabling one."
-        log_info "Ensure these are open (including any cloud firewall): ${desc}"
+        log_info "Ensure these are open (including any cloud firewall): ${rules[*]}"
     fi
+}
+
+# What else listens on TCP <port> here, other than headscale: printed, rc 0.
+# Rc 1 when nothing does (or ss cannot say).
+port_taken_by_other() {
+    local line
+    have ss || return 1
+    line="$(as_root ss -ltnpH "sport = :${1}" 2>/dev/null | awk '!/"headscale"/ && !seen { print; seen = 1 }')"
+    [ -n "$line" ] || return 1
+    printf '%s\n' "$line"
+}
+
+# Does <host> resolve to an address of this machine? Let's Encrypt validates
+# whatever it resolves to. Says what it found when not.
+name_points_here() {
+    local host="$1" addrs mine a
+    addrs="$(getent ahosts "$host" 2>/dev/null | awk '{ print $1 }' | sort -u)"
+    [ -n "$addrs" ] || { log_warn "${host} does not resolve: Let's Encrypt cannot validate it."; return 1; }
+    mine="$(ip -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }')"
+    for a in $addrs; do
+        case $'\n'"$mine"$'\n' in *$'\n'"$a"$'\n'*) return 0 ;; esac
+    done
+    log_warn "${host} resolves to ${addrs//$'\n'/ } -- none of them this machine's; Let's Encrypt validates there."
+    return 1
 }
 
 ensure_headscale_user() {
@@ -697,34 +694,40 @@ ensure_headscale_user() {
 }
 
 cnc_init_local() {
-    local url="$1" base_domain="$2"
+    local url="$1" base_domain="$2" challenge="${3:-$HS_ACME_DEFAULT}"
     require_root cnc-init
-    [ -n "$url" ] || die "Usage: connector cnc-init --url https://<host-or-ip>[:port]"
+    [ -n "$url" ] || die "Usage: connector cnc-init --url https://<name>[:port] [--acme tls-alpn-01|http-01]"
+    cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
     [ -n "$base_domain" ] || base_domain="connector.mesh"
+
+    local host port p taken
+    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
+    case "$challenge" in
+        tls-alpn-01) [ "$port" = 443 ] || die "tls-alpn-01 is answered on :443: serve on :443, or use --acme http-01 to serve on :${port}." ;;
+        http-01) ;;
+        *) die "Unknown --acme '$challenge' (tls-alpn-01 or http-01)." ;;
+    esac
+    # headscale would fail to bind, and the mesh would lose its control plane.
+    for p in "$port" $([ "$challenge" = http-01 ] && echo 80); do
+        if taken="$(port_taken_by_other "$p")"; then
+            die "Something else listens on :${p} here: ${taken} -- free it, or for :443 use --acme http-01 with another port in --url."
+        fi
+    done
+    name_points_here "$host" || confirm "Continue anyway?" || die "Point ${host}'s A record at this machine, then re-run."
 
     install_self_local        # ensure 'connector' + 'con' are on PATH on the CNC
 
-    local host port self_signed=0
-    host="$(url_host "$url")"; port="$(url_port "$url")"
-    if [ "${url%%://*}" = "https" ] && is_ip "$host"; then
-        self_signed=1
-        # No domain -> headscale serves its own TLS on a dedicated port (default 8443),
-        # so it never collides with anything already on :443.
-        if [ -z "$port" ]; then port="$HS_TLS_PORT_DEFAULT"; url="https://${host}:${port}"; fi
-    fi
-
-    log_info "Initialising CNC (headscale) for ${url}"
-    [ "$self_signed" = 1 ] && log_info "TLS: self-signed cert pinned to ${host} (no domain needed)."
+    log_info "Initialising CNC (headscale) for ${url}: Let's Encrypt, ${challenge}"
     have curl || as_root apt-get install -y curl >/dev/null 2>&1 || true
     install_headscale
-    write_headscale_config "$url" "$base_domain"
+    write_headscale_config "$url" "$base_domain" "$challenge"
     write_acl
     log_info "Enabling + starting headscale..."
     as_root systemctl enable headscale >/dev/null 2>&1 || true
     as_root systemctl restart headscale
     sleep 2
     ensure_headscale_user
-    open_firewall "${port:-$HS_TLS_PORT_DEFAULT}"
+    if [ "$challenge" = http-01 ]; then open_firewall "$port" 80; else open_firewall "$port"; fi
 
     echo
     if as_root systemctl is-active --quiet headscale; then
@@ -732,28 +735,29 @@ cnc_init_local() {
     else
         log_warn "headscale is not active yet - check: journalctl -u headscale -e"
     fi
-    if [ "$self_signed" = 1 ]; then
-        echo "  CNC cert SHA-256: $(cnc_cert_fingerprint 2>/dev/null || echo '?')"
-    fi
+    echo "Let's Encrypt issues ${host}'s certificate on the first connection (journalctl -u headscale -f)."
     echo "Next: authorize a machine:  connector invite"
 }
 
 # --- cnc-init dispatcher + remote orchestration + link ----------------------
 cmd_cnc_init() {
-    local host="" url="" port="" base_domain=""
+    local host="" url="" port="" base_domain="" acme="$HS_ACME_DEFAULT" reinit=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --url)         url="$2"; shift 2 ;;
             --base-domain) base_domain="$2"; shift 2 ;;
+            --acme)        acme="$2"; shift 2 ;;
+            --reinit)      reinit=1; shift ;;
             -p|--port)     port="$2"; shift 2 ;;
             -*) die "Unknown option: $1" ;;
             *) [ -z "$host" ] && host="$1" || die "Unexpected argument: $1"; shift ;;
         esac
     done
+    case "$acme" in tls-alpn-01|http-01) ;; *) die "Unknown --acme '$acme' (tls-alpn-01 or http-01)." ;; esac
     if [ -n "$host" ]; then
-        cnc_init_remote "$host" "$url" "$port"
+        cnc_init_remote "$host" "$url" "$port" "$acme" "$reinit"
     else
-        cnc_init_local "$url" "$base_domain"
+        cnc_init_local "$url" "$base_domain" "$acme"
     fi
 }
 
@@ -810,7 +814,7 @@ check_cnc_reachable() {
 }
 
 cnc_init_remote() {
-    local host="$1" url="$2" port="$3" sshflag scpflag self configured=0
+    local host="$1" url="$2" port="$3" acme="${4:-$HS_ACME_DEFAULT}" reinit="${5:-0}" sshflag scpflag self configured=0
     have ssh || die "ssh not found"; have scp || die "scp not found"
     sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
     scpflag="$([ -n "$port" ] && echo "-P $port" || true)"
@@ -829,29 +833,24 @@ cnc_init_remote() {
         configured=1
     fi
 
-    # Determine the server URL: explicit --url, else the remote's existing one,
-    # else derive an IP from your SSH config (HostName) + default TLS port.
-    if [ -z "$url" ]; then
-        if [ "$configured" = 1 ]; then
-            # shellcheck disable=SC2086
-            url="$(ssh $sshflag "$host" "${rsudo}sed -n 's/^server_url:[[:space:]]*//p' /etc/headscale/config.yaml 2>/dev/null | head -n1" | tr -d '\r')"
-        fi
-        if [ -z "$url" ]; then
-            local ip; ip="$(ssh_resolved_host "$host")"
-            [ -n "$ip" ] || die "Could not resolve an address for '$host'; pass --url https://<ip>:${HS_TLS_PORT_DEFAULT}"
-            url="https://${ip}:${HS_TLS_PORT_DEFAULT}"
-            log_info "No --url given; using ${url} (resolved from your SSH config for '$host')."
-        fi
-    fi
-    # Normalise an IP CNC without a port so the saved link matches the listener.
-    if [ "${url%%://*}" = "https" ]; then
-        local uh up; uh="$(url_host "$url")"; up="$(url_port "$url")"
-        if is_ip "$uh" && [ -z "$up" ]; then url="https://${uh}:${HS_TLS_PORT_DEFAULT}"; fi
-    fi
-
+    # The server URL: --url, else the one the CNC already serves -- a DNS name
+    # either way (cnc_url_ok); a CNC still on a bare IP needs --url to move.
+    local existing=""
     if [ "$configured" = 1 ]; then
-        log_info "CNC already configured on $host; skipping install."
+        # shellcheck disable=SC2086
+        existing="$(ssh $sshflag "$host" "${rsudo}sed -n 's/^server_url:[[:space:]]*//p' /etc/headscale/config.yaml 2>/dev/null | head -n1" | tr -d '\r')"
+    fi
+    [ -n "$url" ] || url="$existing"
+    [ -n "$url" ] || die "Pass the CNC's name: --url https://<name> (an A record pointing at $host)."
+    cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
+
+    if [ "$configured" = 1 ] && [ "$url" = "$existing" ] && [ "$reinit" = 0 ]; then
+        log_info "CNC already configured on $host at ${url}; skipping install (--reinit applies this connector to it)."
     else
+        if [ "$configured" = 1 ] && [ "$url" != "$existing" ]; then
+            log_warn "This moves the CNC from ${existing} to ${url}: every node then has to follow it there."
+            confirm "Move the CNC to ${url}?" || die "Declined."
+        fi
         log_info "Copying connector to $host and running cnc-init..."
         self="$(self_path)"
         # shellcheck disable=SC2086
@@ -859,7 +858,7 @@ cnc_init_remote() {
         # shellcheck disable=SC2086
         ssh $sshflag "$host" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$"
         # shellcheck disable=SC2086
-        ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url'" || die "Remote cnc-init failed"
+        ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url' --acme '$acme'" || die "Remote cnc-init failed"
     fi
 
     save_cnc_link "$host" "$url" "$port"
@@ -900,6 +899,7 @@ cmd_link() {
         esac
     done
     [ -n "$host" ] && [ -n "$url" ] || die "Usage: connector link <user@host> --url https://vpn.example.com [-p port]"
+    cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
     sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
     log_info "Verifying CNC at $host..."
     # shellcheck disable=SC2086
@@ -1105,20 +1105,16 @@ cmd_invite() {
     fi
 
     if [ "${#types[@]}" -gt 0 ]; then
-        local roles url key hostarg="" pinarg="" fp
+        local roles url key hostarg=""
         roles="$(parse_node_roles "$(IFS=,; echo "${types[*]}")")"
         url="$(cnc_server_url)"; [ -n "$url" ] || url="<server-url>"
         key="$(mint_key "$roles")"
         [ -n "$name" ] && hostarg=" --hostname $name"
-        if is_ip "$(url_host "$url")"; then
-            fp="$(cnc_cert_fingerprint 2>/dev/null || true)"
-            [ -n "$fp" ] && pinarg=" --ca-sha256 ${fp}"
-        fi
         echo
         log_success "Single-use invite created (roles: ${roles}, expires in ${KEY_EXPIRY})."
         echo "Run this on the new machine:"
         echo
-        echo "    connector register ${roles} ${url} --authkey ${key}${pinarg}${hostarg}"
+        echo "    connector register ${roles} ${url} --authkey ${key}${hostarg}"
         echo
     fi
 }
@@ -1406,14 +1402,14 @@ install_self_local() {
 cmd_register() {
     local roles
     roles="$(parse_node_roles "${1:-}")"
-    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY] [--ca-sha256 FP] [--hostname N] [--tailscale app|oss] [--yes]"
+    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY] [--hostname N] [--tailscale app|oss] [--yes]"
     shift || true
-    local url="" key="" hostname="" pin="" ts_variant=""
+    local url="" key="" hostname="" ts_variant=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --authkey)   key="$2"; shift 2 ;;
             --hostname)  hostname="$2"; shift 2 ;;
-            --ca-sha256) pin="$(printf '%s' "$2" | tr 'A-F' 'a-f' | tr -d ': ')"; shift 2 ;;
+            --ca-sha256) die "--ca-sha256 is gone: the CNC is a DNS name with a public certificate, and connector installs no trust root. Ask your admin for a fresh invite." ;;
             --tailscale) ts_variant="$2"; shift 2 ;;
             --yes|-y)    ASSUME_YES=1; shift ;;
             -*) die "Unknown option: $1" ;;
@@ -1425,8 +1421,8 @@ cmd_register() {
     # On Linux, make sure the join flow's tools are present (prompt to install).
     [ "$(os_kind)" = "linux" ] && ensure_deps curl openssl
 
-    # Trust the CNC's self-signed cert (only for IP CNCs; no-op for domain CNCs).
-    establish_cnc_trust "$url" "$pin"
+    # A DNS name with a public certificate: nothing to trust, and nothing installed.
+    cnc_url_ok "$url" || die "Ask your admin for the CNC's https://<name> (a fresh invite)."
 
     if [ "$(os_kind)" = "macos" ]; then
         register_macos "$roles" "$url" "$key" "$hostname" "$ts_variant"
@@ -1435,15 +1431,6 @@ cmd_register() {
 
     ensure_wsl_systemd || return 0
     install_tailscale
-    # tailscaled caches the system CA pool at startup; if it is already running,
-    # restart it so a freshly-trusted CNC cert is picked up before we connect
-    # (otherwise the control-plane TLS handshake hangs on a self-signed CNC).
-    if [ "${url%%://*}" = "https" ] && is_ip "$(url_host "$url")" \
-        && have systemctl && systemctl is-active --quiet tailscaled 2>/dev/null; then
-        log_info "Restarting tailscaled to load the CNC certificate..."
-        as_root systemctl restart tailscaled 2>/dev/null || true
-        sleep 1
-    fi
     [ -n "$hostname" ] || hostname="$(node_name)"
 
     local tags ssh_flag=""
@@ -2140,11 +2127,9 @@ cmd_cleanup() {
         fi
     fi
     rm -f "$ROLE_FILE"
-    # Remove the trusted self-signed CNC cert, if we installed one.
+    # An older connector's trusted CNC certificate: that one, by its fingerprint.
     if [ -s "$CNC_CA_FILE" ]; then
-        local cn; cn="$(openssl x509 -in "$CNC_CA_FILE" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -n1)"
-        untrust_cnc_cert "$cn"
-        log_info "Removed the trusted CNC certificate."
+        untrust_cert_sha256 "$(fp_of_pem <"$CNC_CA_FILE")" && rm -f "$CNC_CA_FILE"
     fi
     if is_manager && confirm "Also forget the linked CNC?"; then
         rm -f "$CNC_LINK_FILE"; log_success "Forgot CNC link."
@@ -2191,12 +2176,16 @@ connector v${VERSION} - headscale/tailscale mesh manager
 This machine: $(current_roles)
 
 SETUP
-  cnc-init [user@host] [--url https://HOST[:PORT]] [-p SSH_PORT]
-                       Set up the CNC (headscale). With user@host it runs
-                       remotely over SSH and links this PC as a manager.
-                       No domain needed: with a bare IP it self-signs TLS on
-                       :${HS_TLS_PORT_DEFAULT} and pins the cert on clients. If --url is omitted
-                       for a remote, the IP is taken from your SSH config.
+  cnc-init [user@host] --url https://NAME[:PORT] [--acme tls-alpn-01|http-01]
+           [--reinit] [-p SSH_PORT]
+                       Set up the CNC (headscale) on a DNS name: headscale gets
+                       NAME's certificate from Let's Encrypt (tls-alpn-01 on
+                       :443, the default; or http-01 on :80, for another port)
+                       and renews it itself; nodes install no trust root. With
+                       user@host it runs remotely over SSH and links this PC as
+                       a manager; a CNC already set up keeps its URL unless
+                       --url names another (then every node must follow), and
+                       --reinit re-applies this connector.
   link <user@host> --url https://HOST[:PORT] [-p SSH_PORT]
                        Attach to an existing CNC (become a manager).
   cnc-update           [manager] Push this machine's connector script to
@@ -2216,13 +2205,12 @@ ONBOARD                [admin: run on the CNC or a linked manager]
                        (roles comma-separated, e.g. provider,consumer).
 
 JOIN
-  register <roles> <url> [--authkey KEY] [--ca-sha256 FP]
-           [--hostname N] [--tailscale app|oss] [--yes]
+  register <roles> <url> [--authkey KEY] [--hostname N] [--tailscale app|oss] [--yes]
                        roles is comma-separated: provider[,consumer].
                        Join the tailnet (just paste the command 'invite' prints).
-                       Auto-handles WSL systemd (asks first), trusts a self-signed
-                       CNC cert (pinned via --ca-sha256), and on macOS auto-detects
-                       the GUI app or open-source tailscaled (override: --tailscale).
+                       Auto-handles WSL systemd (asks first), and on macOS
+                       auto-detects the GUI app or open-source tailscaled
+                       (override: --tailscale).
 
 USE
   status               Roles + tailscale/headscale status.
@@ -2247,10 +2235,9 @@ USE
   help                 This help.
 
 Examples
-  connector cnc-init root@203.0.113.1            # no domain; self-signs TLS on :${HS_TLS_PORT_DEFAULT}
-  connector cnc-init root@203.0.113.1 --url https://vpn.example.com   # with a domain
+  connector cnc-init root@203.0.113.1 --url https://vpn.example.com   # its A record -> 203.0.113.1
   connector invite consumer
-  connector register consumer https://203.0.113.1:${HS_TLS_PORT_DEFAULT} --authkey hskey-xxxx --ca-sha256 ab12...
+  connector register consumer https://vpn.example.com --authkey hskey-xxxx
   connector hop my-laptop
   connector hop -t my-laptop work                # persistent tmux session 'work'
 EOF
