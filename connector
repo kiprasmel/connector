@@ -10,6 +10,7 @@ HEADSCALE_CONFIG="/etc/headscale/config.yaml"
 HEADSCALE_ACL="/etc/headscale/acl.hujson"         # what headscale reads: composed (write_acl)
 HEADSCALE_ACL_SITE="/etc/headscale/acl.site.json"  # the site's own rules: never overwritten
 HEADSCALE_OPS_USER="ops"                           # operators' machines: untagged, this user's
+HEADSCALE_BACKUP_RECIPIENTS="/etc/headscale/backup.recipients"  # public keys a backup is encrypted to
 HEADSCALE_LIB="/var/lib/headscale"
 HEADSCALE_BIN="/usr/local/bin/headscale"
 # headscale, pinned: a release is this version and the sha256 of each artifact
@@ -47,7 +48,7 @@ TS_INSTALL_URL="https://tailscale.com/install.sh"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
-    cnc-init cnc-update propagate-update link invite manager-key commander-key register migrate-cnc prod-key approve list ls revoke
+    cnc-init cnc-update propagate-update link invite manager-key commander-key register migrate-cnc prod-key backup restore backup-stream restore-stream approve list ls revoke
     status whoami hop ssh tmux cnc alias cleanup cleanup-cnc help --help -h
 )
 
@@ -1781,6 +1782,144 @@ cmd_migrate_cnc() {
     log_success "Migrated to ${url}."
 }
 
+# --- Backup / restore --------------------------------------------------------
+# The CNC's state -- headscale's database (a consistent copy), its noise and
+# DERP keys, the Let's Encrypt cache, its config, policy and the site's rules
+# -- as a tar encrypted with age to public keys alone (age1... or an SSH
+# ed25519 key): the private half never needs to be on the CNC. A restore is
+# decrypted where that private half is (the admin's machine) and streamed to
+# the CNC over SSH.
+
+# Is <r> a public key a backup may be encrypted to?
+backup_recipient_ok() {
+    [[ "$1" =~ ^age1[0-9a-z]{58}$ || "$1" =~ ^ssh-ed25519\ AAAA[A-Za-z0-9+/]+=*(\ .*)?$ ]]
+}
+
+# On the CNC, as root: the encrypted archive to stdout. Args: recipient...
+backup_stream_local() {
+    local tmp r f
+    require_root backup
+    have age || pkg_install age >/dev/null 2>&1 || die "age encrypts the backup: apt-get install age"
+    have sqlite3 || pkg_install sqlite3 >/dev/null 2>&1 || die "sqlite3 copies the database: apt-get install sqlite3"
+    tmp="$(mktemp -d)"
+    { if [ -s "$HEADSCALE_BACKUP_RECIPIENTS" ]; then grep -v '^[[:space:]]*#' "$HEADSCALE_BACKUP_RECIPIENTS"; fi
+      for r in "$@"; do printf '%s\n' "$r"; done; } | awk 'NF' >"$tmp/recipients"
+    [ -s "$tmp/recipients" ] || { rm -rf "$tmp"; die "No recipient: pass --recipient <age1...|ssh-ed25519 ...> (a key whose private half is not on this machine), or list them in ${HEADSCALE_BACKUP_RECIPIENTS}."; }
+    while IFS= read -r r; do
+        backup_recipient_ok "$r" || { rm -rf "$tmp"; die "Not a recipient (age1... or ssh-ed25519): ${r:0:24}..."; }
+    done <"$tmp/recipients"
+    mkdir -p "$tmp/state${HEADSCALE_LIB}" "$tmp/state/etc/headscale"
+    [ -f "$HEADSCALE_LIB/db.sqlite" ] || { rm -rf "$tmp"; die "No headscale database at $HEADSCALE_LIB/db.sqlite."; }
+    sqlite3 "$HEADSCALE_LIB/db.sqlite" ".backup '$tmp/state${HEADSCALE_LIB}/db.sqlite'" \
+        || { rm -rf "$tmp"; die "Could not copy the database."; }
+    for f in noise_private.key derp_server_private.key cache certs; do
+        [ ! -e "$HEADSCALE_LIB/$f" ] || cp -a "$HEADSCALE_LIB/$f" "$tmp/state${HEADSCALE_LIB}/"
+    done
+    for f in "$HEADSCALE_CONFIG" "$HEADSCALE_ACL" "$HEADSCALE_ACL_SITE" "$HEADSCALE_BACKUP_RECIPIENTS"; do
+        [ ! -e "$f" ] || cp -a "$f" "$tmp/state/etc/headscale/"
+    done
+    tar -C "$tmp/state" -cf - . | age -R "$tmp/recipients"
+    local rc=$?
+    rm -rf "$tmp"
+    return "$rc"
+}
+
+cmd_backup() {
+    local out="" r sudo="sudo "
+    local -a rcpts=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --out)       out="$2"; shift 2 ;;
+            --recipient) rcpts+=("$2"); shift 2 ;;
+            *) die "Usage: connector backup [--out FILE] [--recipient <age1...|ssh-ed25519 ...>]..." ;;
+        esac
+    done
+    for r in "${rcpts[@]+"${rcpts[@]}"}"; do backup_recipient_ok "$r" || die "Not a recipient (age1... or ssh-ed25519): ${r:0:24}..."; done
+    [ -n "$out" ] || [ ! -t 1 ] || out="headscale-$(date -u +%Y%m%dT%H%M%SZ).tar.age"
+    [ -z "$out" ] || [ ! -e "$out" ] || die "$out exists: a backup goes into a new file only."
+    if is_cnc; then
+        set -- backup_stream_local "${rcpts[@]+"${rcpts[@]}"}"
+    elif is_manager; then
+        load_cnc_link
+        [ "$CNC_USER" != root ] || sudo=""
+        set -- ssh_cnc "${sudo}${CONNECTOR_BIN} backup-stream $(printf '%q ' "${rcpts[@]+"${rcpts[@]}"}")"
+    else
+        die "Only a CNC or manager takes a backup."
+    fi
+    if [ -z "$out" ]; then "$@"; return; fi
+    ( umask 077; set -o noclobber; "$@" >"$out" ) || { rm -f "$out"; die "The backup failed; nothing kept."; }
+    [ "$(head -c 21 "$out")" = "age-encryption.org/v1" ] || { rm -f "$out"; die "That is not an encrypted backup; nothing kept."; }
+    log_success "Backup: $out ($(wc -c <"$out" | tr -d ' ') bytes, 0600), encrypted to its recipients alone."
+}
+
+# On the CNC, as root: a decrypted backup (a tar) on stdin put in place. The
+# state before is kept aside, and put back when headscale cannot run what
+# was restored.
+restore_stream_local() {
+    local stage aside bad f managed
+    require_root restore
+    managed="${HEADSCALE_CONFIG##*/} ${HEADSCALE_ACL##*/} ${HEADSCALE_ACL_SITE##*/} ${HEADSCALE_BACKUP_RECIPIENTS##*/}"
+    stage="$(mktemp -d)"
+    cat >"$stage/backup.tar" || die "Could not read the backup."
+    [ -s "$stage/backup.tar" ] || { rm -rf "$stage"; die "No backup came (could it be decrypted?); nothing changed."; }
+    # what a backup holds and nothing else: files and directories under the
+    # two places, no link of either kind, no ..
+    bad="$(tar -tvf "$stage/backup.tar" 2>/dev/null | awk '
+        $1 !~ /^[-d]/ || / link to / || $6 ~ /\.\./ { print; next }
+        $6 ~ /^\.\/(var\/lib\/headscale|etc\/headscale)(\/|$)/ { next }
+        $6 == "./" || $6 == "./var/" || $6 == "./var/lib/" || $6 == "./etc/" { next }
+        { print }')"
+    [ -z "$bad" ] || { rm -rf "$stage"; die "Not a backup connector made; refused: $(printf '%s\n' "$bad" | awk 'NR == 1')"; }
+    { mkdir "$stage/x" && tar -C "$stage/x" -xf "$stage/backup.tar"; } || { rm -rf "$stage"; die "Not a backup."; }
+    [ -f "$stage/x${HEADSCALE_LIB}/db.sqlite" ] && [ -f "$stage/x$HEADSCALE_CONFIG" ] \
+        || { rm -rf "$stage"; die "Not a headscale backup (no database, or no config)."; }
+    aside="${HEADSCALE_LIB}.before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+    systemctl stop headscale 2>/dev/null || true
+    { mv "$HEADSCALE_LIB" "$aside" && mkdir -p "$aside/etc" "$HEADSCALE_LIB"; } || die "Could not set the state aside."
+    for f in $managed; do [ ! -e "/etc/headscale/$f" ] || cp -a "/etc/headscale/$f" "$aside/etc/"; done
+    cp -a "$stage/x${HEADSCALE_LIB}/." "$HEADSCALE_LIB/"
+    for f in $managed; do
+        rm -f "/etc/headscale/${f:?}"
+        [ ! -e "$stage/x/etc/headscale/$f" ] || cp -a "$stage/x/etc/headscale/$f" /etc/headscale/
+    done
+    ! id headscale >/dev/null 2>&1 || chown -R headscale:headscale "$HEADSCALE_LIB"
+    rm -rf "$stage"
+    if ! headscale configtest >/dev/null 2>&1; then
+        for f in $managed; do
+            rm -f "/etc/headscale/${f:?}"
+            [ ! -e "$aside/etc/$f" ] || cp -a "$aside/etc/$f" /etc/headscale/
+        done
+        rm -rf "${aside:?}/etc" "${HEADSCALE_LIB:?}" && mv "$aside" "$HEADSCALE_LIB"
+        systemctl start headscale 2>/dev/null || true
+        die "headscale cannot run what was restored; the state before is back in place."
+    fi
+    systemctl start headscale 2>/dev/null || true
+    log_success "Restored. The state before is in ${aside}."
+}
+
+cmd_restore() {
+    local file="" identity="" sudo="sudo "
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --identity) identity="$2"; shift 2 ;;
+            --yes|-y)   ASSUME_YES=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) if [ -z "$file" ]; then file="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+    [ -f "$file" ] && [ -f "$identity" ] || die "Usage: connector restore <backup.tar.age> --identity <age or ssh private key file> [--yes]"
+    have age || die "age decrypts the backup: install it here (brew install age / apt-get install age)."
+    is_admin || die "Only a CNC or manager restores the CNC."
+    confirm "Replace the CNC's headscale state with ${file}'s? (the state now is kept aside)" || die "Declined."
+    if is_cnc; then
+        age -d -i "$identity" "$file" | restore_stream_local
+    else
+        load_cnc_link
+        [ "$CNC_USER" != root ] || sudo=""
+        age -d -i "$identity" "$file" | ssh_cnc "${sudo}${CONNECTOR_BIN} restore-stream"
+    fi
+}
+
 # --- Admin: list / approve / revoke -----------------------------------------
 cmd_list() {
     is_admin || die "Only a CNC or manager can list nodes."
@@ -2562,6 +2701,15 @@ USE
                        attaches strictly), -l lists, -k [name] kills.
   alias <name> <user@name> | alias list | alias rm <name>
                        Save an SSH shortcut (optionally writes ~/.ssh/config).
+  backup [--out FILE] [--recipient <age1...|ssh-ed25519 ...>]...
+                       [admin] The CNC's state (headscale's database, keys,
+                       certificate cache, config and policy), encrypted on the
+                       CNC to public keys alone (and those listed in
+                       /etc/headscale/backup.recipients), into a new 0600 file.
+  restore <backup.tar.age> --identity <private key file> [--yes]
+                       [admin] Decrypt here, where the private key is, and put
+                       the state in place on the CNC: the state before is kept
+                       aside, and back if headscale cannot run what came.
   cleanup              Disconnect this machine from the tailnet.
   cleanup-cnc          [admin] Delete all nodes + stop headscale.
   help                 This help.
@@ -2617,6 +2765,10 @@ main() {
         register)       cmd_register "$@" ;;
         migrate-cnc)    cmd_migrate_cnc "$@" ;;
         prod-key)       cmd_prod_key "$@" ;;
+        backup)         cmd_backup "$@" ;;
+        restore)        cmd_restore "$@" ;;
+        backup-stream)  backup_stream_local "$@" ;;     # over SSH, from a manager's backup
+        restore-stream) restore_stream_local "$@" ;;    # over SSH, from a manager's restore
         approve)        cmd_approve "$@" ;;
         list|ls)        cmd_list "$@" ;;
         revoke)         cmd_revoke "$@" ;;

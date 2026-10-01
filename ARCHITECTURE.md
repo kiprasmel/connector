@@ -243,6 +243,33 @@ one name to another), and every node follows it:
 4. **Last**: once every node has followed, remove the old certificate from
    the CNC (`/var/lib/headscale/certs/`).
 
+## Backups
+
+```
+connector backup --recipient age1...            # a manager: a new 0600 headscale-<UTC>.tar.age here
+connector restore headscale-<UTC>.tar.age --identity ~/.config/age/admin.key
+```
+
+A backup is the CNC's state -- headscale's database (a consistent copy,
+`sqlite3 .backup`, taken while it runs), its noise and DERP keys (the
+server's identity to every node), the Let's Encrypt cache, its config,
+policy and the site's rules -- as a tar encrypted **on the CNC** with `age` to
+public keys alone: `--recipient` (an `age1…` key or an `ssh-ed25519` one) and
+those listed in `/etc/headscale/backup.recipients`. The private half never
+needs to be on the CNC, and a secret key passed by mistake is refused. From a
+manager it streams over SSH into a new 0600 file (never over one, and only if
+what came is an age file); schedule it from the admin's machine (cron, say)
+for copies off the CNC.
+
+A restore is decrypted where the private key is -- the admin's machine -- and
+streamed to the CNC over SSH. The CNC takes only what a backup holds (files
+and directories under `/var/lib/headscale` and `/etc/headscale`, no link, no
+`..`), stops headscale, keeps its current state aside
+(`/var/lib/headscale.before-restore-<UTC>`, its `/etc/headscale` files in
+`etc/` within), puts the backup's in place and starts headscale only if
+`headscale configtest` takes it -- otherwise the state before is put back and
+started. A fresh CNC restores the same way after `cnc-init` (same name).
+
 ## The headscale release
 
 connector installs one headscale release, pinned in the script:
@@ -253,8 +280,8 @@ puts it in over an older one; a headscale newer than the pin is never
 downgraded -- its database has moved on. A release is a pin bump: the version
 and the sha256s from the release's `checksums.txt`, each artifact hashed
 again, and the docker tier's image (`test/helpers.bash`) at the same version.
-Read headscale's upgrade notes for every minor release in between, and copy
-`/var/lib/headscale` first.
+Read headscale's upgrade notes for every minor release in between, and take
+a backup first (`connector backup`).
 
 ## WSL specifics (auto-handled)
 
@@ -283,6 +310,7 @@ If both are present it asks which to use; if neither, it asks which to install
 | `/etc/headscale/config.yaml`           | CNC: headscale config (written by `cnc-init`) |
 | `/etc/headscale/acl.hujson`            | CNC: the policy headscale reads (composed) |
 | `/etc/headscale/acl.site.json`         | CNC: the site's own rules (never overwritten) |
+| `/etc/headscale/backup.recipients`     | CNC: public keys a backup is encrypted to (optional) |
 | `/var/lib/headscale/`                  | CNC: keys + sqlite DB                      |
 | `/var/lib/headscale/cache/`            | CNC: headscale's Let's Encrypt account + certificate |
 | `/var/lib/headscale/certs/`            | CNC: an older connector's self-signed `cnc.crt` (until removed) |
