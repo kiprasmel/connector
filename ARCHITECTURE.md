@@ -49,6 +49,11 @@ an ops machine and keeps reaching providers. What that relies on:
 - prod keys are minted by `prod-key` alone, and reach a machine on stdin;
 - the CNC's state has an encrypted backup whose private key is not on it,
   taken every day (`backup-schedule`);
+- the CNC's own host is held by codespace's provisioning, as any prod host is
+  (`cnc host provision --role headscale`, codespace-cloud's docs/nodes.md, "The
+  tailnet's own host"): its firewall lets headscale's ports in from anyone and
+  ssh from the tailnet alone, sshd takes a named admin's keys from the tailnet,
+  and it patches itself, rebooting for a kernel at 04:30.
 
 **Exit criterion.** This mesh has one admin. The day connector gets a second
 admin, or users from outside, prod moves to a headscale of its own: the
@@ -398,7 +403,10 @@ CNC. Everything else is read live from headscale/tailscale.
 `cnc-init` does **not** enable a host firewall (lockout risk). It opens these
 ports only on an already-active ufw/firewalld, and after a remote `cnc-init` it
 probes the control port from your machine and **asks** you to open any cloud
-firewall (e.g. DigitalOcean) if it's unreachable.
+firewall (e.g. DigitalOcean) if it's unreachable. The prod CNC's host
+firewall, and DigitalOcean's in front of it, are codespace's (`cnc host
+provision --role headscale`; `providers/digitalocean.sh --role headscale`):
+these ports from anyone, ssh from the tailnet alone.
 
 ## Migration from the old WireGuard connector
 
