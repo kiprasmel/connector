@@ -47,7 +47,7 @@ TS_INSTALL_URL="https://tailscale.com/install.sh"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
-    cnc-init cnc-update propagate-update link invite manager-key commander-key register migrate-cnc approve list ls revoke
+    cnc-init cnc-update propagate-update link invite manager-key commander-key register migrate-cnc prod-key approve list ls revoke
     status whoami hop ssh tmux cnc alias cleanup cleanup-cnc help --help -h
 )
 
@@ -265,6 +265,7 @@ parse_node_roles() {
             consumer) c=1 ;;
             both)     p=1; c=1 ;;
             ops)      o=1 ;;
+            prod|tag:*) die "A prod machine is not tagged through connector's roles: its key comes from 'connector prod-key' alone." ;;
             *) die "Invalid role: '$tok' (expected provider and/or consumer, or ops)" ;;
         esac
     done
@@ -1220,6 +1221,40 @@ mint_key() {
     printf '%s\n' "$key"
 }
 
+# --- Prod keys ---------------------------------------------------------------
+# A prod machine (cnc, a node) joins the admin tailnet as tag:prod, and its
+# key is minted here alone: single-use, tag:prod and nothing else, expiring
+# within the hour, the operators' (tagOwners). It goes to stdout -- for a
+# pipe into that machine's join, which reads it on stdin and never puts it on
+# an argv -- or into a new 0600 file. invite and approve refuse prod.
+cmd_prod_key() {
+    local out="" expiry="$KEY_EXPIRY" uid json key
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --out)        out="$2"; shift 2 ;;
+            --expiration) expiry="$2"; shift 2 ;;
+            --yes|-y)     ASSUME_YES=1; shift ;;
+            *) die "Usage: connector prod-key [--out FILE] [--expiration 10m..1h] [--yes]" ;;
+        esac
+    done
+    is_admin || die "Only a CNC or manager mints a prod key."
+    [[ "$expiry" =~ ^([1-9]|[1-5][0-9])m$|^60m$|^1h$ ]] || die "A prod key lives an hour at most (--expiration 1m..60m or 1h), not '$expiry'."
+    [ -z "$out" ] || [ ! -e "$out" ] || die "$out exists: a prod key goes into a new file only."
+    confirm "Mint a single-use tag:prod key, expiring in ${expiry}?" || die "Declined."
+    uid="$(hs_user_id "$HEADSCALE_OPS_USER" 2>/dev/null || true)"
+    [ -n "$uid" ] || die "Could not resolve headscale user '$HEADSCALE_OPS_USER' on the CNC."
+    json="$(hs preauthkeys create --user "$uid" --tags tag:prod --expiration "$expiry" --output json 2>/dev/null)" \
+        || die "Failed to create the prod key on the CNC."
+    key="$(printf '%s' "$json" | json_str key)"
+    [ -n "$key" ] || die "Could not parse the prod key from headscale's output."
+    if [ -n "$out" ]; then
+        ( umask 077; set -o noclobber; printf '%s\n' "$key" >"$out" ) || die "Could not write $out."
+        log_success "Wrote a single-use tag:prod key to $out (0600); it expires in ${expiry}." >&2
+    else
+        printf '%s\n' "$key"
+    fi
+}
+
 cmd_invite() {
     is_admin || die "Only a CNC or manager can invite. Link one: connector link <host> --url ..."
     # Roles may be given comma- or space-separated, e.g. 'provider,consumer'.
@@ -1233,6 +1268,7 @@ cmd_invite() {
             both)     types+=("provider"); types+=("consumer") ;;
             ops)      types+=("ops") ;;
             manager|controller|commander) want_manager=1 ;;
+            prod|tag:*|--tags*) die "A prod machine is not invited: its key comes from 'connector prod-key' alone." ;;
             *) name="$tok" ;;
         esac
     done
@@ -2477,7 +2513,14 @@ ONBOARD                [admin: run on the CNC or a linked manager]
                        reaches prod on ssh and https). No args -> menu.
                        Mints a single-use key and prints the register command;
                        with --migrate, the migrate-cnc command a node already
-                       registered follows the CNC to its new name with.
+                       registered follows the CNC to its new name with. A prod
+                       machine is never invited (see prod-key).
+  prod-key [--out FILE] [--expiration 1m..60m|1h] [--yes]
+                       Mint the key a prod machine (cnc, a node) joins with:
+                       single-use, tag:prod and nothing else, expiring within
+                       the hour. stdout carries the key alone -- pipe it into
+                       that machine's join, which reads it on stdin -- or
+                       --out writes a new 0600 file.
   manager-key          Print this machine's SSH public key (for a
                        'manager' invite).
   approve [node] [roles]
@@ -2573,6 +2616,7 @@ main() {
         manager-key|commander-key)  cmd_manager_key "$@" ;;
         register)       cmd_register "$@" ;;
         migrate-cnc)    cmd_migrate_cnc "$@" ;;
+        prod-key)       cmd_prod_key "$@" ;;
         approve)        cmd_approve "$@" ;;
         list|ls)        cmd_list "$@" ;;
         revoke)         cmd_revoke "$@" ;;

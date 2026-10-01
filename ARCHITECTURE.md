@@ -94,6 +94,22 @@ policy (below) lets it reach prod machines on ssh and https, and what a
 consumer reaches. `ops` is a machine of its own: a tag would make it the
 tag's, not the user's, so it is never combined with provider or consumer.
 
+### Prod machines (tag:prod)
+
+A prod machine (the codespace control plane, a codespace node) joins the
+admin tailnet as `tag:prod`, and its key is minted by **`connector prod-key`
+alone** -- `invite` and `approve` refuse `prod` and any `tag:` -- by an admin
+(a CNC or manager), after a confirmation:
+
+- single-use, `tag:prod` and no other tag (a prod machine that were also a
+  consumer would be granted what consumers are), owned by the operators
+  (`tagOwners`: `group:ops`);
+- expiring within the hour (`--expiration` 1m..60m or 1h);
+- printed once, to stdout and nothing else there, so it pipes straight into
+  the prod machine's join, which reads it on stdin and never puts it on a
+  command line: `connector prod-key | ssh <host> 'sudo <join reading stdin>'`;
+  or `--out FILE`, a new 0600 file (never written over one).
+
 ### Manager invites
 
 A manager commands the CNC over SSH, so promoting one is the single place
