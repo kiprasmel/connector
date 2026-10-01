@@ -31,8 +31,13 @@ setup() {
     run connector_fn parse_node_roles provider,prod
     assert_failure
     assert_output --partial "'connector prod-key' alone"
+    run connector_fn cmd_approve 7 tag:prod
+    assert_failure
+    assert_output --partial "'connector prod-key' alone"
     run calls_of ssh
     refute_output --partial "preauthkeys create"
+    refute_output --partial "approve-routes"
+    refute_output --partial "nodes tag"
 }
 
 @test "an operator's machine is the ops user's, untagged, and nothing beside" {
@@ -45,6 +50,14 @@ setup() {
     run connector_fn parse_node_roles ops,consumer
     assert_failure
     assert_output --partial "not with provider or consumer"
+    # approve tags, and an operator's machine has none: it is never approved into ops
+    : >"$CALLS"
+    run connector_fn cmd_approve 7 ops
+    assert_failure
+    assert_output --partial "it joins with a key from 'connector invite ops'"
+    run calls_of ssh
+    refute_output --partial "approve-routes"
+    refute_output --partial "nodes tag"
 }
 
 @test "a prod key is tag:prod alone, single-use, the operators', and stdout carries the key and nothing else" {

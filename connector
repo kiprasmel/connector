@@ -2310,13 +2310,18 @@ cmd_approve() {
         echo "(Simpler: 'connector invite' issues a single-use key so no approval step is needed.)"
         return 0
     fi
-    local id; id="$(resolve_node_id "$node")" || die "Node not found: $node"
-    approve_routes "$id"
+    # the roles first: one refused (prod, ops) touches nothing on the CNC
+    local roles="" tags=""
     if [ -n "$type" ]; then
-        local roles tags
         roles="$(parse_node_roles "$type")"
         [ -n "$roles" ] || die "type must be provider, consumer, or provider,consumer"
+        # approve tags; an operator's machine is untagged, and the ops user's from its key
+        [ "$roles" != ops ] || die "An operator's machine is the ops user's, untagged: it joins with a key from 'connector invite ops', not by approve."
         tags="$(tags_for_roles "$roles")"
+    fi
+    local id; id="$(resolve_node_id "$node")" || die "Node not found: $node"
+    approve_routes "$id"
+    if [ -n "$tags" ]; then
         hs nodes tag --identifier "$id" --tags "$tags"
         log_success "Tagged node $node as $roles."
     fi
