@@ -321,29 +321,61 @@ resolve_ssh_user() {
     [ -n "$user" ] && printf '%s\n' "$user"
 }
 
+# What a link's <key> may hold: an ssh target (never an option), a URL, a
+# port, a user name. Args: key, value
+link_value_ok() {
+    case "$1" in
+        CNC_SSH)  [[ "$2" =~ ^([a-z_][a-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9._%:-]*$ ]] ;;
+        CNC_URL)  [[ "$2" =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?/?$ ]] ;;
+        CNC_PORT) [[ -z "$2" || "$2" =~ ^[0-9]{1,5}$ ]] ;;
+        CNC_USER) [[ -z "$2" || "$2" =~ ^[a-z_][a-z0-9_.-]*[$]?$ ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# The manager link -- CNC_SSH, CNC_URL, CNC_PORT, CNC_USER -- read as
+# KEY=VALUE text and never sourced: each value bare or in double quotes, and
+# what its key may hold (link_value_ok). Any other line -- another key, code,
+# a value that could be read as one -- is refused, not run to find out.
 load_cnc_link() {
+    local line key val n=0
+    local re_quoted='^(CNC_SSH|CNC_URL|CNC_PORT|CNC_USER)="([^"]*)"$'
+    local re_bare='^(CNC_SSH|CNC_URL|CNC_PORT|CNC_USER)=([^"[:space:]]*)$'
     [ -f "$CNC_LINK_FILE" ] || die "No CNC linked. Run: connector link <user@host> --url https://..."
-    CNC_USER=""
-    # shellcheck disable=SC1090
-    . "$CNC_LINK_FILE"
+    CNC_SSH="" CNC_URL="" CNC_PORT="" CNC_USER=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line="${line%$'\r'}"
+        case "$line" in ''|'#'*) continue ;; esac
+        if [[ "$line" =~ $re_quoted ]] || [[ "$line" =~ $re_bare ]]; then
+            key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+        else
+            die "${CNC_LINK_FILE}:${n} is not a line connector writes; refused (re-link: connector link <host> --url https://<name>)."
+        fi
+        link_value_ok "$key" "$val" || die "${CNC_LINK_FILE}:${n}: that is no ${key} ('${val:0:40}'); refused."
+        printf -v "$key" '%s' "$val"
+    done <"$CNC_LINK_FILE"
+    [ -n "$CNC_SSH" ] || die "${CNC_LINK_FILE} names no CNC (CNC_SSH); re-link: connector link <host> --url https://<name>."
     # Prefer a stored user; else derive it (handles bare SSH aliases like 'nyc').
     if [ -z "${CNC_USER:-}" ]; then
-        CNC_USER="$(resolve_ssh_user "$CNC_SSH")"
+        CNC_USER="$(resolve_ssh_user "$CNC_SSH" || true)"
         [ -n "$CNC_USER" ] || CNC_USER="$(id -un)"
     fi
 }
 
+# Write the manager link, each value checked as load_cnc_link reads it: a
+# link connector would refuse is never written. 0600 from the start.
 save_cnc_link() {
-    local ssh_target="$1" url="$2" port="${3:-}" user
-    user="$(resolve_ssh_user "$ssh_target")"; [ -n "$user" ] || user="$(id -un)"
+    local ssh_target="$1" url="$2" port="${3:-}" user tmp
+    link_value_ok CNC_SSH "$ssh_target" || die "'${ssh_target}' is not an ssh target connector links to (user@host, or an alias)."
+    link_value_ok CNC_URL "$url" || die "'${url}' is not a URL connector links to."
+    link_value_ok CNC_PORT "$port" || die "'${port}' is not a port."
+    user="$(resolve_ssh_user "$ssh_target" || true)"; [ -n "$user" ] || user="$(id -un)"
+    link_value_ok CNC_USER "$user" || user=""
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-    {
-        echo "CNC_SSH=\"$ssh_target\""
-        echo "CNC_URL=\"$url\""
-        echo "CNC_PORT=\"$port\""
-        echo "CNC_USER=\"$user\""
-    } > "$CNC_LINK_FILE"
-    chmod 600 "$CNC_LINK_FILE"
+    tmp="$(mktemp "${CNC_LINK_FILE}.XXXXXX")" || die "Could not write ${CNC_LINK_FILE}."
+    { printf 'CNC_SSH="%s"\nCNC_URL="%s"\nCNC_PORT="%s"\nCNC_USER="%s"\n' "$ssh_target" "$url" "$port" "$user" >"$tmp" \
+        && chmod 600 "$tmp" && mv -f "$tmp" "$CNC_LINK_FILE"; } || { rm -f "$tmp"; die "Could not write ${CNC_LINK_FILE}."; }
 }
 
 _ssh_port_flag() { [ -n "${CNC_PORT:-}" ] && printf -- '-p %s' "$CNC_PORT" || true; }

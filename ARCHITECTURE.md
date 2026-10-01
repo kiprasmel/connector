@@ -361,7 +361,7 @@ If both are present it asks which to use; if neither, it asks which to install
 | `/var/lib/headscale/`                  | CNC: keys + sqlite DB                      |
 | `/var/lib/headscale/cache/`            | CNC: headscale's Let's Encrypt account + certificate |
 | `/var/lib/headscale/certs/`            | CNC: an older connector's self-signed `cnc.crt` (until removed) |
-| `~/.config/connector/cnc`             | manager: linked CNC (`CNC_SSH/URL/PORT`)|
+| `~/.config/connector/cnc`             | manager: linked CNC (`CNC_SSH/URL/PORT/USER`; 0600, read as `KEY=VALUE` text and never sourced -- any other line is refused) |
 | `~/.config/connector/role`            | node: last registered role (provider/…)    |
 | `~/.config/connector/cnc-ca.crt`      | node: an older connector's trusted CNC cert (`cleanup`/`migrate-cnc` remove it) |
 | `~/.config/connector/aliases.conf`    | saved `connector <name>` SSH shortcuts     |
