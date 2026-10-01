@@ -536,11 +536,13 @@ EOF
 # whoever held its key could pass for any site to all of them. migrate-cnc
 # takes a node off it.)
 
-# Can <url> be the CNC's? https, a DNS name, a port or none. Says why not.
+# Can <url> be the CNC's? https, a DNS name, a port (1-65535) or none, and
+# nothing else. Says why not.
 cnc_url_ok() {
-    local url="$1" host port
-    [[ "$url" =~ ^https://[^/\'\"[:space:]]+/?$ ]] || { log_error "The CNC's URL is https://<name>[:port], not '$url'."; return 1; }
-    host="$(url_host "$url")"; port="$(url_port "$url")"
+    local url="$1" host port re='^https://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:([0-9]{1,5}))?/?$'
+    [[ "$url" =~ $re ]] || { log_error "The CNC's URL is https://<name>[:port], not '$url'."; return 1; }
+    host="${BASH_REMATCH[1]}" port="${BASH_REMATCH[3]}"
+    host="${host#\[}"; host="${host%\]}"
     if is_ip "$host"; then
         log_error "The CNC is a DNS name, not an address ($host): point an A record at it and use https://<name>."
         log_error "(connector no longer makes every node trust a certificate of its own; 'connector migrate-cnc' moves a node off one.)"
@@ -548,7 +550,7 @@ cnc_url_ok() {
     fi
     [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] \
         || { log_error "'$host' is not a DNS name."; return 1; }
-    [[ -z "$port" || "$port" =~ ^[0-9]{1,5}$ ]] || { log_error "'$port' is not a port."; return 1; }
+    [ -z "$port" ] || (( 10#$port >= 1 && 10#$port <= 65535 )) || { log_error "'$port' is not a port."; return 1; }
 }
 
 # SHA-1 (uppercase hex, no colons) of a PEM cert on stdin: what macOS's
@@ -1840,12 +1842,14 @@ json_field() {
     else printf '%s' "$1" | tr -d '\n' | json_str "$2"; fi
 }
 
-# The manager link, pointed at <url>; the ssh side of it is unchanged.
+# The manager link, pointed at <url> (a URL load_cnc_link reads back); the ssh
+# side of it is unchanged.
 set_cnc_link_url() {
     local tmp
+    link_value_ok CNC_URL "$1" || return 1
     tmp="$(mktemp "${CNC_LINK_FILE}.XXXXXX")" || return 1
-    awk -v u="$1" '/^CNC_URL=/ { print "CNC_URL=\"" u "\""; next } { print }' "$CNC_LINK_FILE" >"$tmp" \
-        && chmod 600 "$tmp" && mv -f "$tmp" "$CNC_LINK_FILE"
+    awk -v u="$1" '/^CNC_URL=/ { if (!done) print "CNC_URL=\"" u "\""; done = 1; next } { print } END { if (!done) print "CNC_URL=\"" u "\"" }' \
+        "$CNC_LINK_FILE" >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$CNC_LINK_FILE" || { rm -f "$tmp"; return 1; }
 }
 
 cmd_migrate_cnc() {

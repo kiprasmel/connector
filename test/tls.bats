@@ -38,6 +38,16 @@ linked() {
     assert_failure
     run connector_fn cnc_url_ok https://hs.example.com:44x
     assert_failure
+    run connector_fn cnc_url_ok "https://[2001:db8::1]:8443"
+    assert_failure
+    assert_output --partial "a DNS name, not an address (2001:db8::1)"
+    # one name and one port, the port a port
+    local u
+    for u in https://hs.example.com:443:8443 'https://hs.example.com:\x:443' https://hs.example.com:99999 \
+        https://hs.example.com:0 https://admin@hs.example.com https://hs.example.com?x; do
+        run connector_fn cnc_url_ok "$u"
+        assert_failure
+    done
 }
 
 @test "headscale is told the CNC's name for Let's Encrypt; the challenge decides where it listens" {

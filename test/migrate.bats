@@ -87,6 +87,16 @@ linked() {
     run cat "$HOME/.config/connector/cnc"
     assert_output "$(printf 'CNC_SSH="nyc"\nCNC_URL="https://hs.example.com"\nCNC_PORT=""\nCNC_USER="admin"')"
     [ -n "$(find "$HOME/.config/connector/cnc" -perm 600)" ]
+    # a link without a URL gets one; and never one load_cnc_link would refuse
+    printf 'CNC_SSH="nyc"\n' >"$HOME/.config/connector/cnc"
+    run connector_fn set_cnc_link_url https://hs2.example.com
+    assert_success
+    run connector_eval 'load_cnc_link; echo "$CNC_URL"'
+    assert_output https://hs2.example.com
+    run connector_fn set_cnc_link_url 'https://hs.example.com/$(id)'
+    assert_failure
+    run connector_eval 'load_cnc_link; echo "$CNC_URL"'
+    assert_output https://hs2.example.com
 }
 
 @test "invite --migrate prints the command a node follows the CNC with, naming the old root" {
