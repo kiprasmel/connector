@@ -29,7 +29,7 @@ ciphertext"
     assert_output "age-encryption.org/v1"
     [ -n "$(find "$BATS_TEST_TMPDIR/b.tar.age" -perm 600)" ]
     run calls_of ssh
-    assert_line "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-stream\\ ${RCPT}\\ "
+    assert_line "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-stream\\ ${RCPT}"
     # never over a file
     run connector_fn cmd_backup --out "$BATS_TEST_TMPDIR/b.tar.age" --recipient "$RCPT"
     assert_failure
@@ -38,12 +38,15 @@ ciphertext"
 
 @test "a backup is encrypted to public keys alone: a secret key, or anything else, is refused" {
     local r
-    for r in "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ" "age1short" "-----BEGIN OPENSSH PRIVATE KEY-----"; do
+    for r in "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ" "age1short" "-----BEGIN OPENSSH PRIVATE KEY-----" \
+        "age1$(printf 'b%.0s' $(seq 1 58))" \
+        $'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOf6XjP9q0 admin@laptop\nAGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ'; do
         run connector_fn cmd_backup --out "$BATS_TEST_TMPDIR/x" --recipient "$r"
         assert_failure
         assert_output --partial "Not a recipient"
         # not even its start: a secret key's first characters are its own
         [ "${#r}" -lt 24 ] || refute_output --partial "${r:16:8}"
+        refute_output --partial "QQQQQQQQ"
     done
     [ ! -e "$BATS_TEST_TMPDIR/x" ]
     [ -z "$(calls_of ssh)" ]
@@ -77,7 +80,7 @@ ciphertext"
     run connector_fn cmd_backup_schedule --recipient "$RCPT" --keep 7
     assert_success
     run calls_of ssh
-    assert_line "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-schedule-local\\ --recipient\\ ${RCPT}\\ --keep\\ 7\\ "
+    assert_line "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-schedule-local\\ --recipient\\ ${RCPT}\\ --keep\\ 7"
     : >"$CALLS"
     local secret="AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"
     run connector_fn cmd_backup_schedule --recipient "$secret"
@@ -92,5 +95,11 @@ ciphertext"
     run connector_fn cmd_backup_schedule --off
     assert_success
     run calls_of ssh
-    assert_line "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-schedule-local\\ --off\\ "
+    assert_line "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-schedule-local\\ --off"
+    # and with nothing, to the recipients the CNC lists: nothing is sent for an argument
+    : >"$CALLS"
+    run connector_fn cmd_backup_schedule
+    assert_success
+    run calls_of ssh
+    assert_output "ssh -o ConnectTimeout=10 nyc sudo\\ /usr/local/bin/connector\\ backup-schedule-local"
 }

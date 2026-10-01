@@ -1912,9 +1912,16 @@ cmd_migrate_cnc() {
 # decrypted where that private half is (the admin's machine) and streamed to
 # the CNC over SSH.
 
-# Is <r> a public key a backup may be encrypted to?
+# Is <r> a public key a backup may be encrypted to? One line: an age key (in
+# bech32's alphabet), or an ssh-ed25519 key and a comment of no control
+# character -- a newline would carry a second line along.
 backup_recipient_ok() {
-    [[ "$1" =~ ^age1[0-9a-z]{58}$ || "$1" =~ ^ssh-ed25519\ AAAA[A-Za-z0-9+/]+=*(\ .*)?$ ]]
+    [[ "$1" =~ ^age1[02-9ac-hj-np-z]{58}$ || "$1" =~ ^ssh-ed25519\ AAAA[A-Za-z0-9+/]+=*(\ [^[:cntrl:]]*)?$ ]]
+}
+
+# <word>s quoted for a remote shell, each after a space; nothing for none.
+shell_words() {
+    [ $# -eq 0 ] || printf ' %q' "$@"
 }
 
 # On the CNC, as root: the encrypted archive to stdout. Args: recipient...
@@ -1964,7 +1971,7 @@ cmd_backup() {
     elif is_manager; then
         load_cnc_link
         [ "$CNC_USER" != root ] || sudo=""
-        set -- ssh_cnc "${sudo}${CONNECTOR_BIN} backup-stream $(printf '%q ' "${rcpts[@]+"${rcpts[@]}"}")"
+        set -- ssh_cnc "${sudo}${CONNECTOR_BIN} backup-stream$(shell_words "${rcpts[@]+"${rcpts[@]}"}")"
     else
         die "Only a CNC or manager takes a backup."
     fi
@@ -2185,7 +2192,7 @@ cmd_backup_schedule() {
     elif is_manager; then
         load_cnc_link
         [ "$CNC_USER" != root ] || sudo=""
-        ssh_cnc "${sudo}${CONNECTOR_BIN} backup-schedule-local $(printf '%q ' "$@")"
+        ssh_cnc "${sudo}${CONNECTOR_BIN} backup-schedule-local$(shell_words "$@")"
     else
         die "Only a CNC or manager schedules the CNC's backups."
     fi
