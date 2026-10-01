@@ -44,7 +44,20 @@ site_with() {
         '.acls += [{"action":"accept","src":["*"],"dst":["tag:provider:22"]}]' \
         '.acls += [{"action":"accept","src":["autogroup:tagged"],"dst":["group:ops:*"]}]' \
         '.ssh += [{"action":"accept","src":["group:ops"],"dst":["tag:prod"],"users":["root"]}]' \
-        '.ssh += [{"action":"accept","src":["group:ops"],"dst":["autogroup:tagged"],"users":["autogroup:nonroot"]}]'
+        '.ssh += [{"action":"accept","src":["group:ops"],"dst":["autogroup:tagged"],"users":["autogroup:nonroot"]}]' \
+        '.acls += [{"action":"accept","src":["autogroup:danger-all"],"dst":["tag:provider:*"]}]' \
+        '.ssh += [{"action":"accept","src":["tag:prod"],"dst":["tag:provider"],"users":["autogroup:nonroot"]}]' \
+        '.acls += [{"action":"accept","src":["100.64.0.0/10"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["0.0.0.0/0"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["100.127.255.254"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["100.96.0.0/12"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["fd7a:115c:a1e0::/48"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["fd7a:115c:a1e0:ab12:4843:cd96:6258:b240"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["fd7a::/16"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["::/0"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["::ffff:100.64.0.1"],"dst":["tag:provider:*"]}]' \
+        '.hosts = {"everyone": "100.64.0.0/10"} | .acls += [{"action":"accept","src":["everyone"],"dst":["tag:provider:*"]}]' \
+        '.acls += [{"action":"accept","src":["no-such-name"],"dst":["tag:provider:*"]}]'
     do
         compose "$(site_with "$edit")"
         run connector_fn acl_keeps_prod_closed "$BATS_TEST_TMPDIR/acl.json"
@@ -57,4 +70,30 @@ site_with() {
     printf '{ // the ops rules\n  "acls": [],\n}\n' >"$BATS_TEST_TMPDIR/hujson.json"
     run connector_fn compose_acl "$BATS_TEST_TMPDIR/base.json" "$BATS_TEST_TMPDIR/hujson.json"
     assert_failure
+}
+
+@test "a source that holds no prod machine passes: users, groups, untagged members, and addresses off the tailnet" {
+    compose "$(site_with '.hosts = {"office": "192.168.1.0/24"}
+        | .acls += [{"action":"accept","src":["office","192.168.7.1","10.0.0.0/8","100.128.0.0/16","100.63.255.255",
+            "fd7a:115c:a1e1::/48","fd00::/64","2001:db8::1","autogroup:member","ops@","group:ops","tag:consumer"],"dst":["tag:provider:*"]}]
+        | .ssh += [{"action":"accept","src":["group:ops"],"dst":["autogroup:self"],"users":["autogroup:nonroot"]}]')"
+    run connector_fn acl_keeps_prod_closed "$BATS_TEST_TMPDIR/acl.json"
+    assert_success
+}
+
+@test "a site fragment holding what connector does not compose is refused, never dropped unseen" {
+    local edit
+    for edit in \
+        '.grants = [{"src":["tag:prod"],"dst":["tag:provider"],"ip":["*"]}]' \
+        '.autoApprovers = {"routes":{"10.0.0.0/8":["tag:provider"]}}' \
+        '[.]'
+    do
+        run connector_fn compose_acl "$BATS_TEST_TMPDIR/base.json" "$(site_with "$edit")"
+        assert_failure
+        assert_output --partial "connector composes groups, tagOwners, hosts, acls and ssh from the site, and nothing else"
+    done
+    # an empty fragment is no rules
+    : >"$BATS_TEST_TMPDIR/empty.json"
+    run connector_fn compose_acl "$BATS_TEST_TMPDIR/base.json" "$BATS_TEST_TMPDIR/empty.json"
+    assert_success
 }

@@ -755,10 +755,14 @@ EOF
 
 # connector's rules and the site's, as headscale reads them: groups,
 # tagOwners and hosts from both (the site's winning a name both use), acls
-# and ssh rules connector's, then the site's. Args: base file, site file. Stdout.
+# and ssh rules connector's, then the site's. A site fragment holding
+# anything else (grants, autoApprovers, ...) is refused, never dropped
+# unseen. Args: base file, site file. Stdout.
 compose_acl() {
     jq -n --slurpfile b "$1" --slurpfile s "$2" '
-        $b[0] as $b | $s[0] as $s
+        $b[0] as $b | ($s[0] // {}) as $s
+        | ($s | if type == "object" then keys - ["groups", "tagOwners", "hosts", "acls", "ssh"] else ["(it is no object)"] end) as $more
+        | if $more == [] then . else error("connector composes groups, tagOwners, hosts, acls and ssh from the site, and nothing else: not \($more | join(", "))") end
         | { groups:    (($b.groups // {}) + ($s.groups // {})),
             tagOwners: (($b.tagOwners // {}) + ($s.tagOwners // {})),
             hosts:     (($b.hosts // {}) + ($s.hosts // {})),
@@ -768,14 +772,46 @@ compose_acl() {
 }
 
 # Does the policy in <file> grant a prod machine (tag:prod...) nothing, and
-# give no one SSH to one? A source of "*" or autogroup:tagged takes prod
-# machines in too. Says which rules when not.
+# give no one SSH to one? No acl's source, and no ssh rule's source or
+# destination, may take one in: a tag:prod... tag, "*", autogroup:tagged or
+# autogroup:danger-all, or an address or prefix holding an address of the
+# tailnet's (render_headscale_config's prefixes), itself or by a hosts name.
+# What it cannot read counts as taking one in. Says which rules when not.
 acl_keeps_prod_closed() {
     local bad
     bad="$(jq -c '
-        def takes_prod: startswith("tag:prod") or . == "*" or . == "autogroup:tagged";
-        ((.acls // [])[] | select(any(.src[]?; takes_prod))),
-        ((.ssh // [])[] | select(any(.dst[]?; takes_prod)))' "$1")" || return 1
+        def v4: if test("^[0-9]{1,3}([.][0-9]{1,3}){3}$") then split(".") | map(tonumber) | .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3] else null end;
+        def hex: ascii_downcase | explode | reduce .[] as $c (0; . * 16 + (if $c >= 97 then $c - 87 else $c - 48 end));
+        # the first 48 bits of an IPv6 address, or null
+        def v6_48:
+            if test("^[0-9A-Fa-f:]+$") | not then null
+            else (if test("::") then (split("::") | map(if . == "" then [] else split(":") end)) as [$h, $t]
+                    | $h + [range(8 - ($h | length) - ($t | length)) | "0"] + $t
+                  else split(":") end)
+                 | if length == 8 and all(.[]; test("^[0-9A-Fa-f]{1,4}$")) then (.[0] | hex) * 4294967296 + (.[1] | hex) * 65536 + (.[2] | hex) else null end
+            end;
+        # do <a>/<n> and <b>/<m> share an address, in <bits>? Their first min(n, m) bits agree.
+        def meet($a; $n; $b; $m; $bits): pow(2; $bits - ([$n, $m] | min)) as $blk | (($a / $blk) | floor) == (($b / $blk) | floor);
+        def holds_tailnet:
+            split("/") as $p | (($p[1] // null) | if . == null then null else (tonumber? // -1) end) as $len
+            | if ($p | length) > 2 then true
+              elif ($p[0] | test(":")) then ($p[0] | v6_48) as $a | ($len // 128) as $n
+                | if $a == null or $n < 0 or $n > 128 then true
+                  else meet($a; [$n, 48] | min; "fd7a:115c:a1e0::" | v6_48; 48; 48) end
+              else ($p[0] | v4) as $a | ($len // 32) as $n
+                | if $a == null or $n < 0 or $n > 32 then true
+                  else meet($a; $n; "100.64.0.0" | v4; 10; 32) end
+              end;
+        def takes_prod($hosts):
+            if type != "string" then true
+            elif startswith("tag:") then startswith("tag:prod")
+            elif . == "*" or . == "autogroup:tagged" or . == "autogroup:danger-all" then true
+            elif startswith("autogroup:") or startswith("group:") or contains("@") then false
+            elif $hosts[.] != null then ($hosts[.] | if type == "string" then holds_tailnet else true end)
+            else holds_tailnet end;
+        (.hosts // {}) as $h
+        | ((.acls // [])[] | select(any(.src[]?; takes_prod($h)))),
+          ((.ssh // [])[] | select(any(.src[]?, .dst[]?; takes_prod($h))))' "$1")" || return 1
     [ -n "$bad" ] || return 0
     log_error "A prod machine is granted nothing, and no one gets SSH to one; refused:"
     printf '%s\n' "$bad" | sed 's/^/    /' >&2
@@ -798,7 +834,7 @@ write_acl() {
     fi
     as_root cat "$HEADSCALE_ACL_SITE" >"$tmp/site.json"
     if ! compose_acl "$tmp/base.json" "$tmp/site.json" >"$tmp/acl.json" 2>"$tmp/err"; then
-        log_error "${HEADSCALE_ACL_SITE} is not strict JSON: $(cat "$tmp/err")"
+        log_error "${HEADSCALE_ACL_SITE} is not composed (strict JSON, and what connector composes): $(cat "$tmp/err")"
         rm -rf "$tmp"; return 1
     fi
     acl_keeps_prod_closed "$tmp/acl.json" || { rm -rf "$tmp"; return 1; }

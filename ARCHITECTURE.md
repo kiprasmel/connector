@@ -211,10 +211,16 @@ parts, and writes only when the result passes the guards below and headscale's
   a prod machine (`tag:prod`) on ssh and https, and what a consumer reaches.
 
 Whatever the site writes, the composed policy is refused when it grants a prod
-machine anything (an acl whose source is a `tag:prod…` tag, `*` or
-`autogroup:tagged`), or gives anyone Tailscale SSH to one (an ssh rule whose
-destination is one of those): a prod machine is only ever a destination, and
-OpenSSH keys stay the way in. Note: headscale policy v2 (0.26+) requires
+machine anything -- an acl or an ssh rule whose source can take one in: a
+`tag:prod…` tag, `*`, `autogroup:tagged` or `autogroup:danger-all`, or an
+address or prefix holding one of the tailnet's addresses (`100.64.0.0/10`,
+`fd7a:115c:a1e0::/48`), itself or by a `hosts` name -- or gives anyone
+Tailscale SSH to one (an ssh rule whose destination is one of those): a prod
+machine is only ever a destination, and OpenSSH keys stay the way in. A
+site's sources are its users, groups, other tags, `autogroup:member`, and
+addresses off the tailnet (an office's subnet, say). A fragment holding
+anything connector does not compose (`grants`, `autoApprovers`, …) is
+refused, never dropped unseen. Note: headscale policy v2 (0.26+) requires
 usernames to be written with a trailing `@` (`mesh@` is the user `mesh`).
 
 Tailnet membership is already gated at join time (invite key / approve), so
