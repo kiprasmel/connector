@@ -677,6 +677,24 @@ write_acl() {
     as_root chmod 644 "$HEADSCALE_ACL"
 }
 
+# headscale's new config and policy, put in place only if headscale takes
+# them: the ones before are kept beside them and put back when configtest
+# refuses, so a CNC is never restarted onto what its headscale cannot run.
+# Args: url, base_domain, challenge
+apply_headscale_config() {
+    local f err
+    for f in "$HEADSCALE_CONFIG" "$HEADSCALE_ACL"; do
+        if as_root test -f "$f"; then as_root cp -p "$f" "$f.prev"; else as_root rm -f "$f.prev"; fi
+    done
+    write_headscale_config "$1" "$2" "$3" && write_acl && err="$(as_root headscale configtest 2>&1)" && return 0
+    for f in "$HEADSCALE_CONFIG" "$HEADSCALE_ACL"; do
+        if as_root test -f "$f.prev"; then as_root mv -f "$f.prev" "$f"; else as_root rm -f "$f"; fi
+    done
+    log_error "headscale refuses the new config; the one before is back in place:"
+    printf '%s\n' "${err:-}" | awk '/[Ee]rror|[Ff]atal|not found/' >&2
+    return 1
+}
+
 # Open what headscale serves on a host firewall that is already active, never
 # enabling one (lockout risk). Args: tcp port...
 open_firewall() {
@@ -757,8 +775,7 @@ cnc_init_local() {
     log_info "Initialising CNC (headscale) for ${url}: Let's Encrypt, ${challenge}"
     have curl || as_root apt-get install -y curl >/dev/null 2>&1 || true
     install_headscale
-    write_headscale_config "$url" "$base_domain" "$challenge"
-    write_acl
+    apply_headscale_config "$url" "$base_domain" "$challenge" || die "Nothing on the CNC changed."
     log_info "Enabling + starting headscale..."
     as_root systemctl enable headscale >/dev/null 2>&1 || true
     as_root systemctl restart headscale

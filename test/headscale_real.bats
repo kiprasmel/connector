@@ -76,3 +76,29 @@ configtest() {
     assert_success
     assert_line --partial "headscale version v$(connector_eval 'echo "$HEADSCALE_VERSION"')"
 }
+
+@test "cnc-init puts in what headscale takes, and keeps the CNC's config when headscale refuses the new one" {
+    local bin
+    bin="$(headscale_bin)"
+    run in_node -v "$bin:/usr/local/bin/headscale:ro" '
+        # a CNC with no systemd, nothing else on its ports, and no server for the CLI to ask
+        systemctl() { echo "systemctl $*" >>/tmp/systemctl; }
+        ss() { :; }
+        headscale() { case "$1" in users) echo "[]" ;; *) /usr/local/bin/headscale "$@" ;; esac; }
+        export ASSUME_YES=1
+        ( cnc_init_local https://hs.example.com connector.mesh tls-alpn-01 ) >/tmp/first 2>&1; echo "first rc=$?"
+        grep "^  base_domain:" /etc/headscale/config.yaml
+        ( cnc_init_local https://hs.example.com example.com tls-alpn-01 ) >/tmp/second 2>&1; echo "second rc=$?"
+        grep "^  base_domain:" /etc/headscale/config.yaml
+        grep -c "server_url cannot be part of base_domain" /tmp/second
+        grep -c "restart headscale" /tmp/systemctl
+    '
+    assert_success
+    assert_line "first rc=0"
+    assert_line --index 1 "  base_domain: connector.mesh"
+    assert_line "second rc=1"
+    assert_line --index 3 "  base_domain: connector.mesh"
+    assert_line --index 4 "1"
+    # headscale was restarted onto the config it took, never onto the one it refused
+    assert_line --index 5 "1"
+}

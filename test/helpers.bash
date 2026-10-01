@@ -100,3 +100,14 @@ make_cert() {
 # A certificate file's SHA-256 (lowercase, no colons) and SHA-1 (uppercase).
 cert_sha256() { openssl x509 -in "$1" -noout -fingerprint -sha256 | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f'; }
 cert_sha1() { openssl x509 -in "$1" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F'; }
+
+# headscale's own binary, from the pinned image, once per run. Stdout: its path.
+headscale_bin() {
+    local out="$BATS_RUN_TMPDIR/headscale" c
+    if [ ! -x "$out" ]; then
+        c="$(docker create "$HEADSCALE_IMAGE")" || return 1
+        docker cp "$c:/ko-app/headscale" "$out" >/dev/null || { docker rm "$c" >/dev/null; return 1; }
+        docker rm "$c" >/dev/null
+    fi
+    printf '%s\n' "$out"
+}

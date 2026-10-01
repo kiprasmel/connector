@@ -147,7 +147,10 @@ connector cnc-init root@203.0.113.1 --url https://vpn.example.com   # A record -
 `cnc-init` refuses to bind over a port another process already holds (it
 would take the control plane down), warns when the name does not resolve to
 the machine (Let's Encrypt validates at whatever it resolves to), and needs a
-URL of exactly `https://<name>[:port]`.
+URL of exactly `https://<name>[:port]`. It puts a new config and policy in
+place only if `headscale configtest` takes them (which reads the policy too):
+the ones before are kept as `*.prev` and put back otherwise, and headscale is
+never restarted onto what it refuses.
 
 **connector installs no trust root on any machine.** An older connector
 served a bare IP (`https://<ip>:8443`) with a self-signed **CA:TRUE**
