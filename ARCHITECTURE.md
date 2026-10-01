@@ -24,11 +24,36 @@ consumer). `connector` detects them from cheap, local state:
 | **manager**    | a saved link at `~/.config/connector/cnc`               | runs admin commands on the CNC over SSH |
 | **provider**   | local role file contains `provider` (`tag:provider`)    | accepts Tailscale SSH                   |
 | **consumer**   | local role file contains `consumer` (`tag:consumer`)    | initiates SSH to providers              |
+| **ops**        | local role file contains `ops` (untagged, user `ops`)   | reaches prod machines on ssh + https, and providers |
+
+A **prod machine** (`tag:prod`) holds no connector role: it joins with a key
+from `connector prod-key` and is only ever a destination.
 
 `connector whoami` prints the detected set; `connector status` shows it too.
 
 Only a **cnc or manager** may invite or approve machines, or promote a new
 manager. A plain provider/consumer has no admin authority.
+
+## Prod admin access on this mesh
+
+The codespace control plane and its nodes join this tailnet as `tag:prod`
+machines, so their admin SSH and HTTPS are reachable from operators'
+machines and from nowhere else (the site policy above; their own firewalls
+and sshd allow the tailnet). One tailnet carries both: an admin's laptop is
+an ops machine and keeps reaching providers. What that relies on:
+
+- the CNC is a DNS name with a public certificate, and no machine trusts a
+  root of connector's;
+- headscale is a pinned release, and the policy a site writes is its own and
+  can never open a prod machine;
+- prod keys are minted by `prod-key` alone, and reach a machine on stdin;
+- the CNC's state has an encrypted backup whose private key is not on it.
+
+**Exit criterion.** This mesh has one admin. The day connector gets a second
+admin, or users from outside, prod moves to a headscale of its own: the
+codespace provisioning takes the login server as a parameter, so moving is a
+re-join of each prod machine (a fresh `prod-key` from the new headscale), not
+a rebuild; then the `tag:prod` rules leave this site's policy.
 
 ## Topology
 

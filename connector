@@ -2,7 +2,7 @@
 # connector - headscale/tailscale mesh management tool
 set -euo pipefail
 
-VERSION="2.2.0"
+VERSION="3.0.0"
 
 # --- Constants ---------------------------------------------------------------
 HEADSCALE_USER="mesh"
