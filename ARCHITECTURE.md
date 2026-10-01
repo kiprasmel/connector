@@ -160,6 +160,19 @@ certificate in the System keychain is hashed and only the match is deleted,
 with its trust setting; on Linux only a file connector wrote that holds that
 certificate is removed, and the store is rebuilt).
 
+## The headscale release
+
+connector installs one headscale release, pinned in the script:
+`HEADSCALE_VERSION` and the sha256 of each artifact it installs (the `.deb`
+on apt hosts, the binary elsewhere; amd64 and arm64). `cnc-init` downloads
+it, checks it against its pinned sha256 before anything is installed, and
+puts it in over an older one; a headscale newer than the pin is never
+downgraded -- its database has moved on. A release is a pin bump: the version
+and the sha256s from the release's `checksums.txt`, each artifact hashed
+again, and the docker tier's image (`test/helpers.bash`) at the same version.
+Read headscale's upgrade notes for every minor release in between, and copy
+`/var/lib/headscale` first.
+
 ## WSL specifics (auto-handled)
 
 `register` detects WSL and:

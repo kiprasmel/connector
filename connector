@@ -10,6 +10,15 @@ HEADSCALE_CONFIG="/etc/headscale/config.yaml"
 HEADSCALE_ACL="/etc/headscale/acl.hujson"
 HEADSCALE_LIB="/var/lib/headscale"
 HEADSCALE_BIN="/usr/local/bin/headscale"
+# headscale, pinned: a release is this version and the sha256 of each artifact
+# connector installs, bumped together (from the release's checksums.txt, and
+# the artifacts hashed again). A newer headscale already on the CNC is never
+# downgraded: its database has moved on.
+HEADSCALE_VERSION="0.29.4"
+HEADSCALE_SHA256_AMD64_DEB="1f65364716ae1fcc3845b1a65a47583469022e9c6f194dfdfeb25403f89f0841"
+HEADSCALE_SHA256_ARM64_DEB="021a4aeb2106d09c0e6fb5f936acffcbcdea213ef8882b19ea91b03783e1f816"
+HEADSCALE_SHA256_AMD64_BIN="212ed0a884c0d3541e094c4bebbe94397df6f4e01bd3d7f059c520cb55e0d757"
+HEADSCALE_SHA256_ARM64_BIN="cbad8f02524cc6a94955a107a72e1d4cc652ae3f22e740d5c60884e7f384d60e"
 # Where an older connector kept a bare-IP CNC's self-signed certificate.
 HEADSCALE_CERT_DIR="${HEADSCALE_LIB}/certs"
 # How headscale proves the CNC's name to Let's Encrypt: tls-alpn-01, answered
@@ -380,30 +389,58 @@ detect_arch() {
     esac
 }
 
+# The installed headscale's version (x.y.z), or nothing.
+headscale_installed_version() {
+    have headscale || return 0
+    headscale version 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^v?[0-9]+[.][0-9]+[.][0-9]+$/) { sub(/^v/, "", $i); print $i; exit } }'
+}
+
+# Is version <a> older than <b>?
+version_lt() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | awk 'NR == 1')" = "$1" ]
+}
+
+# The pinned release's artifact for <arch> as <kind> (deb | bin): its file
+# name, then its sha256. Rc 1 when the pin has none.
+headscale_artifact() {
+    local sha
+    case "$1/$2" in
+        amd64/deb) sha="$HEADSCALE_SHA256_AMD64_DEB" ;;
+        arm64/deb) sha="$HEADSCALE_SHA256_ARM64_DEB" ;;
+        amd64/bin) sha="$HEADSCALE_SHA256_AMD64_BIN" ;;
+        arm64/bin) sha="$HEADSCALE_SHA256_ARM64_BIN" ;;
+        *) return 1 ;;
+    esac
+    printf 'headscale_%s_linux_%s%s %s\n' "$HEADSCALE_VERSION" "$1" "$([ "$2" = deb ] && echo .deb)" "$sha"
+}
+
+# headscale at the pinned release: downloaded, checked against its pinned
+# sha256 before anything is installed, and put in over an older one.
 install_headscale() {
-    if have headscale; then
-        log_info "headscale already installed"
+    local have_ver arch kind name sha tmp
+    have_ver="$(headscale_installed_version)"
+    if [ "$have_ver" = "$HEADSCALE_VERSION" ]; then
+        log_info "headscale ${HEADSCALE_VERSION} (the pinned release) is installed"
         return 0
     fi
-    local ver="${HEADSCALE_VERSION:-}"
-    if [ -z "$ver" ]; then
-        log_info "Resolving latest headscale release..."
-        ver="$(curl -fsSL https://api.github.com/repos/juanfont/headscale/releases/latest | json_str tag_name)"
+    if [ -n "$have_ver" ] && version_lt "$HEADSCALE_VERSION" "$have_ver"; then
+        die "headscale ${have_ver} is installed, newer than the pinned ${HEADSCALE_VERSION}: connector never downgrades it (its database has moved on); bump the pin instead."
     fi
-    [ -n "$ver" ] || die "Could not determine headscale version (set HEADSCALE_VERSION=vX.Y.Z)"
-    local arch num tmp
-    arch="$(detect_arch)"; num="${ver#v}"; tmp="$(mktemp -d)"
-    if have apt-get; then
-        log_info "Installing headscale ${ver} (.deb, ${arch})..."
-        curl -fsSL -o "$tmp/headscale.deb" \
-            "https://github.com/juanfont/headscale/releases/download/${ver}/headscale_${num}_linux_${arch}.deb"
+    arch="$(detect_arch)"
+    if have apt-get; then kind="deb"; else kind="bin"; fi
+    read -r name sha < <(headscale_artifact "$arch" "$kind") || true
+    [ -n "${sha:-}" ] || die "No pinned headscale ${HEADSCALE_VERSION} for linux/${arch} (${kind})."
+    tmp="$(mktemp -d)"
+    log_info "Installing headscale ${HEADSCALE_VERSION} (${kind}, ${arch})${have_ver:+ over ${have_ver}}..."
+    curl -fsSL -o "$tmp/$name" "https://github.com/juanfont/headscale/releases/download/v${HEADSCALE_VERSION}/${name}" \
+        || { rm -rf "$tmp"; die "Could not download ${name}."; }
+    [ "$(file_sha256 "$tmp/$name")" = "$sha" ] \
+        || { rm -rf "$tmp"; die "${name} is not the pinned release (its sha256 is not ${sha}); nothing installed."; }
+    if [ "$kind" = "deb" ]; then
         as_root apt-get update -y
-        as_root apt-get install -y "$tmp/headscale.deb"
+        as_root apt-get install -y "$tmp/$name"
     else
-        log_info "Installing headscale ${ver} (binary, ${arch})..."
-        curl -fsSL -o "$tmp/headscale" \
-            "https://github.com/juanfont/headscale/releases/download/${ver}/headscale_${num}_linux_${arch}"
-        as_root install -m 0755 "$tmp/headscale" "$HEADSCALE_BIN"
+        as_root install -m 0755 "$tmp/$name" "$HEADSCALE_BIN"
         install_headscale_service
     fi
     rm -rf "$tmp"

@@ -70,3 +70,9 @@ configtest() {
     assert_line --partial "is not the certificate"
     assert_line --index 8 "headscale-cnc.crt kept"
 }
+
+@test "the headscale the docker tier runs is the release connector pins" {
+    run docker run --rm "$HEADSCALE_IMAGE" version
+    assert_success
+    assert_line --partial "headscale version v$(connector_eval 'echo "$HEADSCALE_VERSION"')"
+}
