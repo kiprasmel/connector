@@ -1434,6 +1434,25 @@ macos_tailscale_cli() {
     esac
 }
 
+# `<cli...> <args...>`: tailscale up, the auth key (if any) read by tailscale
+# from a 0600 file rather than from its argv, where any local user's ps would
+# see it. Args: key ('' for none), cli words..., --, args...
+ts_up() {
+    local key="$1" f="" rc=0
+    local -a runner=()
+    shift
+    while [ "$1" != -- ]; do runner+=("$1"); shift; done
+    shift
+    if [ -n "$key" ]; then
+        f="$(umask 077; mktemp)" || return 1
+        printf '%s\n' "$key" >"$f"
+        set -- "$@" --auth-key "file:$f"
+    fi
+    "${runner[@]}" "$@" || rc=$?
+    [ -z "$f" ] || rm -f "$f"
+    return "$rc"
+}
+
 # Print the post-join summary. register_summary <roles-csv> <cli> <hostname>
 register_summary() {
     local roles="$1" cli="$2" hostname="$3" ts_ip ts_name
@@ -1488,13 +1507,9 @@ register_macos() {
     [ "$reauth" = 1 ] && up_args+=(--force-reauth)
     [ -n "$hostname" ] && up_args+=(--hostname "$hostname")
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
-    if [ -n "$key" ]; then
-        up_args+=(--authkey "$key")
-    else
-        up_args+=(--advertise-tags="$tags")
-    fi
+    [ -n "$key" ] || up_args+=(--advertise-tags="$tags")
 
-    if ! "${runner_cmd[@]}" "${up_args[@]}"; then
+    if ! ts_up "$key" "${runner_cmd[@]}" -- "${up_args[@]}"; then
         log_warn "tailscale up failed."
         log_warn "If a browser login URL appeared, finish there; or ask the admin to run 'connector approve'."
         log_warn "If using the GUI app, ensure it is running and its system extension is approved."
@@ -1556,7 +1571,7 @@ install_self_local() {
 cmd_register() {
     local roles
     roles="$(parse_node_roles "${1:-}")"
-    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY] [--hostname N] [--tailscale app|oss] [--yes]"
+    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY|-] [--hostname N] [--tailscale app|oss] [--yes]"
     shift || true
     local url="" key="" hostname="" ts_variant="" reauth=0
     while [ $# -gt 0 ]; do
@@ -1571,7 +1586,9 @@ cmd_register() {
             *) [ -z "$url" ] && url="$1" || die "Unexpected argument: $1"; shift ;;
         esac
     done
-    [ -n "$url" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY]"
+    [ -n "$url" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY|-]"
+    # `--authkey -`: the key on stdin, never on an argv
+    if [ "$key" = "-" ]; then IFS= read -r key || true; [ -n "$key" ] || die "No key on stdin."; fi
 
     # On Linux, make sure the join flow's tools are present (prompt to install).
     [ "$(os_kind)" = "linux" ] && ensure_deps curl openssl
@@ -1603,13 +1620,9 @@ cmd_register() {
     [ "$reauth" = 1 ] && up_args+=(--force-reauth)
     [ -n "$hostname" ] && up_args+=(--hostname "$hostname")
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
-    if [ -n "$key" ]; then
-        up_args+=(--authkey "$key")
-    else
-        up_args+=(--advertise-tags="$tags")
-    fi
+    [ -n "$key" ] || up_args+=(--advertise-tags="$tags")
 
-    if ! as_root tailscale up "${up_args[@]}"; then
+    if ! ts_up "$key" as_root tailscale up -- "${up_args[@]}"; then
         if [ -z "$key" ]; then
             log_warn "No --authkey supplied; tailscale printed a login URL above."
             log_warn "Ask the CNC admin to approve it:  connector approve"
@@ -2445,9 +2458,11 @@ ONBOARD                [admin: run on the CNC or a linked manager]
                        (roles comma-separated, e.g. provider,consumer).
 
 JOIN
-  register <roles> <url> [--authkey KEY] [--hostname N] [--tailscale app|oss] [--yes]
+  register <roles> <url> [--authkey KEY|-] [--hostname N] [--tailscale app|oss] [--yes]
                        roles is comma-separated: provider[,consumer].
-                       Join the tailnet (just paste the command 'invite' prints).
+                       Join the tailnet (just paste the command 'invite' prints;
+                       '--authkey -' reads the key from stdin). The key reaches
+                       tailscale in a 0600 file, never on its command line.
                        Auto-handles WSL systemd (asks first), and on macOS
                        auto-detects the GUI app or open-source tailscaled
                        (override: --tailscale).

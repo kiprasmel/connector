@@ -17,7 +17,8 @@ common_setup() {
     CALLS="$BATS_TEST_TMPDIR/calls"
     mkdir -p "$STUBS"
     : >"$CALLS"
-    export PATH="$STUBS:$PATH" STUBS CALLS CONNECTOR REPO_ROOT
+    KEY_SEEN="$BATS_TEST_TMPDIR/key-seen"
+    export PATH="$STUBS:$PATH" STUBS CALLS CONNECTOR REPO_ROOT KEY_SEEN
     # sudo runs what it is given, as us, and says so; nothing reaches this
     # machine's own tailscale, headscale or keychain
     stub sudo 'exec "$@"'
@@ -37,6 +38,10 @@ $body
 STUB
     chmod +x "$STUBS/$cmd"
 }
+
+# A tailscale stub's body: `debug prefs` answers $TS_PREFS, and the key an
+# `up` was handed in a file (--auth-key file:...) is kept in $KEY_SEEN.
+TS_STUB='prev=""; for a in "$@"; do [ "$prev" != --auth-key ] || cat "${a#file:}" >"$KEY_SEEN"; prev="$a"; done; [ "$1" != debug ] || printf "%s\n" "${TS_PREFS:-{\}}"'
 
 # The calls a stub saw, one per line. Args: cmd
 calls_of() {

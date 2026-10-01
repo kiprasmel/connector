@@ -82,7 +82,9 @@ by the admin:
    Never "approve all".
 
 `finalize` from the old tool is gone: after a successful `register`, the node is
-already connected.
+already connected. `register` hands the key to `tailscale up` in a 0600 file
+(`--auth-key file:…`), never on its command line, where any local user's `ps`
+would see it; `--authkey -` reads it from stdin.
 
 ### Manager invites
 

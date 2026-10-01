@@ -84,6 +84,7 @@ linked() {
     assert_success
     run calls_of tailscale
     assert_line --partial "tailscale up --reset --login-server https://hs.example.com"
+    refute_output --partial hskey-test
     [ -z "$(calls_of security)" ]
     [ -z "$(calls_of update-ca-certificates)" ]
     [ ! -e "$HOME/.config/connector/cnc-ca.crt" ]

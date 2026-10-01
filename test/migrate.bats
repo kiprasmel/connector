@@ -10,8 +10,8 @@ setup() {
     common_setup
     # a Mac on the Tailscale app, logged in to the old bare-IP CNC as laptop2
     stub uname 'echo Darwin'
-    stub Tailscale '[ "$1" != debug ] || printf "{\"ControlURL\":\"%s\",\"Hostname\":\"laptop2\"}\n" "$TS_CONTROL"'
-    export TS_CONTROL="https://203.0.113.1:8443"
+    stub Tailscale "$TS_STUB"
+    export TS_PREFS='{"ControlURL":"https://203.0.113.1:8443","Hostname":"laptop2"}'
     mkdir -p "$HOME/.config/connector"
     echo consumer >"$HOME/.config/connector/role"
     make_cert 203.0.113.1 "$BATS_TEST_TMPDIR/old.pem"
@@ -37,7 +37,10 @@ linked() {
     run migrate https://hs.example.com --authkey hskey-m --tailscale app
     assert_success
     run calls_of Tailscale
-    assert_line "Tailscale up --reset --login-server https://hs.example.com --accept-dns=true --force-reauth --hostname laptop2 --authkey hskey-m"
+    assert_line --regexp "^Tailscale up --reset --login-server https://hs\.example\.com --accept-dns=true --force-reauth --hostname laptop2 --auth-key file:"
+    refute_output --partial hskey-m
+    run cat "$KEY_SEEN"
+    assert_output hskey-m
     run calls_of security
     assert_line "security delete-certificate -Z $(cert_sha1 "$BATS_TEST_TMPDIR/old.pem") /Library/Keychains/System.keychain"
     refute_line --partial "$(cert_sha1 "$BATS_TEST_TMPDIR/other.pem")"
@@ -56,7 +59,7 @@ linked() {
 }
 
 @test "a node already at the new name is not re-joined, and the old root still goes" {
-    export TS_CONTROL=https://hs.example.com
+    export TS_PREFS='{"ControlURL":"https://hs.example.com","Hostname":"laptop2"}'
     run migrate https://hs.example.com --tailscale app
     assert_success
     assert_output --partial "Already on https://hs.example.com"
