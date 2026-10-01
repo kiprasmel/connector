@@ -1923,7 +1923,7 @@ backup_stream_local() {
       for r in "$@"; do printf '%s\n' "$r"; done; } | awk 'NF' >"$tmp/recipients"
     [ -s "$tmp/recipients" ] || { rm -rf "$tmp"; die "No recipient: pass --recipient <age1...|ssh-ed25519 ...> (a key whose private half is not on this machine), or list them in ${HEADSCALE_BACKUP_RECIPIENTS}."; }
     while IFS= read -r r; do
-        backup_recipient_ok "$r" || { rm -rf "$tmp"; die "Not a recipient (age1... or ssh-ed25519): ${r:0:24}..."; }
+        backup_recipient_ok "$r" || { rm -rf "$tmp"; die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone"; }
     done <"$tmp/recipients"
     mkdir -p "$tmp/state${HEADSCALE_LIB}" "$tmp/state/etc/headscale"
     [ -f "$HEADSCALE_LIB/db.sqlite" ] || { rm -rf "$tmp"; die "No headscale database at $HEADSCALE_LIB/db.sqlite."; }
@@ -1951,7 +1951,7 @@ cmd_backup() {
             *) die "Usage: connector backup [--out FILE] [--recipient <age1...|ssh-ed25519 ...>]..." ;;
         esac
     done
-    for r in "${rcpts[@]+"${rcpts[@]}"}"; do backup_recipient_ok "$r" || die "Not a recipient (age1... or ssh-ed25519): ${r:0:24}..."; done
+    for r in "${rcpts[@]+"${rcpts[@]}"}"; do backup_recipient_ok "$r" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone (nothing of it was sent)"; done
     [ -n "$out" ] || [ ! -t 1 ] || out="headscale-$(date -u +%Y%m%dT%H%M%SZ).tar.age"
     [ -z "$out" ] || [ ! -e "$out" ] || die "$out exists: a backup goes into a new file only."
     if is_cnc; then

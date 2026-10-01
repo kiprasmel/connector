@@ -42,6 +42,8 @@ ciphertext"
         run connector_fn cmd_backup --out "$BATS_TEST_TMPDIR/x" --recipient "$r"
         assert_failure
         assert_output --partial "Not a recipient"
+        # not even its start: a secret key's first characters are its own
+        [ "${#r}" -lt 24 ] || refute_output --partial "${r:16:8}"
     done
     [ ! -e "$BATS_TEST_TMPDIR/x" ]
     [ -z "$(calls_of ssh)" ]
