@@ -86,6 +86,43 @@ CNC_STATE='
     assert_line "asides: 0"
 }
 
+@test "a recipient age takes no key for backs up nothing, schedules nothing, and leaves nothing in the clear" {
+    run in_node -v "$HS_BIN:/usr/local/bin/headscale:ro" "$CNC_STATE"'
+        # in bech32 alphabet and of the length, as a typo is: no key age reads
+        BAD="age1$(printf "q%.0s" $(seq 1 58))"
+        backup_recipient_ok "$BAD" && echo "looks like one"
+        ( cmd_backup --out /tmp/bad.tar.age --recipient "$BAD" ) >/tmp/out 2>&1; echo "backup rc=$?"
+        [ -e /tmp/bad.tar.age ] && echo "kept" || echo "nothing kept"
+        # as a manager asks for it over ssh: the script itself, errexit and all
+        /usr/local/bin/connector backup-stream "$BAD" >/tmp/stream 2>/dev/null; echo "stream rc=$?"
+        echo "in the clear: $(find /tmp -path "*/state/*" \( -name db.sqlite -o -name noise_private.key \) | wc -l)"
+        ( backup_schedule_local --recipient "$BAD" ) >/tmp/sched 2>&1; echo "schedule rc=$?"
+        [ -e /etc/headscale/backup.recipients ] && echo "recipients written" || echo "no recipients"
+        [ -e /etc/systemd/system/connector-backup.service ] && echo "units written" || echo "no units"
+        # a list of comments alone, a recipient given: it is the one
+        echo "# none yet" >/etc/headscale/backup.recipients
+        ( cmd_backup --out /tmp/c.tar.age --recipient "$ADMIN" ) >/tmp/c 2>&1; echo "comments rc=$?"
+        age -d -i /tmp/admin.key /tmp/c.tar.age | tar -tf - | grep -c "^./var/lib/headscale/db.sqlite$"
+        # and a recipients file of comments and a key: scheduled, age reading it as written
+        printf "# the admin\n%s\n" "$ADMIN" >/etc/headscale/backup.recipients
+        ( backup_schedule_local ) >/tmp/listed 2>&1; echo "listed rc=$?"
+        echo "in the clear: $(find /tmp -path "*/state/*" \( -name db.sqlite -o -name noise_private.key \) | wc -l)"
+    '
+    assert_success
+    assert_line "looks like one"
+    assert_line "backup rc=1"
+    assert_line "nothing kept"
+    assert_line "stream rc=1"
+    assert_line --index 4 "in the clear: 0"
+    assert_line "schedule rc=1"
+    assert_line "no recipients"
+    assert_line "no units"
+    assert_line "comments rc=0"
+    assert_line --index 9 "1"
+    assert_line "listed rc=0"
+    assert_line --index 11 "in the clear: 0"
+}
+
 @test "a restore headscale cannot run is undone, and the CNC runs what it had" {
     run in_node -v "$HS_BIN:/usr/local/bin/headscale:ro" "$CNC_STATE"'
         # a backup whose database headscale refuses: a table it does not know

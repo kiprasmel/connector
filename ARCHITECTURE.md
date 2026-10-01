@@ -298,9 +298,11 @@ server's identity to every node), the Let's Encrypt cache, its config,
 policy and the site's rules -- as a tar encrypted **on the CNC** with `age` to
 public keys alone: `--recipient` (an `age1…` key or an `ssh-ed25519` one) and
 those listed in `/etc/headscale/backup.recipients`. The private half never
-needs to be on the CNC, and a secret key passed by mistake is refused. From a
-manager it streams over SSH into a new 0600 file (never over one, and only if
-what came is an age file).
+needs to be on the CNC, and a secret key passed by mistake is refused. age
+itself takes every recipient before any of the state is copied, and the copy
+staged in the clear (root's, under `mktemp -d`) is removed however the backup
+ends. From a manager it streams over SSH into a new 0600 file (never over one,
+and only if what came is an age file).
 
 `backup-schedule` has the CNC take one every day itself (`connector-backup.timer`,
 a random hour after midnight, and a day the CNC was down for once it is up):
@@ -313,7 +315,8 @@ and `cnc-update` as the connector they install writes them, and never put in by
 either. Copies off the CNC are the admin's: `scp` the newest from
 `/var/backups/headscale`, or a manager's `connector backup` (cron, say). A
 recipient is checked on the machine it is typed on, so a private key passed
-by mistake never reaches the CNC.
+by mistake never reaches the CNC; and a schedule is put in only for
+recipients age takes, so a typo is refused then, not every day after.
 
 A restore is decrypted where the private key is -- the admin's machine -- and
 streamed to the CNC over SSH. The CNC takes only what a backup holds (files

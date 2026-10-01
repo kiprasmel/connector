@@ -1925,33 +1925,33 @@ shell_words() {
 }
 
 # On the CNC, as root: the encrypted archive to stdout. Args: recipient...
-backup_stream_local() {
-    local tmp r f
+# A subshell: the state it stages in the clear goes however it ends, and age
+# has taken every recipient before any of that state is copied.
+backup_stream_local() (
+    local tmp="" r f
+    trap '[ -z "$tmp" ] || rm -rf "$tmp"' EXIT
     require_root backup
     have age || pkg_install age >/dev/null 2>&1 || die "age encrypts the backup: apt-get install age"
     have sqlite3 || pkg_install sqlite3 >/dev/null 2>&1 || die "sqlite3 copies the database: apt-get install sqlite3"
     tmp="$(mktemp -d)"
-    { if [ -s "$HEADSCALE_BACKUP_RECIPIENTS" ]; then grep -v '^[[:space:]]*#' "$HEADSCALE_BACKUP_RECIPIENTS"; fi
+    { if [ -s "$HEADSCALE_BACKUP_RECIPIENTS" ]; then grep -v '^[[:space:]]*#' "$HEADSCALE_BACKUP_RECIPIENTS" || true; fi
       for r in "$@"; do printf '%s\n' "$r"; done; } | awk 'NF' >"$tmp/recipients"
-    [ -s "$tmp/recipients" ] || { rm -rf "$tmp"; die "No recipient: pass --recipient <age1...|ssh-ed25519 ...> (a key whose private half is not on this machine), or list them in ${HEADSCALE_BACKUP_RECIPIENTS}."; }
+    [ -s "$tmp/recipients" ] || die "No recipient: pass --recipient <age1...|ssh-ed25519 ...> (a key whose private half is not on this machine), or list them in ${HEADSCALE_BACKUP_RECIPIENTS}."
     while IFS= read -r r; do
-        backup_recipient_ok "$r" || { rm -rf "$tmp"; die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone"; }
+        backup_recipient_ok "$r" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone"
     done <"$tmp/recipients"
+    age -R "$tmp/recipients" </dev/null >/dev/null || die "age takes no such recipient (above); nothing was copied."
     mkdir -p "$tmp/state${HEADSCALE_LIB}" "$tmp/state/etc/headscale"
-    [ -f "$HEADSCALE_LIB/db.sqlite" ] || { rm -rf "$tmp"; die "No headscale database at $HEADSCALE_LIB/db.sqlite."; }
-    sqlite3 "$HEADSCALE_LIB/db.sqlite" ".backup '$tmp/state${HEADSCALE_LIB}/db.sqlite'" \
-        || { rm -rf "$tmp"; die "Could not copy the database."; }
+    [ -f "$HEADSCALE_LIB/db.sqlite" ] || die "No headscale database at $HEADSCALE_LIB/db.sqlite."
+    sqlite3 "$HEADSCALE_LIB/db.sqlite" ".backup '$tmp/state${HEADSCALE_LIB}/db.sqlite'" || die "Could not copy the database."
     for f in noise_private.key derp_server_private.key cache certs; do
-        [ ! -e "$HEADSCALE_LIB/$f" ] || cp -a "$HEADSCALE_LIB/$f" "$tmp/state${HEADSCALE_LIB}/"
+        [ ! -e "$HEADSCALE_LIB/$f" ] || cp -a "$HEADSCALE_LIB/$f" "$tmp/state${HEADSCALE_LIB}/" || die "Could not copy $HEADSCALE_LIB/$f."
     done
     for f in "$HEADSCALE_CONFIG" "$HEADSCALE_ACL" "$HEADSCALE_ACL_SITE" "$HEADSCALE_BACKUP_RECIPIENTS"; do
-        [ ! -e "$f" ] || cp -a "$f" "$tmp/state/etc/headscale/"
+        [ ! -e "$f" ] || cp -a "$f" "$tmp/state/etc/headscale/" || die "Could not copy $f."
     done
     tar -C "$tmp/state" -cf - . | age -R "$tmp/recipients"
-    local rc=$?
-    rm -rf "$tmp"
-    return "$rc"
-}
+)
 
 cmd_backup() {
     local out="" r sudo="sudo "
@@ -2155,9 +2155,13 @@ backup_schedule_local() {
     keep="${keep:-$HEADSCALE_BACKUP_KEEP}"
     backup_keep_ok "$keep" || die "--keep is how many backups stay, 1 or more: not '$keep'"
     for r in "${rcpts[@]+"${rcpts[@]}"}"; do backup_recipient_ok "$r" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone"; done
+    have age || pkg_install age >/dev/null 2>&1 || die "age encrypts the backups: apt-get install age"
+    have sqlite3 || pkg_install sqlite3 >/dev/null 2>&1 || die "sqlite3 copies the database: apt-get install sqlite3"
     if [ "${#rcpts[@]}" -gt 0 ]; then
         tmp="$(mktemp)"
         { echo "# connector backup-schedule: the public keys a backup is encrypted to"; printf '%s\n' "${rcpts[@]}"; } >"$tmp"
+        # age takes each, or none is written: a typo would fail every day's backup
+        age -R "$tmp" </dev/null >/dev/null || { rm -f "$tmp"; die "age takes no such recipient (above); nothing changed."; }
         { mkdir -p "$(dirname "$HEADSCALE_BACKUP_RECIPIENTS")" && install -m 0644 "$tmp" "$HEADSCALE_BACKUP_RECIPIENTS"; } \
             || { rm -f "$tmp"; die "Could not write ${HEADSCALE_BACKUP_RECIPIENTS}."; }
         rm -f "$tmp"
@@ -2167,8 +2171,8 @@ backup_schedule_local() {
         n=$((n + 1))
     done < <(grep -v '^[[:space:]]*#' "$HEADSCALE_BACKUP_RECIPIENTS" 2>/dev/null | awk 'NF')
     [ "$n" -gt 0 ] || die "No recipient: pass --recipient <age1...|ssh-ed25519 ...> (a key whose private half is not on this machine)."
-    have age || pkg_install age >/dev/null 2>&1 || die "age encrypts the backups: apt-get install age"
-    have sqlite3 || pkg_install sqlite3 >/dev/null 2>&1 || die "sqlite3 copies the database: apt-get install sqlite3"
+    age -R "$HEADSCALE_BACKUP_RECIPIENTS" </dev/null >/dev/null \
+        || die "age takes no such recipient in ${HEADSCALE_BACKUP_RECIPIENTS} (above); the daily backup is as it was."
     mkdir -p "$BACKUP_UNIT_DIR" || die "Could not make $BACKUP_UNIT_DIR."
     { backup_service_unit "$keep" >"$unit" && backup_timer_unit >"$BACKUP_UNIT_DIR/connector-backup.timer"; } \
         || die "Could not write the backup's units."
