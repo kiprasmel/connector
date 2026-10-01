@@ -68,12 +68,27 @@ ciphertext"
     : >"$BATS_TEST_TMPDIR/admin.key"
     run connector_fn cmd_restore "$BATS_TEST_TMPDIR/b.tar.age" --identity "$BATS_TEST_TMPDIR/admin.key" --yes
     assert_success
+    # once whole, to see that it decrypts; then into the stream
     run calls_of age
-    assert_output "age -d -i $BATS_TEST_TMPDIR/admin.key $BATS_TEST_TMPDIR/b.tar.age"
+    local once="age -d -i $BATS_TEST_TMPDIR/admin.key $BATS_TEST_TMPDIR/b.tar.age"
+    assert_output "$once"$'\n'"$once"
     run calls_of ssh
     assert_output --partial "sudo\\ /usr/local/bin/connector\\ restore-stream"
     run cat "$BATS_TEST_TMPDIR/restored"
     assert_output "the decrypted tar"
+}
+
+@test "a backup that does not decrypt whole sends the CNC nothing" {
+    # age writes what it could, then stops: a damaged chunk, a cut copy
+    stub age 'printf "the start of a tar"; echo "age: error: chunk 3: decryption failed" >&2; exit 1'
+    : >"$BATS_TEST_TMPDIR/b.tar.age"
+    : >"$BATS_TEST_TMPDIR/admin.key"
+    run connector_fn cmd_restore "$BATS_TEST_TMPDIR/b.tar.age" --identity "$BATS_TEST_TMPDIR/admin.key" --yes
+    assert_failure
+    assert_output --partial "does not decrypt whole"
+    assert_output --partial "nothing was sent"
+    [ -z "$(calls_of ssh)" ]
+    [ ! -e "$BATS_TEST_TMPDIR/restored" ]
 }
 
 @test "a manager schedules the CNC's daily backup over SSH, to public keys alone, checked here before they go" {

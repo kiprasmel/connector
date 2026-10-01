@@ -1982,48 +1982,84 @@ cmd_backup() {
 }
 
 # On the CNC, as root: a decrypted backup (a tar) on stdin put in place. The
-# state before is kept aside, and put back when headscale cannot run what
-# was restored.
-restore_stream_local() {
-    local stage aside bad f managed
+# state before is kept aside, and put back when any step of putting the
+# backup in place fails or headscale cannot run what came. A subshell: the
+# backup it stages in the clear goes however it ends.
+restore_stream_local() (
+    local stage="" aside bad why="" managed
+    trap '[ -z "$stage" ] || rm -rf "$stage"' EXIT
     require_root restore
     managed="${HEADSCALE_CONFIG##*/} ${HEADSCALE_ACL##*/} ${HEADSCALE_ACL_SITE##*/} ${HEADSCALE_BACKUP_RECIPIENTS##*/}"
     stage="$(mktemp -d)"
-    cat >"$stage/backup.tar" || die "Could not read the backup."
-    [ -s "$stage/backup.tar" ] || { rm -rf "$stage"; die "No backup came (could it be decrypted?); nothing changed."; }
+    cat >"$stage/backup.tar" || die "Could not read the backup; nothing changed."
+    [ -s "$stage/backup.tar" ] || die "No backup came (could it be decrypted?); nothing changed."
     # what a backup holds and nothing else: files and directories under the
-    # two places, no link of either kind, no ..
-    bad="$(tar -tvf "$stage/backup.tar" 2>/dev/null | awk '
-        $1 !~ /^[-d]/ || / link to / || $6 ~ /\.\./ { print; next }
-        $6 ~ /^\.\/(var\/lib\/headscale|etc\/headscale)(\/|$)/ { next }
-        $6 == "./" || $6 == "./var/" || $6 == "./var/lib/" || $6 == "./etc/" { next }
-        { print }')"
-    [ -z "$bad" ] || { rm -rf "$stage"; die "Not a backup connector made; refused: $(printf '%s\n' "$bad" | awk 'NR == 1')"; }
-    { mkdir "$stage/x" && tar -C "$stage/x" -xf "$stage/backup.tar"; } || { rm -rf "$stage"; die "Not a backup."; }
+    # two places, no link of either kind, no .. -- each name whole (tar -t
+    # prints one a line), each type from tar -tv
+    { tar -tvf "$stage/backup.tar" >"$stage/types" && tar -tf "$stage/backup.tar" >"$stage/names"; } 2>/dev/null \
+        || die "Not a backup tar can read; nothing changed."
+    bad="$(awk '$1 !~ /^[-d]/ || / link to /' "$stage/types"
+           awk '/(^|\/)\.\.(\/|$)/ { print; next }
+                /^\.\/(var\/lib\/headscale|etc\/headscale)(\/|$)/ { next }
+                $0 == "./" || $0 == "./var/" || $0 == "./var/lib/" || $0 == "./etc/" { next }
+                { print }' "$stage/names")"
+    [ -z "$bad" ] || die "Not a backup connector made; refused: $(printf '%s\n' "$bad" | awk 'NR == 1')"
+    { mkdir "$stage/x" && tar -C "$stage/x" -xf "$stage/backup.tar"; } || die "Not a backup; nothing changed."
     [ -f "$stage/x${HEADSCALE_LIB}/db.sqlite" ] && [ -f "$stage/x$HEADSCALE_CONFIG" ] \
-        || { rm -rf "$stage"; die "Not a headscale backup (no database, or no config)."; }
+        || die "Not a headscale backup (no database, or no config); nothing changed."
     aside="${HEADSCALE_LIB}.before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+    [ ! -e "$aside" ] || die "${aside} is there already; nothing changed."
     systemctl stop headscale 2>/dev/null || true
-    { mv "$HEADSCALE_LIB" "$aside" && mkdir -p "$aside/etc" "$HEADSCALE_LIB"; } || die "Could not set the state aside."
-    for f in $managed; do [ ! -e "/etc/headscale/$f" ] || cp -a "/etc/headscale/$f" "$aside/etc/"; done
-    cp -a "$stage/x${HEADSCALE_LIB}/." "$HEADSCALE_LIB/"
-    for f in $managed; do
-        rm -f "/etc/headscale/${f:?}"
-        [ ! -e "$stage/x/etc/headscale/$f" ] || cp -a "$stage/x/etc/headscale/$f" /etc/headscale/
-    done
-    ! id headscale >/dev/null 2>&1 || chown -R headscale:headscale "$HEADSCALE_LIB"
-    rm -rf "$stage"
-    if ! headscale configtest >/dev/null 2>&1; then
-        for f in $managed; do
-            rm -f "/etc/headscale/${f:?}"
-            [ ! -e "$aside/etc/$f" ] || cp -a "$aside/etc/$f" /etc/headscale/
-        done
-        rm -rf "${aside:?}/etc" "${HEADSCALE_LIB:?}" && mv "$aside" "$HEADSCALE_LIB"
+    if ! mv "$HEADSCALE_LIB" "$aside"; then
         systemctl start headscale 2>/dev/null || true
-        die "headscale cannot run what was restored; the state before is back in place."
+        die "Could not set the state aside; nothing changed."
+    fi
+    if ! restore_keep_etc "$aside" "$managed"; then
+        rm -rf "${aside:?}/etc" && mv "$aside" "$HEADSCALE_LIB"
+        systemctl start headscale 2>/dev/null || true
+        die "Could not set the state aside; nothing changed."
+    fi
+    if ! restore_put "$stage/x" "$managed"; then why="it could not be put in place"
+    elif ! headscale configtest >/dev/null 2>&1; then why="headscale cannot run it"
+    fi
+    if [ -n "$why" ]; then
+        restore_undo "$aside" "$managed" \
+            || die "Not restored (${why}), and the state before is still in ${aside}: put it back by hand (it, as ${HEADSCALE_LIB}; its etc/ files in /etc/headscale)."
+        systemctl start headscale 2>/dev/null || true
+        die "Not restored: ${why}; the state before is back in place."
     fi
     systemctl start headscale 2>/dev/null || true
     log_success "Restored. The state before is in ${aside}."
+)
+
+# restore_stream_local's steps, each rc 1 at the first thing that fails.
+# The state now, set aside in <aside>: its /etc/headscale <files> in etc/.
+restore_keep_etc() {
+    local aside="$1" f
+    mkdir -p "$aside/etc" || return 1
+    for f in $2; do [ ! -e "/etc/headscale/$f" ] || cp -a "/etc/headscale/$f" "$aside/etc/" || return 1; done
+}
+
+# The backup extracted at <x> in place: /var/lib/headscale, and its
+# /etc/headscale <files> (one the backup lacks is left out).
+restore_put() {
+    local x="$1" f
+    { mkdir -p "$HEADSCALE_LIB" && cp -a "$x${HEADSCALE_LIB}/." "$HEADSCALE_LIB/"; } || return 1
+    for f in $2; do
+        rm -f "/etc/headscale/${f:?}" || return 1
+        [ ! -e "$x/etc/headscale/$f" ] || cp -a "$x/etc/headscale/$f" /etc/headscale/ || return 1
+    done
+    ! id headscale >/dev/null 2>&1 || chown -R headscale:headscale "$HEADSCALE_LIB"
+}
+
+# The state set aside in <aside> back in place, its /etc/headscale <files> too.
+restore_undo() {
+    local aside="$1" f
+    for f in $2; do
+        rm -f "/etc/headscale/${f:?}"
+        [ ! -e "$aside/etc/$f" ] || cp -a "$aside/etc/$f" /etc/headscale/
+    done
+    rm -rf "${aside:?}/etc" "${HEADSCALE_LIB:?}" && mv "$aside" "$HEADSCALE_LIB"
 }
 
 cmd_restore() {
@@ -2039,6 +2075,10 @@ cmd_restore() {
     [ -f "$file" ] && [ -f "$identity" ] || die "Usage: connector restore <backup.tar.age> --identity <age or ssh private key file> [--yes]"
     have age || die "age decrypts the backup: install it here (brew install age / apt-get install age)."
     is_admin || die "Only a CNC or manager restores the CNC."
+    # the whole file decrypts with this identity before any of it goes: age
+    # stops at the first chunk that does not, and a tar cut there can still
+    # read, short of what the backup held (the noise key, say)
+    age -d -i "$identity" "$file" >/dev/null || die "${file} does not decrypt whole with ${identity} (above); nothing was sent."
     confirm "Replace the CNC's headscale state with ${file}'s? (the state now is kept aside)" || die "Declined."
     if is_cnc; then
         age -d -i "$identity" "$file" | restore_stream_local

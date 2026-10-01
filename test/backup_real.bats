@@ -150,6 +150,50 @@ CNC_STATE='
     assert_line "systemctl start headscale"
 }
 
+@test "a backup cut short restores nothing, nor does a step that fails, and nothing of it stays in the clear" {
+    run in_node -v "$HS_BIN:/usr/local/bin/headscale:ro" "$CNC_STATE"'
+        ( cmd_backup --out /tmp/b.tar.age --recipient "$ADMIN" ) >/dev/null 2>&1; echo "backup rc=$?"
+        db="$(sha256sum </var/lib/headscale/db.sqlite)"
+        staged() { find /tmp -name backup.tar | wc -l; }
+        # a copy cut short: age writes the chunks it could, then stops
+        head -c 70000 /tmp/b.tar.age >/tmp/cut.tar.age
+        ( cmd_restore /tmp/cut.tar.age --identity /tmp/admin.key --yes ) >/tmp/r1 2>&1; echo "cut rc=$?"
+        echo "said: $(grep -c "does not decrypt whole" /tmp/r1)"
+        # the stream itself cut short, at a member: tar would read what came
+        age -d -i /tmp/admin.key /tmp/b.tar.age >/tmp/full.tar
+        head -c 65536 /tmp/full.tar >/tmp/short.tar
+        ( restore_stream_local </tmp/short.tar ) >/tmp/r2 2>&1; echo "short rc=$?"
+        /usr/local/bin/connector restore-stream </tmp/short.tar >/tmp/r3 2>&1; echo "short stream rc=$?"
+        # a name that climbs out, whole (a space before it no longer hides it)
+        mkdir -p /tmp/s/etc/headscale && echo x >/tmp/s/etc/headscale/x
+        tar -C /tmp/s --transform "s,etc/headscale/x,etc/headscale/a ../../../../tmp/pwned," -cf /tmp/climb.tar ./etc/headscale/x
+        ( restore_stream_local </tmp/climb.tar ) >/tmp/r4 2>&1; echo "climb rc=$?"
+        echo "climb refused: $(grep -c "refused" /tmp/r4)"
+        # putting it in place fails partway: the state before goes back
+        ( cp() { case "$*" in *"/x/var/lib/headscale/."*) return 1 ;; *) command cp "$@" ;; esac; }
+          restore_stream_local </tmp/full.tar ) >/tmp/r5 2>&1; echo "put rc=$?"
+        echo "said: $(grep -c "could not be put in place; the state before is back in place" /tmp/r5)"
+        [ "$(sha256sum </var/lib/headscale/db.sqlite)" = "$db" ] && echo "state as it was"
+        echo "asides: $(ls -d /var/lib/headscale.before-restore-* 2>/dev/null | wc -l)"
+        echo "staged: $(staged)"
+        [ -e /tmp/pwned ] && echo "climbed" || echo "stayed"
+    '
+    assert_success
+    assert_line "backup rc=0"
+    assert_line "cut rc=1"
+    assert_line --index 2 "said: 1"
+    assert_line "short rc=1"
+    assert_line "short stream rc=1"
+    assert_line "climb rc=1"
+    assert_line "climb refused: 1"
+    assert_line "put rc=1"
+    assert_line --index 8 "said: 1"
+    assert_line "state as it was"
+    assert_line "asides: 0"
+    assert_line "staged: 0"
+    assert_line "stayed"
+}
+
 @test "the CNC backs itself up daily, to its recipients alone, keeps the newest, and restore takes what the timer wrote" {
     run in_node -v "$HS_BIN:/usr/local/bin/headscale:ro" "$CNC_STATE"'
         systemctl() { echo "systemctl $*" >>/tmp/systemctl; }

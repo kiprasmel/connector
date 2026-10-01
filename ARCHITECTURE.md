@@ -319,13 +319,19 @@ by mistake never reaches the CNC; and a schedule is put in only for
 recipients age takes, so a typo is refused then, not every day after.
 
 A restore is decrypted where the private key is -- the admin's machine -- and
-streamed to the CNC over SSH. The CNC takes only what a backup holds (files
-and directories under `/var/lib/headscale` and `/etc/headscale`, no link, no
-`..`), stops headscale, keeps its current state aside
+streamed to the CNC over SSH. It is decrypted twice: once whole, to see that
+every chunk of the file decrypts, and only then into the stream -- age stops
+at the first chunk that does not, and a tar cut there can still read, short of
+what the backup held (an identity with a passphrase asks for it twice). The
+CNC takes only what a backup holds (files and directories under
+`/var/lib/headscale` and `/etc/headscale`, no link, no `..` in any name),
+stops headscale, keeps its current state aside
 (`/var/lib/headscale.before-restore-<UTC>`, its `/etc/headscale` files in
 `etc/` within), puts the backup's in place and starts headscale only if
-`headscale configtest` takes it -- otherwise the state before is put back and
-started. A fresh CNC restores the same way after `cnc-init` (same name).
+`headscale configtest` takes it -- otherwise, or when any step of putting it
+in place fails, the state before is put back and started. The backup it
+stages in the clear is removed however the restore ends. A fresh CNC
+restores the same way after `cnc-init` (same name).
 
 ## The headscale release
 
