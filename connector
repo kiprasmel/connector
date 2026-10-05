@@ -2,24 +2,42 @@
 # connector - headscale/tailscale mesh management tool
 set -euo pipefail
 
-VERSION="2.2.0"
+VERSION="3.0.0"
 
 # --- Constants ---------------------------------------------------------------
 HEADSCALE_USER="mesh"
 HEADSCALE_CONFIG="/etc/headscale/config.yaml"
-HEADSCALE_ACL="/etc/headscale/acl.hujson"
+HEADSCALE_ACL="/etc/headscale/acl.hujson"         # what headscale reads: composed (write_acl)
+HEADSCALE_ACL_SITE="/etc/headscale/acl.site.json"  # the site's own rules: never overwritten
+HEADSCALE_OPS_USER="ops"                           # operators' machines: untagged, this user's
+HEADSCALE_BACKUP_RECIPIENTS="/etc/headscale/backup.recipients"  # public keys a backup is encrypted to
+HEADSCALE_BACKUP_DIR="/var/backups/headscale"     # the CNC's daily backups (backup-schedule)
+HEADSCALE_BACKUP_KEEP=14                          # how many of them stay
+BACKUP_UNIT_DIR="/etc/systemd/system"
 HEADSCALE_LIB="/var/lib/headscale"
 HEADSCALE_BIN="/usr/local/bin/headscale"
+# headscale, pinned: a release is this version and the sha256 of each artifact
+# connector installs, bumped together (from the release's checksums.txt, and
+# the artifacts hashed again). A newer headscale already on the CNC is never
+# downgraded: its database has moved on.
+HEADSCALE_VERSION="0.29.4"
+HEADSCALE_SHA256_AMD64_DEB="1f65364716ae1fcc3845b1a65a47583469022e9c6f194dfdfeb25403f89f0841"
+HEADSCALE_SHA256_ARM64_DEB="021a4aeb2106d09c0e6fb5f936acffcbcdea213ef8882b19ea91b03783e1f816"
+HEADSCALE_SHA256_AMD64_BIN="212ed0a884c0d3541e094c4bebbe94397df6f4e01bd3d7f059c520cb55e0d757"
+HEADSCALE_SHA256_ARM64_BIN="cbad8f02524cc6a94955a107a72e1d4cc652ae3f22e740d5c60884e7f384d60e"
+# Where an older connector kept a bare-IP CNC's self-signed certificate: read
+# to say which root its nodes must stop trusting (invite --migrate).
 HEADSCALE_CERT_DIR="${HEADSCALE_LIB}/certs"
 HEADSCALE_CERT="${HEADSCALE_CERT_DIR}/cnc.crt"
-HEADSCALE_KEY="${HEADSCALE_CERT_DIR}/cnc.key"
-HS_TLS_PORT_DEFAULT="8443"
+# How headscale proves the CNC's name to Let's Encrypt: tls-alpn-01, answered
+# on the TLS listener at :443, or http-01, answered on :80.
+HS_ACME_DEFAULT="tls-alpn-01"
 CONNECTOR_BIN="/usr/local/bin/connector"
 CON_BIN="/usr/local/bin/con"        # short 'con' shortcut, symlinked to connector
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/connector"
 CNC_LINK_FILE="${STATE_DIR}/cnc"
 ROLE_FILE="${STATE_DIR}/role"
-CNC_CA_FILE="${STATE_DIR}/cnc-ca.crt"
+CNC_CA_FILE="${STATE_DIR}/cnc-ca.crt"        # an older connector's trusted CNC cert
 ALIASES_FILE="${STATE_DIR}/aliases.conf"
 TMUX_SOCKET="connector"                       # dedicated tmux server socket (-L)
 TMUX_CONF="${STATE_DIR}/tmux.conf"            # connector-managed tmux config
@@ -29,11 +47,17 @@ TMUX_PUSH_CACHE="${STATE_DIR}/tmux-push.cache"  # per-remote sha of last pushed 
 SSH_CONFIG_FILE="${HOME}/.ssh/config"
 KEY_EXPIRY="${CONNECTOR_KEY_EXPIRY:-1h}"
 WSL_MTU="1280"
-TS_INSTALL_URL="https://tailscale.com/install.sh"
+# tailscale's apt repository, trusted by the one key whose fingerprint is
+# pinned here ("Tailscale Inc. (Package repository signing key)", the same for
+# every release pkgs.tailscale.com serves), named alone by its source.
+TS_APT_KEY_FPR="2596A99EAAB33821893C0A79458CA832957F5868"
+TS_APT_KEYRING="/usr/share/keyrings/tailscale-archive-keyring.gpg"
+TS_APT_LIST="/etc/apt/sources.list.d/tailscale.list"
+OS_RELEASE="/etc/os-release"
 TS_MAC_APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
 RESERVED_COMMANDS=(
-    cnc-init cnc-update propagate-update link invite manager-key commander-key register approve list ls revoke
+    cnc-init cnc-update propagate-update link invite manager-key commander-key register migrate-cnc prod-key backup restore backup-stream restore-stream backup-schedule backup-schedule-local backup-local approve list ls revoke
     status whoami hop ssh tmux cnc alias cleanup cleanup-cnc help --help -h
 )
 
@@ -209,9 +233,10 @@ url_port() {
     esac
 }
 
-# SHA-256 fingerprint (lowercase hex, no colons) of a PEM cert on stdin.
+# SHA-256 fingerprint (lowercase hex, no colons) of a PEM cert on stdin;
+# nothing, and rc 0, when stdin holds none.
 fp_of_pem() {
-    openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+    { openssl x509 -noout -fingerprint -sha256 2>/dev/null || true; } \
         | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f' | tr -d '[:space:]'
 }
 
@@ -237,21 +262,30 @@ node_role() {
 }
 is_provider() { role_has "$(node_role)" provider; }
 is_consumer() { role_has "$(node_role)" consumer; }
+is_ops()      { role_has "$(node_role)" ops; }
 is_node()     { have tailscale && tailscale status >/dev/null 2>&1; }
 
 # Canonicalize a comma/space separated node-role spec into an ordered, de-duped
 # CSV of tailnet roles (provider[,consumer]). 'both' stays as a legacy alias.
 # Dies on any unknown role. Empty input yields empty output (no error).
 parse_node_roles() {
-    local tok p=0 c=0 out=""
+    local tok p=0 c=0 o=0 out=""
     for tok in $(printf '%s' "${1:-}" | tr ',' ' '); do
         case "$tok" in
             provider) p=1 ;;
             consumer) c=1 ;;
             both)     p=1; c=1 ;;
-            *) die "Invalid role: '$tok' (expected provider and/or consumer)" ;;
+            ops)      o=1 ;;
+            prod|tag:*) die "A prod machine is not tagged through connector's roles: its key comes from 'connector prod-key' alone." ;;
+            *) die "Invalid role: '$tok' (expected provider and/or consumer, or ops)" ;;
         esac
     done
+    if [ "$o" = 1 ]; then
+        # an operator's machine is untagged (headscale user ops); tags would make it someone else
+        [ "$p$c" = 00 ] || die "ops is a machine of its own (an operator's, untagged): not with provider or consumer."
+        printf 'ops'
+        return 0
+    fi
     [ "$p" = 1 ] && out="provider"
     [ "$c" = 1 ] && out="${out:+$out,}consumer"
     printf '%s' "$out"
@@ -271,6 +305,7 @@ current_roles() {
     is_manager && roles+=("manager")
     is_provider   && roles+=("provider")
     is_consumer   && roles+=("consumer")
+    is_ops        && roles+=("ops")
     if [ "${#roles[@]}" -eq 0 ]; then
         if is_node; then roles+=("node (untagged)"); else roles+=("unconfigured"); fi
     fi
@@ -290,29 +325,61 @@ resolve_ssh_user() {
     [ -n "$user" ] && printf '%s\n' "$user"
 }
 
+# What a link's <key> may hold: an ssh target (never an option), a URL, a
+# port, a user name. Args: key, value
+link_value_ok() {
+    case "$1" in
+        CNC_SSH)  [[ "$2" =~ ^([a-z_][a-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9._%:-]*$ ]] ;;
+        CNC_URL)  [[ "$2" =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?/?$ ]] ;;
+        CNC_PORT) [[ -z "$2" || "$2" =~ ^[0-9]{1,5}$ ]] ;;
+        CNC_USER) [[ -z "$2" || "$2" =~ ^[a-z_][a-z0-9_.-]*[$]?$ ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# The manager link -- CNC_SSH, CNC_URL, CNC_PORT, CNC_USER -- read as
+# KEY=VALUE text and never sourced: each value bare or in double quotes, and
+# what its key may hold (link_value_ok). Any other line -- another key, code,
+# a value that could be read as one -- is refused, not run to find out.
 load_cnc_link() {
+    local line key val n=0
+    local re_quoted='^(CNC_SSH|CNC_URL|CNC_PORT|CNC_USER)="([^"]*)"$'
+    local re_bare='^(CNC_SSH|CNC_URL|CNC_PORT|CNC_USER)=([^"[:space:]]*)$'
     [ -f "$CNC_LINK_FILE" ] || die "No CNC linked. Run: connector link <user@host> --url https://..."
-    CNC_USER=""
-    # shellcheck disable=SC1090
-    . "$CNC_LINK_FILE"
+    CNC_SSH="" CNC_URL="" CNC_PORT="" CNC_USER=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line="${line%$'\r'}"
+        case "$line" in ''|'#'*) continue ;; esac
+        if [[ "$line" =~ $re_quoted ]] || [[ "$line" =~ $re_bare ]]; then
+            key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+        else
+            die "${CNC_LINK_FILE}:${n} is not a line connector writes; refused (re-link: connector link <host> --url https://<name>)."
+        fi
+        link_value_ok "$key" "$val" || die "${CNC_LINK_FILE}:${n}: that is no ${key} ('${val:0:40}'); refused."
+        printf -v "$key" '%s' "$val"
+    done <"$CNC_LINK_FILE"
+    [ -n "$CNC_SSH" ] || die "${CNC_LINK_FILE} names no CNC (CNC_SSH); re-link: connector link <host> --url https://<name>."
     # Prefer a stored user; else derive it (handles bare SSH aliases like 'nyc').
     if [ -z "${CNC_USER:-}" ]; then
-        CNC_USER="$(resolve_ssh_user "$CNC_SSH")"
+        CNC_USER="$(resolve_ssh_user "$CNC_SSH" || true)"
         [ -n "$CNC_USER" ] || CNC_USER="$(id -un)"
     fi
 }
 
+# Write the manager link, each value checked as load_cnc_link reads it: a
+# link connector would refuse is never written. 0600 from the start.
 save_cnc_link() {
-    local ssh_target="$1" url="$2" port="${3:-}" user
-    user="$(resolve_ssh_user "$ssh_target")"; [ -n "$user" ] || user="$(id -un)"
+    local ssh_target="$1" url="$2" port="${3:-}" user tmp
+    link_value_ok CNC_SSH "$ssh_target" || die "'${ssh_target}' is not an ssh target connector links to (user@host, or an alias)."
+    link_value_ok CNC_URL "$url" || die "'${url}' is not a URL connector links to."
+    link_value_ok CNC_PORT "$port" || die "'${port}' is not a port."
+    user="$(resolve_ssh_user "$ssh_target" || true)"; [ -n "$user" ] || user="$(id -un)"
+    link_value_ok CNC_USER "$user" || user=""
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-    {
-        echo "CNC_SSH=\"$ssh_target\""
-        echo "CNC_URL=\"$url\""
-        echo "CNC_PORT=\"$port\""
-        echo "CNC_USER=\"$user\""
-    } > "$CNC_LINK_FILE"
-    chmod 600 "$CNC_LINK_FILE"
+    tmp="$(mktemp "${CNC_LINK_FILE}.XXXXXX")" || die "Could not write ${CNC_LINK_FILE}."
+    { printf 'CNC_SSH="%s"\nCNC_URL="%s"\nCNC_PORT="%s"\nCNC_USER="%s"\n' "$ssh_target" "$url" "$port" "$user" >"$tmp" \
+        && chmod 600 "$tmp" && mv -f "$tmp" "$CNC_LINK_FILE"; } || { rm -f "$tmp"; die "Could not write ${CNC_LINK_FILE}."; }
 }
 
 _ssh_port_flag() { [ -n "${CNC_PORT:-}" ] && printf -- '-p %s' "$CNC_PORT" || true; }
@@ -379,30 +446,58 @@ detect_arch() {
     esac
 }
 
+# The installed headscale's version (x.y.z), or nothing.
+headscale_installed_version() {
+    have headscale || return 0
+    { headscale version 2>/dev/null || true; } | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^v?[0-9]+[.][0-9]+[.][0-9]+$/) { sub(/^v/, "", $i); print $i; exit } }'
+}
+
+# Is version <a> older than <b>?
+version_lt() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | awk 'NR == 1')" = "$1" ]
+}
+
+# The pinned release's artifact for <arch> as <kind> (deb | bin): its file
+# name, then its sha256. Rc 1 when the pin has none.
+headscale_artifact() {
+    local sha
+    case "$1/$2" in
+        amd64/deb) sha="$HEADSCALE_SHA256_AMD64_DEB" ;;
+        arm64/deb) sha="$HEADSCALE_SHA256_ARM64_DEB" ;;
+        amd64/bin) sha="$HEADSCALE_SHA256_AMD64_BIN" ;;
+        arm64/bin) sha="$HEADSCALE_SHA256_ARM64_BIN" ;;
+        *) return 1 ;;
+    esac
+    printf 'headscale_%s_linux_%s%s %s\n' "$HEADSCALE_VERSION" "$1" "$([ "$2" = deb ] && echo .deb)" "$sha"
+}
+
+# headscale at the pinned release: downloaded, checked against its pinned
+# sha256 before anything is installed, and put in over an older one.
 install_headscale() {
-    if have headscale; then
-        log_info "headscale already installed"
+    local have_ver arch kind name sha tmp
+    have_ver="$(headscale_installed_version)"
+    if [ "$have_ver" = "$HEADSCALE_VERSION" ]; then
+        log_info "headscale ${HEADSCALE_VERSION} (the pinned release) is installed"
         return 0
     fi
-    local ver="${HEADSCALE_VERSION:-}"
-    if [ -z "$ver" ]; then
-        log_info "Resolving latest headscale release..."
-        ver="$(curl -fsSL https://api.github.com/repos/juanfont/headscale/releases/latest | json_str tag_name)"
+    if [ -n "$have_ver" ] && version_lt "$HEADSCALE_VERSION" "$have_ver"; then
+        die "headscale ${have_ver} is installed, newer than the pinned ${HEADSCALE_VERSION}: connector never downgrades it (its database has moved on); bump the pin instead."
     fi
-    [ -n "$ver" ] || die "Could not determine headscale version (set HEADSCALE_VERSION=vX.Y.Z)"
-    local arch num tmp
-    arch="$(detect_arch)"; num="${ver#v}"; tmp="$(mktemp -d)"
-    if have apt-get; then
-        log_info "Installing headscale ${ver} (.deb, ${arch})..."
-        curl -fsSL -o "$tmp/headscale.deb" \
-            "https://github.com/juanfont/headscale/releases/download/${ver}/headscale_${num}_linux_${arch}.deb"
+    arch="$(detect_arch)"
+    if have apt-get; then kind="deb"; else kind="bin"; fi
+    read -r name sha < <(headscale_artifact "$arch" "$kind") || true
+    [ -n "${sha:-}" ] || die "No pinned headscale ${HEADSCALE_VERSION} for linux/${arch} (${kind})."
+    tmp="$(mktemp -d)"
+    log_info "Installing headscale ${HEADSCALE_VERSION} (${kind}, ${arch})${have_ver:+ over ${have_ver}}..."
+    curl -fsSL -o "$tmp/$name" "https://github.com/juanfont/headscale/releases/download/v${HEADSCALE_VERSION}/${name}" \
+        || { rm -rf "$tmp"; die "Could not download ${name}."; }
+    [ "$(file_sha256 "$tmp/$name")" = "$sha" ] \
+        || { rm -rf "$tmp"; die "${name} is not the pinned release (its sha256 is not ${sha}); nothing installed."; }
+    if [ "$kind" = "deb" ]; then
         as_root apt-get update -y
-        as_root apt-get install -y "$tmp/headscale.deb"
+        as_root apt-get install -y "$tmp/$name"
     else
-        log_info "Installing headscale ${ver} (binary, ${arch})..."
-        curl -fsSL -o "$tmp/headscale" \
-            "https://github.com/juanfont/headscale/releases/download/${ver}/headscale_${num}_linux_${arch}"
-        as_root install -m 0755 "$tmp/headscale" "$HEADSCALE_BIN"
+        as_root install -m 0755 "$tmp/$name" "$HEADSCALE_BIN"
         install_headscale_service
     fi
     rm -rf "$tmp"
@@ -432,157 +527,119 @@ EOF
     as_root systemctl daemon-reload
 }
 
-# Generate a long-lived self-signed cert with the IP in the SAN (idempotent).
-gen_self_signed() {
-    local ip="$1"
-    if [ -s "$HEADSCALE_CERT" ] && [ -s "$HEADSCALE_KEY" ] \
-        && as_root openssl x509 -in "$HEADSCALE_CERT" -noout -text 2>/dev/null | grep -q "IP Address:${ip}\b"; then
-        log_info "Reusing existing self-signed cert for ${ip}"
-    else
-        have openssl || as_root apt-get install -y openssl >/dev/null 2>&1 || true
-        log_info "Generating self-signed TLS cert for ${ip} (10y, P-256)..."
-        as_root mkdir -p "$HEADSCALE_CERT_DIR"
-        as_root openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-            -days 3650 -subj "/CN=${ip}" -addext "subjectAltName=IP:${ip}" \
-            -keyout "$HEADSCALE_KEY" -out "$HEADSCALE_CERT" >/dev/null 2>&1 \
-            || die "openssl certificate generation failed"
+# --- The CNC's name and certificate -------------------------------------------
+# The CNC is a DNS name, and headscale gets that name's certificate from Let's
+# Encrypt itself (ACME) and renews it in-process: a node verifies the control
+# server against the public roots it already has, and connector installs no
+# trust root on any machine. (An older connector served a bare IP with a
+# self-signed CA:TRUE certificate and trusted it as a root on every node:
+# whoever held its key could pass for any site to all of them. migrate-cnc
+# takes a node off it.)
+
+# Can <url> be the CNC's? https, a DNS name, a port (1-65535) or none, and
+# nothing else. Says why not.
+cnc_url_ok() {
+    local url="$1" host port re='^https://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:([0-9]{1,5}))?/?$'
+    [[ "$url" =~ $re ]] || { log_error "The CNC's URL is https://<name>[:port], not '$url'."; return 1; }
+    host="${BASH_REMATCH[1]}" port="${BASH_REMATCH[3]}"
+    host="${host#\[}"; host="${host%\]}"
+    if is_ip "$host"; then
+        log_error "The CNC is a DNS name, not an address ($host): point an A record at it and use https://<name>."
+        log_error "(connector no longer makes every node trust a certificate of its own; 'connector migrate-cnc' moves a node off one.)"
+        return 1
     fi
-    # headscale (.deb) runs as user 'headscale'; binary install runs as root.
-    as_root chown -R headscale:headscale "$HEADSCALE_CERT_DIR" 2>/dev/null || true
-    as_root chmod 750 "$HEADSCALE_CERT_DIR" 2>/dev/null || true
-    as_root chmod 640 "$HEADSCALE_KEY"  2>/dev/null || true
-    as_root chmod 644 "$HEADSCALE_CERT" 2>/dev/null || true
+    [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] \
+        || { log_error "'$host' is not a DNS name."; return 1; }
+    [ -z "$port" ] || (( 10#$port >= 1 && 10#$port <= 65535 )) || { log_error "'$port' is not a port."; return 1; }
 }
 
-# Print the CNC's self-signed cert PEM (local file on cnc, or over SSH).
-cnc_cert_pem() {
-    if is_cnc; then
-        as_root cat "$HEADSCALE_CERT" 2>/dev/null
-    elif is_manager; then
-        load_cnc_link
-        if [ "$CNC_USER" = "root" ]; then ssh_cnc cat "$HEADSCALE_CERT" 2>/dev/null
-        else ssh_cnc sudo cat "$HEADSCALE_CERT" 2>/dev/null; fi
-    fi
+# SHA-1 (uppercase hex, no colons) of a PEM cert on stdin: what macOS's
+# security(1) names a certificate by. Nothing, and rc 0, when stdin holds none.
+sha1_of_pem() {
+    { openssl x509 -noout -fingerprint -sha1 2>/dev/null || true; } | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F' | tr -d '[:space:]'
 }
-
-cnc_cert_fingerprint() { cnc_cert_pem | fp_of_pem; }
 
 # p11-kit anchor directories used by Fedora/RHEL, Arch, and SUSE respectively.
 CA_ANCHOR_DIRS="/etc/pki/ca-trust/source/anchors /etc/ca-certificates/trust-source/anchors /etc/pki/trust/anchors"
+MACOS_SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
 
-# Add a PEM CA file to the Linux system trust store across distro families.
-# Returns non-zero if no trust mechanism could be used.
-linux_trust_ca() {
-    local crt="$1" d=""
-    # Nothing to drive the store yet? Try to install the standard package.
-    if ! have update-ca-certificates && ! have update-ca-trust && ! have trust; then
-        pkg_install ca-certificates >/dev/null 2>&1 || true
-    fi
-    if have update-ca-certificates; then            # Debian/Ubuntu (incl. WSL)
-        as_root mkdir -p /usr/local/share/ca-certificates || return 1
-        as_root install -m 0644 "$crt" /usr/local/share/ca-certificates/headscale-cnc.crt || return 1
-        as_root update-ca-certificates >/dev/null 2>&1 || return 1
-    elif have update-ca-trust; then                 # Fedora/RHEL/Arch/SUSE (p11-kit)
-        for c in $CA_ANCHOR_DIRS; do [ -d "$c" ] && { d="$c"; break; }; done
-        [ -n "$d" ] || { d="/etc/ca-certificates/trust-source/anchors"; as_root mkdir -p "$d" || return 1; }
-        as_root install -m 0644 "$crt" "$d/headscale-cnc.crt" || return 1
-        as_root update-ca-trust extract >/dev/null 2>&1 || as_root update-ca-trust >/dev/null 2>&1 || return 1
-    elif have trust; then                            # generic p11-kit
-        as_root trust anchor --store "$crt" >/dev/null 2>&1 || return 1
-    else
-        return 1
-    fi
-}
-
-# Install + trust a CNC cert (PEM on stdin) in this machine's trust store.
-# The local marker (CNC_CA_FILE) is only kept when trust actually succeeds, so
-# a failed attempt is retried on the next run instead of being skipped.
-trust_cnc_cert() {
-    local pem; pem="$(cat)"
-    [ -n "$pem" ] || { log_warn "No CNC certificate to trust."; return 1; }
-    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-    printf '%s\n' "$pem" > "$CNC_CA_FILE"; chmod 644 "$CNC_CA_FILE"
+# Stop trusting the certificate whose SHA-256 is <want>, which an older
+# connector made this machine trust as a root: that certificate, matched by
+# its fingerprint, and nothing else. Rc 0 whether it was there or not.
+# Args: sha256 (lowercase hex)
+untrust_cert_sha256() {
+    local want="$1"
+    [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { log_error "'$want' is not a SHA-256 fingerprint."; return 1; }
     case "$(os_kind)" in
-        macos)
-            log_info "Trusting the CNC certificate in the macOS System keychain (needs sudo)..."
-            sudo security add-trusted-cert -d -r trustRoot -p ssl \
-                -k /Library/Keychains/System.keychain "$CNC_CA_FILE" \
-                || { rm -f "$CNC_CA_FILE"; log_error "Failed to add the cert to the System keychain."; return 1; }
-            ;;
-        linux)
-            linux_trust_ca "$CNC_CA_FILE" \
-                || { rm -f "$CNC_CA_FILE"; log_error "Could not add the cert to the system trust store."; return 1; }
-            ;;
-        *) log_warn "Unknown OS; trust $CNC_CA_FILE manually." ;;
+        macos) untrust_macos_sha256 "$want" ;;
+        linux) untrust_linux_sha256 "$want" ;;
+        *)     log_warn "Unknown OS; remove the certificate $want from its trust store by hand." ;;
     esac
-    log_success "Trusted the CNC certificate."
 }
 
-# Remove a previously-trusted CNC cert. untrust_cnc_cert [common-name]
-untrust_cnc_cert() {
-    local cn="${1:-}" d
-    case "$(os_kind)" in
-        macos) [ -n "$cn" ] && sudo security delete-certificate -c "$cn" /Library/Keychains/System.keychain 2>/dev/null || true ;;
-        linux)
-            as_root rm -f /usr/local/share/ca-certificates/headscale-cnc.crt 2>/dev/null || true
-            have update-ca-certificates && as_root update-ca-certificates --fresh >/dev/null 2>&1 || true
-            for d in $CA_ANCHOR_DIRS; do as_root rm -f "$d/headscale-cnc.crt" 2>/dev/null || true; done
-            have update-ca-trust && { as_root update-ca-trust extract >/dev/null 2>&1 || as_root update-ca-trust >/dev/null 2>&1 || true; }
-            ;;
-    esac
-    rm -f "$CNC_CA_FILE" 2>/dev/null || true
+# macOS: every certificate in the System keychain, each hashed here, and the
+# one that matches removed with its trust setting.
+untrust_macos_sha256() {
+    local want="$1" dir f sha1 found=0
+    dir="$(mktemp -d)"
+    security find-certificate -a -p "$MACOS_SYSTEM_KEYCHAIN" 2>/dev/null \
+        | awk -v d="$dir" '/-----BEGIN CERTIFICATE-----/ { n++; f = d "/" n ".pem" } f { print > f } /-----END CERTIFICATE-----/ { close(f); f = "" }'
+    for f in "$dir"/*.pem; do
+        [ -f "$f" ] || continue
+        [ "$(fp_of_pem <"$f")" = "$want" ] || continue
+        sha1="$(sha1_of_pem <"$f")"
+        log_info "Removing the old CNC certificate from the System keychain (SHA-1 ${sha1}; needs sudo)..."
+        sudo security remove-trusted-cert -d "$f" 2>/dev/null || true
+        sudo security delete-certificate -Z "$sha1" "$MACOS_SYSTEM_KEYCHAIN" \
+            || { rm -rf "$dir"; log_error "Could not remove it; by hand: sudo security delete-certificate -Z $sha1 $MACOS_SYSTEM_KEYCHAIN"; return 1; }
+        found=1
+    done
+    rm -rf "$dir"
+    if [ "$found" = 1 ]; then log_success "The old CNC certificate is no longer trusted."
+    else log_info "No certificate ${want:0:16}... in the System keychain; nothing to remove."; fi
 }
 
-# Ensure this machine trusts the CNC's self-signed cert (only for IP CNCs).
-# establish_cnc_trust <url> [pin-sha256]
-establish_cnc_trust() {
-    local url="$1" pin="${2:-}" host port pem livefp
-    [ "${url%%://*}" = "https" ] || return 0
-    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
-    is_ip "$host" || return 0                      # public-domain CNC = publicly-trusted cert
-    [ -s "$CNC_CA_FILE" ] && return 0              # already trusted
-    if is_manager; then
-        pem="$(cnc_cert_pem)"
-        [ -n "$pem" ] || die "Could not read the CNC cert over SSH."
-    else
-        pem="$(fetch_live_cert "$host" "$port")"
-        [ -n "$pem" ] || die "Could not fetch a TLS cert from ${host}:${port}."
-        livefp="$(printf '%s\n' "$pem" | fp_of_pem)"
-        if [ -n "$pin" ]; then
-            [ "$livefp" = "$pin" ] || die "CNC cert fingerprint mismatch (pinned $pin, got $livefp)."
-        else
-            log_warn "No --ca-sha256 pin given; cert presented by ${host}:${port} has fingerprint:"
-            log_warn "  $livefp"
-            confirm "Trust this CNC certificate?" || die "Declined."
+# Linux: the files an older connector wrote into the CA store, each only if it
+# is that certificate, then the store rebuilt; and p11-kit's own copy.
+untrust_linux_sha256() {
+    local want="$1" f d removed=0
+    for f in /usr/local/share/ca-certificates/headscale-cnc.crt $(for d in $CA_ANCHOR_DIRS; do printf '%s/headscale-cnc.crt ' "$d"; done); do
+        [ -f "$f" ] || continue
+        if [ "$(fp_of_pem <"$f")" != "$want" ]; then
+            log_warn "$f is not the certificate ${want:0:16}...; left as it is."
+            continue
+        fi
+        as_root rm -f "$f" || return 1
+        removed=1
+    done
+    if [ "$removed" = 1 ]; then
+        if have update-ca-certificates; then as_root update-ca-certificates --fresh >/dev/null 2>&1 || return 1; fi
+        if have update-ca-trust; then
+            as_root update-ca-trust extract >/dev/null 2>&1 || as_root update-ca-trust >/dev/null 2>&1 || return 1
         fi
     fi
-    printf '%s\n' "$pem" | trust_cnc_cert
+    # `trust anchor --store` kept a copy under a name of its own; it is removed by the certificate itself.
+    if have trust && [ -s "$CNC_CA_FILE" ] && [ "$(fp_of_pem <"$CNC_CA_FILE")" = "$want" ]; then
+        as_root trust anchor --remove "$CNC_CA_FILE" >/dev/null 2>&1 && removed=1
+    fi
+    if [ "$removed" = 1 ]; then log_success "The old CNC certificate is no longer trusted."
+    else log_info "No certificate ${want:0:16}... in the CA store; nothing to remove."; fi
 }
 
-write_headscale_config() {
-    local url="$1" base_domain="$2" host scheme port listen_addr tls_block
-    host="$(url_host "$url")"; port="$(url_port "$url")"
-    scheme="${url%%://*}"
-    if [ "$scheme" = "https" ] && is_ip "$host"; then
-        [ -n "$port" ] || port="$HS_TLS_PORT_DEFAULT"
-        listen_addr="0.0.0.0:${port}"
-        gen_self_signed "$host"
-        tls_block=$(printf 'tls_cert_path: "%s"\ntls_key_path: "%s"\ntls_letsencrypt_hostname: ""' "$HEADSCALE_CERT" "$HEADSCALE_KEY")
-    elif [ "$scheme" = "https" ]; then
-        [ -n "$port" ] || port="443"
-        listen_addr="0.0.0.0:${port}"
-        tls_block=$(printf 'tls_letsencrypt_hostname: "%s"\ntls_letsencrypt_cache_dir: %s/cache\ntls_letsencrypt_challenge_type: TLS-ALPN-01' "$host" "$HEADSCALE_LIB")
-    else
-        [ -n "$port" ] || port="8080"
-        listen_addr="0.0.0.0:${port}"
-        tls_block='tls_letsencrypt_hostname: ""'
-        log_warn "URL is not https; headscale will serve plain HTTP on :${port} (clients need an https endpoint or a TLS proxy)."
-    fi
-    as_root mkdir -p /etc/headscale "$HEADSCALE_LIB"
-    as_root tee "$HEADSCALE_CONFIG" >/dev/null <<EOF
-# Generated by connector $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# headscale's config for <url>, a DNS name whose certificate headscale gets by
+# ACME <challenge> (tls-alpn-01 | http-01). Stdout. Args: url, base_domain, challenge
+render_headscale_config() {
+    local url="$1" base_domain="$2" challenge="$3" host port acme
+    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
+    case "$challenge" in
+        tls-alpn-01) acme="tls_letsencrypt_challenge_type: TLS-ALPN-01" ;;
+        http-01)     acme="$(printf 'tls_letsencrypt_challenge_type: HTTP-01\ntls_letsencrypt_listen: ":http"')" ;;
+        *) log_error "Unknown ACME challenge '$challenge' (tls-alpn-01 or http-01)."; return 1 ;;
+    esac
+    cat <<EOF
+# Written by connector cnc-init: an edit here is replaced on its next run.
 server_url: ${url}
-listen_addr: ${listen_addr}
+listen_addr: 0.0.0.0:${port}
 metrics_listen_addr: 127.0.0.1:9090
 grpc_listen_addr: 127.0.0.1:50443
 grpc_allow_insecure: false
@@ -616,7 +673,9 @@ database:
   sqlite:
     path: ${HEADSCALE_LIB}/db.sqlite
 
-${tls_block}
+tls_letsencrypt_hostname: "${host}"
+tls_letsencrypt_cache_dir: ${HEADSCALE_LIB}/cache
+${acme}
 
 log:
   level: info
@@ -638,12 +697,20 @@ dns:
 unix_socket: /var/run/headscale/headscale.sock
 unix_socket_permission: "0770"
 EOF
+}
+
+write_headscale_config() {
+    local cfg
+    cfg="$(render_headscale_config "$1" "$2" "$3")" || return 1
+    as_root mkdir -p /etc/headscale "$HEADSCALE_LIB"
+    printf '%s\n' "$cfg" | as_root tee "$HEADSCALE_CONFIG" >/dev/null
     as_root chmod 644 "$HEADSCALE_CONFIG"
 }
 
-write_acl() {
-    as_root mkdir -p /etc/headscale
-    as_root tee "$HEADSCALE_ACL" >/dev/null <<EOF
+# connector's own policy: consumers reach providers, and SSH to them as a
+# non-root user. Stdout (strict JSON).
+render_acl() {
+    cat <<EOF
 {
   "tagOwners": {
     "tag:provider": ["${HEADSCALE_USER}@"],
@@ -662,28 +729,178 @@ write_acl() {
   ]
 }
 EOF
-    as_root chmod 644 "$HEADSCALE_ACL"
 }
 
-open_firewall() {
-    local tcp_port="${1:-$HS_TLS_PORT_DEFAULT}" desc
-    desc="${tcp_port}/tcp, 3478/udp, 41641/udp"
-    if have ufw && as_root ufw status 2>/dev/null | grep -q "Status: active"; then
-        as_root ufw allow "${tcp_port}/tcp" >/dev/null 2>&1 || true
-        as_root ufw allow 3478/udp  >/dev/null 2>&1 || true
-        as_root ufw allow 41641/udp >/dev/null 2>&1 || true
-        log_success "ufw rules added (${desc})"
-    elif have firewall-cmd && as_root firewall-cmd --state >/dev/null 2>&1; then
-        as_root firewall-cmd --permanent --add-port="${tcp_port}/tcp" >/dev/null 2>&1 || true
-        as_root firewall-cmd --permanent --add-port=3478/udp  >/dev/null 2>&1 || true
-        as_root firewall-cmd --permanent --add-port=41641/udp >/dev/null 2>&1 || true
-        as_root firewall-cmd --reload >/dev/null 2>&1 || true
-        log_success "firewalld rules added (${desc})"
-    else
-        # No active host firewall (e.g. ufw inactive) - do NOT enable one (lockout risk).
-        log_info "No active host firewall detected; not enabling one."
-        log_info "Ensure these are open (including any cloud firewall): ${desc}"
+# The site's own rules, written only where there are none and never
+# overwritten: the site edits them (strict JSON). This default is the
+# operators' (machines of headscale user ops, group:ops): they reach prod
+# machines (tag:prod) on ssh and https and nothing else of them, and what a
+# consumer reaches. A prod machine is granted nothing, and no one has
+# Tailscale SSH to one: OpenSSH keys stay the way in. Stdout.
+render_site_acl() {
+    cat <<EOF
+{
+  "groups": { "group:ops": ["${HEADSCALE_OPS_USER}@"] },
+  "tagOwners": { "tag:prod": ["group:ops"] },
+  "acls": [
+    { "action": "accept", "src": ["group:ops"], "dst": ["tag:prod:22,443"] },
+    { "action": "accept", "src": ["group:ops"], "dst": ["tag:provider:*"] }
+  ],
+  "ssh": [
+    { "action": "accept", "src": ["group:ops"], "dst": ["tag:provider"], "users": ["autogroup:nonroot"] }
+  ]
+}
+EOF
+}
+
+# connector's rules and the site's, as headscale reads them: groups,
+# tagOwners and hosts from both (the site's winning a name both use), acls
+# and ssh rules connector's, then the site's. A site fragment holding
+# anything else (grants, autoApprovers, ...) is refused, never dropped
+# unseen. Args: base file, site file. Stdout.
+compose_acl() {
+    jq -n --slurpfile b "$1" --slurpfile s "$2" '
+        $b[0] as $b | ($s[0] // {}) as $s
+        | ($s | if type == "object" then keys - ["groups", "tagOwners", "hosts", "acls", "ssh"] else ["(it is no object)"] end) as $more
+        | if $more == [] then . else error("connector composes groups, tagOwners, hosts, acls and ssh from the site, and nothing else: not \($more | join(", "))") end
+        | { groups:    (($b.groups // {}) + ($s.groups // {})),
+            tagOwners: (($b.tagOwners // {}) + ($s.tagOwners // {})),
+            hosts:     (($b.hosts // {}) + ($s.hosts // {})),
+            acls:      (($b.acls // []) + ($s.acls // [])),
+            ssh:       (($b.ssh // []) + ($s.ssh // [])) }
+        | with_entries(select(.value | length > 0))'
+}
+
+# Does the policy in <file> grant a prod machine (tag:prod...) nothing, and
+# give no one SSH to one? No acl's source, and no ssh rule's source or
+# destination, may take one in: a tag:prod... tag, "*", autogroup:tagged or
+# autogroup:danger-all, or an address or prefix holding an address of the
+# tailnet's (render_headscale_config's prefixes), itself or by a hosts name.
+# What it cannot read counts as taking one in. Says which rules when not.
+acl_keeps_prod_closed() {
+    local bad
+    bad="$(jq -c '
+        def v4: if test("^[0-9]{1,3}([.][0-9]{1,3}){3}$") then split(".") | map(tonumber) | .[0] * 16777216 + .[1] * 65536 + .[2] * 256 + .[3] else null end;
+        def hex: ascii_downcase | explode | reduce .[] as $c (0; . * 16 + (if $c >= 97 then $c - 87 else $c - 48 end));
+        # the first 48 bits of an IPv6 address, or null
+        def v6_48:
+            if test("^[0-9A-Fa-f:]+$") | not then null
+            else (if test("::") then (split("::") | map(if . == "" then [] else split(":") end)) as [$h, $t]
+                    | $h + [range(8 - ($h | length) - ($t | length)) | "0"] + $t
+                  else split(":") end)
+                 | if length == 8 and all(.[]; test("^[0-9A-Fa-f]{1,4}$")) then (.[0] | hex) * 4294967296 + (.[1] | hex) * 65536 + (.[2] | hex) else null end
+            end;
+        # do <a>/<n> and <b>/<m> share an address, in <bits>? Their first min(n, m) bits agree.
+        def meet($a; $n; $b; $m; $bits): pow(2; $bits - ([$n, $m] | min)) as $blk | (($a / $blk) | floor) == (($b / $blk) | floor);
+        def holds_tailnet:
+            split("/") as $p | (($p[1] // null) | if . == null then null else (tonumber? // -1) end) as $len
+            | if ($p | length) > 2 then true
+              elif ($p[0] | test(":")) then ($p[0] | v6_48) as $a | ($len // 128) as $n
+                | if $a == null or $n < 0 or $n > 128 then true
+                  else meet($a; [$n, 48] | min; "fd7a:115c:a1e0::" | v6_48; 48; 48) end
+              else ($p[0] | v4) as $a | ($len // 32) as $n
+                | if $a == null or $n < 0 or $n > 32 then true
+                  else meet($a; $n; "100.64.0.0" | v4; 10; 32) end
+              end;
+        def takes_prod($hosts):
+            if type != "string" then true
+            elif startswith("tag:") then startswith("tag:prod")
+            elif . == "*" or . == "autogroup:tagged" or . == "autogroup:danger-all" then true
+            elif startswith("autogroup:") or startswith("group:") or contains("@") then false
+            elif $hosts[.] != null then ($hosts[.] | if type == "string" then holds_tailnet else true end)
+            else holds_tailnet end;
+        (.hosts // {}) as $h
+        | ((.acls // [])[] | select(any(.src[]?; takes_prod($h)))),
+          ((.ssh // [])[] | select(any(.src[]?, .dst[]?; takes_prod($h))))' "$1")" || return 1
+    [ -n "$bad" ] || return 0
+    log_error "A prod machine is granted nothing, and no one gets SSH to one; refused:"
+    printf '%s\n' "$bad" | sed 's/^/    /' >&2
+    return 1
+}
+
+# The policy headscale reads: connector's rules and the site's, composed --
+# the site's written first where there are none, never overwritten -- and
+# refused when it would open a prod machine (acl_keeps_prod_closed).
+write_acl() {
+    local tmp
+    have jq || { log_error "jq composes the policy: apt-get install jq"; return 1; }
+    tmp="$(mktemp -d)"
+    render_acl >"$tmp/base.json"
+    if ! as_root test -e "$HEADSCALE_ACL_SITE"; then
+        as_root mkdir -p /etc/headscale
+        render_site_acl | as_root tee "$HEADSCALE_ACL_SITE" >/dev/null
+        as_root chmod 644 "$HEADSCALE_ACL_SITE"
+        log_info "Wrote the site's policy ${HEADSCALE_ACL_SITE}: yours from now on (connector never overwrites it)."
     fi
+    as_root cat "$HEADSCALE_ACL_SITE" >"$tmp/site.json"
+    if ! compose_acl "$tmp/base.json" "$tmp/site.json" >"$tmp/acl.json" 2>"$tmp/err"; then
+        log_error "${HEADSCALE_ACL_SITE} is not composed (strict JSON, and what connector composes): $(cat "$tmp/err")"
+        rm -rf "$tmp"; return 1
+    fi
+    acl_keeps_prod_closed "$tmp/acl.json" || { rm -rf "$tmp"; return 1; }
+    as_root install -m 644 "$tmp/acl.json" "$HEADSCALE_ACL"
+    rm -rf "$tmp"
+}
+
+# headscale's new config and policy, put in place only if headscale takes
+# them: the ones before are kept beside them and put back when configtest
+# refuses, so a CNC is never restarted onto what its headscale cannot run.
+# Args: url, base_domain, challenge
+apply_headscale_config() {
+    local f err
+    for f in "$HEADSCALE_CONFIG" "$HEADSCALE_ACL"; do
+        if as_root test -f "$f"; then as_root cp -p "$f" "$f.prev"; else as_root rm -f "$f.prev"; fi
+    done
+    write_headscale_config "$1" "$2" "$3" && write_acl && err="$(as_root headscale configtest 2>&1)" && return 0
+    for f in "$HEADSCALE_CONFIG" "$HEADSCALE_ACL"; do
+        if as_root test -f "$f.prev"; then as_root mv -f "$f.prev" "$f"; else as_root rm -f "$f"; fi
+    done
+    log_error "Not applied; the config and policy before are back in place."
+    [ -z "${err:-}" ] || printf '%s\n' "$err" | awk '/[Ee]rror|[Ff]atal|not found/' >&2
+    return 1
+}
+
+# Open what headscale serves on a host firewall that is already active, never
+# enabling one (lockout risk). Args: tcp port...
+open_firewall() {
+    local -a rules=() ; local p
+    for p in "$@"; do rules+=("${p}/tcp"); done
+    rules+=(3478/udp 41641/udp)
+    if have ufw && as_root ufw status 2>/dev/null | grep -q "Status: active"; then
+        for p in "${rules[@]}"; do as_root ufw allow "$p" >/dev/null 2>&1 || true; done
+        log_success "ufw rules added (${rules[*]})"
+    elif have firewall-cmd && as_root firewall-cmd --state >/dev/null 2>&1; then
+        for p in "${rules[@]}"; do as_root firewall-cmd --permanent --add-port="$p" >/dev/null 2>&1 || true; done
+        as_root firewall-cmd --reload >/dev/null 2>&1 || true
+        log_success "firewalld rules added (${rules[*]})"
+    else
+        log_info "No active host firewall detected; not enabling one."
+        log_info "Ensure these are open (including any cloud firewall): ${rules[*]}"
+    fi
+}
+
+# What else listens on TCP <port> here, other than headscale: printed, rc 0.
+# Rc 1 when nothing does (or ss cannot say).
+port_taken_by_other() {
+    local line
+    have ss || return 1
+    line="$(as_root ss -ltnpH "sport = :${1}" 2>/dev/null | awk '!/"headscale"/ && !seen { print; seen = 1 }')"
+    [ -n "$line" ] || return 1
+    printf '%s\n' "$line"
+}
+
+# Does <host> resolve to an address of this machine? Let's Encrypt validates
+# whatever it resolves to. Says what it found when not.
+name_points_here() {
+    local host="$1" addrs mine a
+    addrs="$(getent ahosts "$host" 2>/dev/null | awk '{ print $1 }' | sort -u)"
+    [ -n "$addrs" ] || { log_warn "${host} does not resolve: Let's Encrypt cannot validate it."; return 1; }
+    mine="$(ip -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }')"
+    for a in $addrs; do
+        case $'\n'"$mine"$'\n' in *$'\n'"$a"$'\n'*) return 0 ;; esac
+    done
+    log_warn "${host} resolves to ${addrs//$'\n'/ } -- none of them this machine's; Let's Encrypt validates there."
+    return 1
 }
 
 ensure_headscale_user() {
@@ -696,35 +913,59 @@ ensure_headscale_user() {
     fi
 }
 
+# Is <d> a base domain (MagicDNS's suffix): a DNS name of labels.
+base_domain_ok() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]]
+}
+
+# The base domain cnc-init renders: <given>, else the one the CNC's config
+# has -- a re-run keeps it, every node's MagicDNS name with it -- else
+# connector.mesh. Args: given
+cnc_base_domain() {
+    local d="$1"
+    [ -n "$d" ] || d="$(awk '/^[[:space:]]+base_domain:/ { gsub(/["\047]/, "", $2); print $2; exit }' "$HEADSCALE_CONFIG" 2>/dev/null || true)"
+    base_domain_ok "$d" || d="connector.mesh"
+    printf '%s\n' "$d"
+}
+
 cnc_init_local() {
-    local url="$1" base_domain="$2"
+    local url="$1" base_domain="$2" challenge="${3:-$HS_ACME_DEFAULT}"
     require_root cnc-init
-    [ -n "$url" ] || die "Usage: connector cnc-init --url https://<host-or-ip>[:port]"
-    [ -n "$base_domain" ] || base_domain="connector.mesh"
+    [ -n "$url" ] || die "Usage: connector cnc-init --url https://<name>[:port] [--acme tls-alpn-01|http-01]"
+    cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
+    [ -z "$base_domain" ] || base_domain_ok "$base_domain" || die "'$base_domain' is not a base domain (a DNS name)."
+    base_domain="$(cnc_base_domain "$base_domain")"
+
+    local host port p taken
+    host="$(url_host "$url")"; port="$(url_port "$url")"; [ -n "$port" ] || port="443"
+    case "$challenge" in
+        tls-alpn-01) [ "$port" = 443 ] || die "tls-alpn-01 is answered on :443: serve on :443, or use --acme http-01 to serve on :${port}." ;;
+        http-01) ;;
+        *) die "Unknown --acme '$challenge' (tls-alpn-01 or http-01)." ;;
+    esac
+    # headscale would fail to bind, and the mesh would lose its control plane.
+    for p in "$port" $([ "$challenge" = http-01 ] && echo 80); do
+        if taken="$(port_taken_by_other "$p")"; then
+            die "Something else listens on :${p} here: ${taken} -- free it, or for :443 use --acme http-01 with another port in --url."
+        fi
+    done
+    name_points_here "$host" || confirm "Continue anyway?" || die "Point ${host}'s A record at this machine, then re-run."
 
     install_self_local        # ensure 'connector' + 'con' are on PATH on the CNC
 
-    local host port self_signed=0
-    host="$(url_host "$url")"; port="$(url_port "$url")"
-    if [ "${url%%://*}" = "https" ] && is_ip "$host"; then
-        self_signed=1
-        # No domain -> headscale serves its own TLS on a dedicated port (default 8443),
-        # so it never collides with anything already on :443.
-        if [ -z "$port" ]; then port="$HS_TLS_PORT_DEFAULT"; url="https://${host}:${port}"; fi
-    fi
-
-    log_info "Initialising CNC (headscale) for ${url}"
-    [ "$self_signed" = 1 ] && log_info "TLS: self-signed cert pinned to ${host} (no domain needed)."
+    log_info "Initialising CNC (headscale) for ${url}: Let's Encrypt, ${challenge}"
     have curl || as_root apt-get install -y curl >/dev/null 2>&1 || true
+    have jq || as_root apt-get install -y jq >/dev/null 2>&1 || true
     install_headscale
-    write_headscale_config "$url" "$base_domain"
-    write_acl
+    apply_headscale_config "$url" "$base_domain" "$challenge" || die "The CNC's config and policy are as they were."
     log_info "Enabling + starting headscale..."
     as_root systemctl enable headscale >/dev/null 2>&1 || true
     as_root systemctl restart headscale
     sleep 2
     ensure_headscale_user
-    open_firewall "${port:-$HS_TLS_PORT_DEFAULT}"
+    if [ "$challenge" = http-01 ]; then open_firewall "$port" 80; else open_firewall "$port"; fi
+    # a daily backup that is scheduled runs as this connector writes it
+    ( backup_schedule_local --refresh ) || log_warn "The daily backup's units are as they were: connector backup-schedule"
 
     echo
     if as_root systemctl is-active --quiet headscale; then
@@ -732,28 +973,30 @@ cnc_init_local() {
     else
         log_warn "headscale is not active yet - check: journalctl -u headscale -e"
     fi
-    if [ "$self_signed" = 1 ]; then
-        echo "  CNC cert SHA-256: $(cnc_cert_fingerprint 2>/dev/null || echo '?')"
-    fi
+    echo "Let's Encrypt issues ${host}'s certificate on the first connection (journalctl -u headscale -f)."
     echo "Next: authorize a machine:  connector invite"
 }
 
 # --- cnc-init dispatcher + remote orchestration + link ----------------------
 cmd_cnc_init() {
-    local host="" url="" port="" base_domain=""
+    local host="" url="" port="" base_domain="" acme="$HS_ACME_DEFAULT" reinit=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --url)         url="$2"; shift 2 ;;
             --base-domain) base_domain="$2"; shift 2 ;;
+            --acme)        acme="$2"; shift 2 ;;
+            --reinit)      reinit=1; shift ;;
             -p|--port)     port="$2"; shift 2 ;;
             -*) die "Unknown option: $1" ;;
             *) [ -z "$host" ] && host="$1" || die "Unexpected argument: $1"; shift ;;
         esac
     done
+    case "$acme" in tls-alpn-01|http-01) ;; *) die "Unknown --acme '$acme' (tls-alpn-01 or http-01)." ;; esac
+    [ -z "$base_domain" ] || base_domain_ok "$base_domain" || die "'$base_domain' is not a base domain (a DNS name)."
     if [ -n "$host" ]; then
-        cnc_init_remote "$host" "$url" "$port"
+        cnc_init_remote "$host" "$url" "$port" "$acme" "$reinit" "$base_domain"
     else
-        cnc_init_local "$url" "$base_domain"
+        cnc_init_local "$url" "$base_domain" "$acme"
     fi
 }
 
@@ -810,10 +1053,9 @@ check_cnc_reachable() {
 }
 
 cnc_init_remote() {
-    local host="$1" url="$2" port="$3" sshflag scpflag self configured=0
+    local host="$1" url="$2" port="$3" acme="${4:-$HS_ACME_DEFAULT}" reinit="${5:-0}" base_domain="${6:-}" sshflag configured=0
     have ssh || die "ssh not found"; have scp || die "scp not found"
     sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
-    scpflag="$([ -n "$port" ] && echo "-P $port" || true)"
 
     log_info "Checking SSH access to $host..."
     # shellcheck disable=SC2086
@@ -829,37 +1071,31 @@ cnc_init_remote() {
         configured=1
     fi
 
-    # Determine the server URL: explicit --url, else the remote's existing one,
-    # else derive an IP from your SSH config (HostName) + default TLS port.
-    if [ -z "$url" ]; then
-        if [ "$configured" = 1 ]; then
-            # shellcheck disable=SC2086
-            url="$(ssh $sshflag "$host" "${rsudo}sed -n 's/^server_url:[[:space:]]*//p' /etc/headscale/config.yaml 2>/dev/null | head -n1" | tr -d '\r')"
-        fi
-        if [ -z "$url" ]; then
-            local ip; ip="$(ssh_resolved_host "$host")"
-            [ -n "$ip" ] || die "Could not resolve an address for '$host'; pass --url https://<ip>:${HS_TLS_PORT_DEFAULT}"
-            url="https://${ip}:${HS_TLS_PORT_DEFAULT}"
-            log_info "No --url given; using ${url} (resolved from your SSH config for '$host')."
-        fi
-    fi
-    # Normalise an IP CNC without a port so the saved link matches the listener.
-    if [ "${url%%://*}" = "https" ]; then
-        local uh up; uh="$(url_host "$url")"; up="$(url_port "$url")"
-        if is_ip "$uh" && [ -z "$up" ]; then url="https://${uh}:${HS_TLS_PORT_DEFAULT}"; fi
-    fi
-
+    # The server URL: --url, else the one the CNC already serves -- a DNS name
+    # either way (cnc_url_ok); a CNC still on a bare IP needs --url to move.
+    local existing=""
     if [ "$configured" = 1 ]; then
-        log_info "CNC already configured on $host; skipping install."
+        # shellcheck disable=SC2086
+        existing="$(ssh $sshflag "$host" "${rsudo}sed -n 's/^server_url:[[:space:]]*//p' /etc/headscale/config.yaml 2>/dev/null | head -n1" | tr -d '\r')"
+    fi
+    [ -n "$url" ] || url="$existing"
+    [ -n "$url" ] || die "Pass the CNC's name: --url https://<name> (an A record pointing at $host)."
+    cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
+
+    if [ "$configured" = 1 ] && [ "$url" = "$existing" ] && [ "$reinit" = 0 ]; then
+        log_info "CNC already configured on $host at ${url}; skipping install (--reinit applies this connector to it)."
     else
+        if [ "$configured" = 1 ] && [ "$url" != "$existing" ]; then
+            log_warn "This moves the CNC from ${existing} to ${url}. Every node then follows with"
+            log_warn "'connector migrate-cnc' (a fresh key from 'connector invite --migrate <roles> <node>')."
+            confirm "Move the CNC to ${url}?" || die "Declined."
+        fi
         log_info "Copying connector to $host and running cnc-init..."
-        self="$(self_path)"
+        push_connector "$host" "$rsudo" 0 "$port" || die "Could not install connector on $host."
         # shellcheck disable=SC2086
-        scp $scpflag "$self" "$host:/tmp/connector.$$" >/dev/null
-        # shellcheck disable=SC2086
-        ssh $sshflag "$host" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$"
-        # shellcheck disable=SC2086
-        ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url'" || die "Remote cnc-init failed"
+        # no --base-domain: the CNC keeps the one it has (cnc_base_domain)
+        ssh -t $sshflag "$host" "${rsudo}${CONNECTOR_BIN} cnc-init --url '$url' --acme '$acme'${base_domain:+ --base-domain '$base_domain'}" \
+            || die "Remote cnc-init failed"
     fi
 
     save_cnc_link "$host" "$url" "$port"
@@ -900,6 +1136,7 @@ cmd_link() {
         esac
     done
     [ -n "$host" ] && [ -n "$url" ] || die "Usage: connector link <user@host> --url https://vpn.example.com [-p port]"
+    cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
     sshflag="$([ -n "$port" ] && echo "-p $port" || true)"
     log_info "Verifying CNC at $host..."
     # shellcheck disable=SC2086
@@ -910,21 +1147,46 @@ cmd_link() {
     echo "Try: connector list"
 }
 
+# Put this machine's connector on <target> as CONNECTOR_BIN, with the con
+# link: copied into a directory of its own there (mktemp -d, the login user's
+# alone), installed from it, and the directory removed in the same command
+# whatever happened -- never a fixed name in /tmp, which anyone on that host
+# could make first, or swap before root installs what it holds. stdin is
+# closed unless sudo there may ask for a password. Returns 0/1.
+# Args: target, sudo ("sudo " or ""), tty (1: sudo may prompt), [ssh port]
+push_connector() {
+    local target="$1" rsudo="$2" tty="$3" port="${4:-}" self dir cmd
+    local -a ssh_o=(-o ConnectTimeout=10) scp_o=(-o ConnectTimeout=10)
+    if [ -n "$port" ]; then ssh_o+=(-p "$port"); scp_o+=(-P "$port"); fi
+    self="$(self_path)"
+    dir="$(ssh "${ssh_o[@]}" "$target" 'mktemp -d /tmp/connector.XXXXXXXXXX' </dev/null 2>/dev/null | tr -d '\r')" || dir=""
+    if ! [[ "$dir" =~ ^/tmp/connector\.[A-Za-z0-9]{10}$ ]]; then
+        log_warn "   ${target} made no directory of its own to copy into (it said '${dir:0:40}')."
+        return 1
+    fi
+    if ! scp -q "${scp_o[@]}" "$self" "$target:$dir/connector" </dev/null >/dev/null 2>&1; then
+        ssh "${ssh_o[@]}" "$target" "rm -rf $dir" </dev/null >/dev/null 2>&1 || true
+        log_warn "   copy to ${target} failed."
+        return 1
+    fi
+    cmd="${rsudo}install -m 0755 $dir/connector ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN}; rc=\$?; rm -rf $dir; exit \$rc"
+    if [ "$tty" = 1 ]; then
+        ssh -t "${ssh_o[@]}" "$target" "$cmd"
+    else
+        ssh "${ssh_o[@]}" "$target" "$cmd" </dev/null
+    fi
+}
+
 # Push this machine's connector to the linked CNC and install it. Returns 0/1.
 cnc_update_push() {
     load_cnc_link
-    local self sshflag scpflag rsudo="sudo " lsum rsum
+    local self sshflag rsudo="sudo " lsum rsum
     self="$(self_path)"
     sshflag="$([ -n "${CNC_PORT:-}" ] && echo "-p $CNC_PORT" || true)"
-    scpflag="$([ -n "${CNC_PORT:-}" ] && echo "-P $CNC_PORT" || true)"
     [ "${CNC_USER:-}" = "root" ] && rsudo=""
 
     log_info "-> CNC ${CNC_SSH} (${CONNECTOR_BIN})"
-    # shellcheck disable=SC2086
-    scp $scpflag "$self" "$CNC_SSH:/tmp/connector.$$" >/dev/null 2>&1 || { log_warn "   copy to CNC failed."; return 1; }
-    # shellcheck disable=SC2086
-    ssh $sshflag "$CNC_SSH" "${rsudo}install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && ${rsudo}ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$" \
-        || { log_warn "   install on CNC failed."; return 1; }
+    push_connector "$CNC_SSH" "$rsudo" 0 "${CNC_PORT:-}" || { log_warn "   install on CNC failed."; return 1; }
 
     lsum="$(file_sha256 "$self")"
     # shellcheck disable=SC2086
@@ -934,18 +1196,18 @@ cnc_update_push() {
     else
         log_warn "   installed, but checksum unverified (local=${lsum:-?} cnc=${rsum:-?})."
     fi
+    # a daily backup that is scheduled there runs as this connector writes it
+    ssh_cnc "${rsudo}${CONNECTOR_BIN} backup-schedule-local --refresh" </dev/null >/dev/null 2>&1 \
+        || log_warn "   its daily backup's units are as they were: connector backup-schedule"
 }
 
 # Push this machine's connector to a provider node over Tailscale SSH. Returns 0/1.
 provider_update_push() {
-    local name="$1" user self
-    user="$(id -un)"; self="$(self_path)"
+    local name="$1" user
+    user="$(id -un)"
     log_info "-> provider ${name} (ssh ${user}@${name})"
-    scp -o ConnectTimeout=10 "$self" "${user}@${name}:/tmp/connector.$$" >/dev/null 2>&1 \
-        || { log_warn "   copy failed (online + SSH-reachable?)."; return 1; }
-    ssh -t -o ConnectTimeout=10 "${user}@${name}" \
-        "sudo install -m 0755 /tmp/connector.$$ ${CONNECTOR_BIN} && sudo ln -sf ${CONNECTOR_BIN} ${CON_BIN} && rm -f /tmp/connector.$$" \
-        || { log_warn "   remote install failed (sudo rights?)."; return 1; }
+    push_connector "${user}@${name}" "sudo " 1 \
+        || { log_warn "   remote install failed (online + SSH-reachable? sudo rights?)."; return 1; }
     log_success "   updated."
 }
 
@@ -1037,47 +1299,98 @@ cmd_propagate_update() {
 }
 
 # --- Invite ------------------------------------------------------------------
+# A headscale user's numeric id (default: connector's own user), created when
+# it is the operators' and does not exist yet. Args: [name]
 hs_user_id() {
-    local out
+    local name="${1:-$HEADSCALE_USER}" out id
     out="$(hs users list --output json 2>/dev/null)" || return 1
+    id="$(printf '%s' "$out" | user_id_in "$name")"
+    if [ -z "$id" ] && [ "$name" = "$HEADSCALE_OPS_USER" ]; then
+        hs users create "$name" >/dev/null 2>&1 || return 1
+        out="$(hs users list --output json 2>/dev/null)" || return 1
+        id="$(printf '%s' "$out" | user_id_in "$name")"
+    fi
+    printf '%s\n' "$id"
+}
+
+# The id of user <name> in headscale's `users list --output json` on stdin.
+user_id_in() {
     if have jq; then
-        printf '%s' "$out" | jq -r --arg n "$HEADSCALE_USER" \
-            'first(.[] | select(.name==$n) | .id) // empty' 2>/dev/null | head -n1
+        jq -r --arg n "$1" 'first(.[] | select(.name==$n) | .id) // empty' 2>/dev/null
         return 0
     fi
     # Fallback for pretty-printed JSON: each user object lists "id" then "name".
-    printf '%s' "$out" | tr '\n\t' '  ' | sed 's/  */ /g' \
-        | grep -o "\"id\": *[0-9]* *, *\"name\": *\"$HEADSCALE_USER\"" \
+    tr '\n\t' '  ' | sed 's/  */ /g' \
+        | grep -o "\"id\": *[0-9]* *, *\"name\": *\"$1\"" \
         | sed -n 's/.*"id": *\([0-9]*\).*/\1/p' | head -n1
 }
 
 # Mint a single-use, short-expiry pre-auth key for a role spec; echo the key.
-# headscale's --user takes a numeric user ID, so we always resolve it.
+# headscale's --user takes a numeric user ID, so we always resolve it. An
+# operator's machine (ops) is the ops user's and carries no tag.
 mint_key() {
-    local roles tags uid out key
+    local roles key_tags="" user="$HEADSCALE_USER" uid out key
     roles="$(parse_node_roles "$1")"
-    [ -n "$roles" ] || die "No roles given for key (expected provider and/or consumer)."
-    tags="$(tags_for_roles "$roles")"
-    uid="$(hs_user_id 2>/dev/null || true)"
-    [ -n "$uid" ] || die "Could not resolve headscale user '$HEADSCALE_USER' on the CNC (is headscale running? try: connector status)"
-    out="$(hs preauthkeys create --user "$uid" --tags "$tags" --expiration "$KEY_EXPIRY" --output json 2>/dev/null)" \
-        || die "Failed to create pre-auth key on CNC"
+    [ -n "$roles" ] || die "No roles given for key (expected provider and/or consumer, or ops)."
+    if [ "$roles" = ops ]; then user="$HEADSCALE_OPS_USER"; else key_tags="$(tags_for_roles "$roles")"; fi
+    uid="$(hs_user_id "$user" 2>/dev/null || true)"
+    [ -n "$uid" ] || die "Could not resolve headscale user '$user' on the CNC (is headscale running? try: connector status)"
+    local -a create=(preauthkeys create --user "$uid" --expiration "$KEY_EXPIRY" --output json)
+    [ -z "$key_tags" ] || create+=(--tags "$key_tags")
+    out="$(hs "${create[@]}" 2>/dev/null)" || die "Failed to create pre-auth key on CNC"
     key="$(printf '%s' "$out" | json_str key)"
     [ -n "$key" ] || die "Could not parse pre-auth key from headscale output"
     printf '%s\n' "$key"
+}
+
+# --- Prod keys ---------------------------------------------------------------
+# A prod machine (cnc, a node) joins the admin tailnet as tag:prod, and its
+# key is minted here alone: single-use, tag:prod and nothing else, expiring
+# within the hour, the operators' (tagOwners). It goes to stdout -- for a
+# pipe into that machine's join, which reads it on stdin and never puts it on
+# an argv -- or into a new 0600 file. invite and approve refuse prod.
+cmd_prod_key() {
+    local out="" expiry="$KEY_EXPIRY" uid json key
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --out)        out="$2"; shift 2 ;;
+            --expiration) expiry="$2"; shift 2 ;;
+            --yes|-y)     ASSUME_YES=1; shift ;;
+            *) die "Usage: connector prod-key [--out FILE] [--expiration 10m..1h] [--yes]" ;;
+        esac
+    done
+    is_admin || die "Only a CNC or manager mints a prod key."
+    [[ "$expiry" =~ ^([1-9]|[1-5][0-9])m$|^60m$|^1h$ ]] || die "A prod key lives an hour at most (--expiration 1m..60m or 1h), not '$expiry'."
+    [ -z "$out" ] || [ ! -e "$out" ] || die "$out exists: a prod key goes into a new file only."
+    confirm "Mint a single-use tag:prod key, expiring in ${expiry}?" || die "Declined."
+    uid="$(hs_user_id "$HEADSCALE_OPS_USER" 2>/dev/null || true)"
+    [ -n "$uid" ] || die "Could not resolve headscale user '$HEADSCALE_OPS_USER' on the CNC."
+    json="$(hs preauthkeys create --user "$uid" --tags tag:prod --expiration "$expiry" --output json 2>/dev/null)" \
+        || die "Failed to create the prod key on the CNC."
+    key="$(printf '%s' "$json" | json_str key)"
+    [ -n "$key" ] || die "Could not parse the prod key from headscale's output."
+    if [ -n "$out" ]; then
+        ( umask 077; set -o noclobber; printf '%s\n' "$key" >"$out" ) || die "Could not write $out."
+        log_success "Wrote a single-use tag:prod key to $out (0600); it expires in ${expiry}." >&2
+    else
+        printf '%s\n' "$key"
+    fi
 }
 
 cmd_invite() {
     is_admin || die "Only a CNC or manager can invite. Link one: connector link <host> --url ..."
     # Roles may be given comma- or space-separated, e.g. 'provider,consumer'.
     # Any non-role token is treated as the new machine's hostname.
-    local types=() name="" want_manager=0 tok
+    local types=() name="" want_manager=0 migrate=0 tok
     for tok in $(printf '%s ' "$@" | tr ',' ' '); do
         case "$tok" in
+            --migrate) migrate=1 ;;
             provider) types+=("provider") ;;
             consumer) types+=("consumer") ;;
             both)     types+=("provider"); types+=("consumer") ;;
+            ops)      types+=("ops") ;;
             manager|controller|commander) want_manager=1 ;;
+            prod|tag:*|--tags*) die "A prod machine is not invited: its key comes from 'connector prod-key' alone." ;;
             *) name="$tok" ;;
         esac
     done
@@ -1087,6 +1400,7 @@ cmd_invite() {
         echo "  [1] provider"
         echo "  [2] consumer"
         echo "  [3] manager (commands the CNC over SSH)"
+        echo "  [4] ops (an operator's machine: reaches prod on ssh and https)"
         local sel n
         read -r -p 'Enter roles: ' sel || sel=""
         for n in $(printf '%s' "$sel" | tr ',' ' '); do
@@ -1094,6 +1408,7 @@ cmd_invite() {
                 1|provider) types+=("provider") ;;
                 2|consumer) types+=("consumer") ;;
                 3|manager|controller|commander) want_manager=1 ;;
+                4|ops) types+=("ops") ;;
                 *) log_warn "Ignoring invalid choice: $n" ;;
             esac
         done
@@ -1105,21 +1420,39 @@ cmd_invite() {
     fi
 
     if [ "${#types[@]}" -gt 0 ]; then
-        local roles url key hostarg="" pinarg="" fp
+        local roles url key hostarg=""
         roles="$(parse_node_roles "$(IFS=,; echo "${types[*]}")")"
         url="$(cnc_server_url)"; [ -n "$url" ] || url="<server-url>"
         key="$(mint_key "$roles")"
         [ -n "$name" ] && hostarg=" --hostname $name"
-        if is_ip "$(url_host "$url")"; then
-            fp="$(cnc_cert_fingerprint 2>/dev/null || true)"
-            [ -n "$fp" ] && pinarg=" --ca-sha256 ${fp}"
+        echo
+        if [ "$migrate" = 1 ]; then
+            local fp oldarg=""
+            fp="$(old_cnc_cert_pem | fp_of_pem)"
+            [ -n "$fp" ] && oldarg=" --old-sha256 ${fp}"
+            log_success "Single-use key to follow the CNC (roles: ${roles}, expires in ${KEY_EXPIRY})."
+            echo "Run this on that machine:"
+            echo
+            echo "    connector migrate-cnc ${url} --authkey ${key}${oldarg}"
+        else
+            log_success "Single-use invite created (roles: ${roles}, expires in ${KEY_EXPIRY})."
+            echo "Run this on the new machine:"
+            echo
+            echo "    connector register ${roles} ${url} --authkey ${key}${hostarg}"
         fi
         echo
-        log_success "Single-use invite created (roles: ${roles}, expires in ${KEY_EXPIRY})."
-        echo "Run this on the new machine:"
-        echo
-        echo "    connector register ${roles} ${url} --authkey ${key}${pinarg}${hostarg}"
-        echo
+    fi
+}
+
+# The self-signed certificate an older connector served the CNC's bare IP
+# with, if the CNC still holds it (local, or over SSH): stdout, PEM.
+old_cnc_cert_pem() {
+    if is_cnc; then
+        as_root cat "$HEADSCALE_CERT" 2>/dev/null || true
+    elif is_manager; then
+        load_cnc_link
+        if [ "$CNC_USER" = "root" ]; then ssh_cnc cat "$HEADSCALE_CERT" 2>/dev/null || true
+        else ssh_cnc sudo cat "$HEADSCALE_CERT" 2>/dev/null || true; fi
     fi
 }
 
@@ -1179,18 +1512,72 @@ cmd_manager_key() {
 is_wsl()        { grep -qiE "(microsoft|wsl)" /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; }
 systemd_active() { [ -d /run/systemd/system ]; }
 
+# A field of /etc/os-release, unquoted. Args: field
+os_release_field() {
+    awk -F= -v k="$1" '$1 == k { gsub(/^"|"$/, "", $2); print $2; exit }' "$OS_RELEASE" 2>/dev/null
+}
+
+# The apt distribution tailscale publishes for this machine, "<distro>
+# <codename>": ubuntu, debian or raspbian, a derivative by the one it is
+# like. Rc 1 when there is none.
+ts_apt_dist() {
+    local id like codename
+    id="$(os_release_field ID)"; like=" $(os_release_field ID_LIKE) "
+    case "$id" in
+        ubuntu|debian|raspbian) codename="$(os_release_field VERSION_CODENAME)" ;;
+        *)
+            case "$like" in
+                *" ubuntu "*) id=ubuntu; codename="$(os_release_field UBUNTU_CODENAME)" ;;
+                *" debian "*) id=debian; codename="$(os_release_field VERSION_CODENAME)" ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+    [[ "$codename" =~ ^[a-z0-9]+$ ]] || return 1
+    printf '%s %s\n' "$id" "$codename"
+}
+
+# tailscale from its apt repository: the key fetched, checked to be the pinned
+# one and no other before apt is told of it, and named alone by the source
+# (signed-by) -- it vouches for that repository and nothing else.
+install_tailscale_apt() {
+    local dist codename key got arch
+    read -r dist codename < <(ts_apt_dist) || true
+    [ -n "${codename:-}" ] || die "No tailscale apt repository for this machine (${OS_RELEASE})."
+    have gpg || pkg_install gnupg >/dev/null 2>&1 || die "gpg checks tailscale's key: install gnupg, then re-run register."
+    key="$(mktemp)"
+    curl -fsSL -o "$key" "https://pkgs.tailscale.com/stable/${dist}/${codename}.noarmor.gpg" \
+        || { rm -f "$key"; die "Could not fetch tailscale's apt key."; }
+    # every primary key the file holds: a second one would sign for the repository too
+    got="$( { gpg --show-keys --with-colons "$key" 2>/dev/null || true; } | awk -F: '/^pub:/ { p = 1; next } p && /^fpr:/ { printf "%s%s", s, $10; s = " "; p = 0 }')"
+    [ "$got" = "$TS_APT_KEY_FPR" ] || { rm -f "$key"; die "tailscale's apt key is ${got:-unreadable}, not the pinned ${TS_APT_KEY_FPR}; nothing installed."; }
+    arch="$(dpkg --print-architecture)"
+    if ! { as_root install -d -m 755 "${TS_APT_KEYRING%/*}" && as_root install -m 644 "$key" "$TS_APT_KEYRING"; }; then
+        rm -f "$key"; die "Could not put tailscale's key in place."
+    fi
+    rm -f "$key"
+    printf 'deb [arch=%s signed-by=%s] https://pkgs.tailscale.com/stable/%s %s main\n' "$arch" "$TS_APT_KEYRING" "$dist" "$codename" \
+        | as_root tee "$TS_APT_LIST" >/dev/null
+    as_root apt-get update -q >/dev/null || die "apt-get update failed with tailscale's repository."
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y tailscale
+}
+
+# tailscale on Linux: from its apt repository by its pinned key where apt is,
+# else the distribution's own package -- never a script piped to a shell.
 install_tailscale() {
     have tailscale && return 0
     log_info "Installing tailscale..."
-    # Arch mirrors keep only the newest build, so a stale local pacman DB makes
-    # the upstream installer request a 404'd version. Refresh it first.
-    # (apt-based installs are refreshed by the upstream script itself.)
-    if have pacman; then
-        log_info "Refreshing pacman database (Arch)..."
-        as_root pacman -Sy --noconfirm >/dev/null 2>&1 || true
+    if have apt-get && ts_apt_dist >/dev/null; then
+        install_tailscale_apt
+    else
+        case "$(pkg_mgr)" in
+            # Arch mirrors keep only the newest build: -Sy refreshes the database first
+            pacman)         as_root pacman -Sy --needed --noconfirm tailscale ;;
+            apk|zypper|dnf) pkg_install tailscale ;;
+            *) die "No tailscale package here: install it (https://tailscale.com/download), then re-run register." ;;
+        esac
     fi
-    curl -fsSL "$TS_INSTALL_URL" | sh
-    have tailscale || die "tailscale installation failed. On Arch, run 'sudo pacman -Syu' then re-run register."
+    have tailscale || die "tailscale installation failed; install it (https://tailscale.com/download), then re-run register."
 }
 
 install_tailscale_macos_app() {
@@ -1285,6 +1672,28 @@ macos_tailscale_cli() {
     esac
 }
 
+# `<cli...> <args...>`: tailscale up, the auth key (if any) read by tailscale
+# from a 0600 file rather than from its argv, where any local user's ps would
+# see it. The file goes when tailscale is done, or when connector is
+# interrupted waiting for it. Args: key ('' for none), cli words..., --, args...
+TS_KEY_FILE=""
+ts_up() {
+    local key="$1" rc=0
+    local -a runner=()
+    shift
+    while [ "$1" != -- ]; do runner+=("$1"); shift; done
+    shift
+    if [ -n "$key" ]; then
+        TS_KEY_FILE="$(umask 077; mktemp)" || return 1
+        trap '[ -z "$TS_KEY_FILE" ] || rm -f "$TS_KEY_FILE"' EXIT
+        printf '%s\n' "$key" >"$TS_KEY_FILE"
+        set -- "$@" --auth-key "file:$TS_KEY_FILE"
+    fi
+    "${runner[@]}" "$@" || rc=$?
+    if [ -n "$TS_KEY_FILE" ]; then rm -f "$TS_KEY_FILE"; TS_KEY_FILE=""; trap - EXIT; fi
+    return "$rc"
+}
+
 # Print the post-join summary. register_summary <roles-csv> <cli> <hostname>
 register_summary() {
     local roles="$1" cli="$2" hostname="$3" ts_ip ts_name
@@ -1301,7 +1710,7 @@ register_summary() {
 }
 
 register_macos() {
-    local roles="$1" url="$2" key="$3" hostname="$4" variant="$5" cli needs_ssh=0
+    local roles="$1" url="$2" key="$3" hostname="$4" variant="$5" reauth="${6:-0}" cli needs_ssh=0
     [ -n "$hostname" ] || hostname="$(node_name)"
     # Providers must host Tailscale SSH, which the sandboxed GUI app can't do;
     # let the CLI chooser steer to open-source tailscaled in that case.
@@ -1336,15 +1745,12 @@ register_macos() {
     # user-scoped key combined with --advertise-tags, so only advertise the tags
     # for interactive (keyless) registration where the admin owns them.
     local up_args=(up --reset --login-server "$url" --accept-dns=true)
+    [ "$reauth" = 1 ] && up_args+=(--force-reauth)
     [ -n "$hostname" ] && up_args+=(--hostname "$hostname")
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
-    if [ -n "$key" ]; then
-        up_args+=(--authkey "$key")
-    else
-        up_args+=(--advertise-tags="$tags")
-    fi
+    [ -n "$key" ] || up_args+=(--advertise-tags="$tags")
 
-    if ! "${runner_cmd[@]}" "${up_args[@]}"; then
+    if ! ts_up "$key" "${runner_cmd[@]}" -- "${up_args[@]}"; then
         log_warn "tailscale up failed."
         log_warn "If a browser login URL appeared, finish there; or ask the admin to run 'connector approve'."
         log_warn "If using the GUI app, ensure it is running and its system extension is approved."
@@ -1406,44 +1812,38 @@ install_self_local() {
 cmd_register() {
     local roles
     roles="$(parse_node_roles "${1:-}")"
-    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY] [--ca-sha256 FP] [--hostname N] [--tailscale app|oss] [--yes]"
+    [ -n "$roles" ] || die "Usage: connector register <provider|consumer|provider,consumer|ops> <url> [--authkey KEY|-] [--hostname N] [--tailscale app|oss] [--yes]"
     shift || true
-    local url="" key="" hostname="" pin="" ts_variant=""
+    local url="" key="" hostname="" ts_variant="" reauth=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --authkey)   key="$2"; shift 2 ;;
+            --force-reauth) reauth=1; shift ;;
             --hostname)  hostname="$2"; shift 2 ;;
-            --ca-sha256) pin="$(printf '%s' "$2" | tr 'A-F' 'a-f' | tr -d ': ')"; shift 2 ;;
+            --ca-sha256) die "--ca-sha256 is gone: the CNC is a DNS name with a public certificate, and connector installs no trust root. Ask your admin for a fresh invite." ;;
             --tailscale) ts_variant="$2"; shift 2 ;;
             --yes|-y)    ASSUME_YES=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *) [ -z "$url" ] && url="$1" || die "Unexpected argument: $1"; shift ;;
         esac
     done
-    [ -n "$url" ] || die "Usage: connector register <provider|consumer|provider,consumer> <url> [--authkey KEY]"
+    [ -n "$url" ] || die "Usage: connector register <provider|consumer|provider,consumer|ops> <url> [--authkey KEY|-]"
+    # `--authkey -`: the key on stdin, never on an argv
+    if [ "$key" = "-" ]; then IFS= read -r key || true; [ -n "$key" ] || die "No key on stdin."; fi
 
     # On Linux, make sure the join flow's tools are present (prompt to install).
     [ "$(os_kind)" = "linux" ] && ensure_deps curl openssl
 
-    # Trust the CNC's self-signed cert (only for IP CNCs; no-op for domain CNCs).
-    establish_cnc_trust "$url" "$pin"
+    # A DNS name with a public certificate: nothing to trust, and nothing installed.
+    cnc_url_ok "$url" || die "Ask your admin for the CNC's https://<name> (a fresh invite)."
 
     if [ "$(os_kind)" = "macos" ]; then
-        register_macos "$roles" "$url" "$key" "$hostname" "$ts_variant"
+        register_macos "$roles" "$url" "$key" "$hostname" "$ts_variant" "$reauth"
         return $?
     fi
 
     ensure_wsl_systemd || return 0
     install_tailscale
-    # tailscaled caches the system CA pool at startup; if it is already running,
-    # restart it so a freshly-trusted CNC cert is picked up before we connect
-    # (otherwise the control-plane TLS handshake hangs on a self-signed CNC).
-    if [ "${url%%://*}" = "https" ] && is_ip "$(url_host "$url")" \
-        && have systemctl && systemctl is-active --quiet tailscaled 2>/dev/null; then
-        log_info "Restarting tailscaled to load the CNC certificate..."
-        as_root systemctl restart tailscaled 2>/dev/null || true
-        sleep 1
-    fi
     [ -n "$hostname" ] || hostname="$(node_name)"
 
     local tags ssh_flag=""
@@ -1458,15 +1858,12 @@ cmd_register() {
     # user-scoped key combined with --advertise-tags, so only advertise the tags
     # for interactive (keyless) registration where the admin owns them.
     local up_args=(--reset --login-server "$url" --accept-dns=true)
+    [ "$reauth" = 1 ] && up_args+=(--force-reauth)
     [ -n "$hostname" ] && up_args+=(--hostname "$hostname")
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
-    if [ -n "$key" ]; then
-        up_args+=(--authkey "$key")
-    else
-        up_args+=(--advertise-tags="$tags")
-    fi
+    [ -n "$key" ] || up_args+=(--advertise-tags="$tags")
 
-    if ! as_root tailscale up "${up_args[@]}"; then
+    if ! ts_up "$key" as_root tailscale up -- "${up_args[@]}"; then
         if [ -z "$key" ]; then
             log_warn "No --authkey supplied; tailscale printed a login URL above."
             log_warn "Ask the CNC admin to approve it:  connector approve"
@@ -1479,6 +1876,434 @@ cmd_register() {
     maybe_fix_wsl_mtu
     install_self_local
     register_summary "$roles" "tailscale" "$hostname"
+}
+
+# --- Migrate: a node follows the CNC to its new name ------------------------
+# The CNC moved (an older connector's bare IP to a DNS name, or one name to
+# another): this node joins it there with a fresh key, as the roles and name
+# it had, and stops trusting the root an older connector installed for the
+# old address -- that certificate, by its fingerprint, and nothing else.
+
+# This node's tailscale prefs as JSON: what it is logged in to, and as what.
+# Nothing when tailscale cannot say (its daemon down, say).
+ts_prefs_json() {
+    local variant="$1"
+    if [ "$(os_kind)" = "macos" ] && { [ "$variant" = app ] || { [ -z "$variant" ] && [ -x "$TS_MAC_APP_CLI" ]; }; }; then
+        "$TS_MAC_APP_CLI" debug prefs 2>/dev/null || true
+    else
+        as_root tailscale debug prefs 2>/dev/null || true
+    fi
+}
+
+# A top-level JSON field of <json> (jq, else sed). Args: json, field
+json_field() {
+    if have jq; then printf '%s' "$1" | jq -r --arg f "$2" '.[$f] // empty' 2>/dev/null
+    else printf '%s' "$1" | tr -d '\n' | json_str "$2"; fi
+}
+
+# The manager link, pointed at <url> (a URL load_cnc_link reads back); the ssh
+# side of it is unchanged.
+set_cnc_link_url() {
+    local tmp
+    link_value_ok CNC_URL "$1" || return 1
+    tmp="$(mktemp "${CNC_LINK_FILE}.XXXXXX")" || return 1
+    awk -v u="$1" '/^CNC_URL=/ { if (!done) print "CNC_URL=\"" u "\""; done = 1; next } { print } END { if (!done) print "CNC_URL=\"" u "\"" }' \
+        "$CNC_LINK_FILE" >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$CNC_LINK_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+cmd_migrate_cnc() {
+    local url="" key="" old="" variant="" roles prefs current hostname kept=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --authkey)    key="$2"; shift 2 ;;
+            --old-sha256) old="$(printf '%s' "$2" | tr 'A-F' 'a-f' | tr -d ': ')"; shift 2 ;;
+            --tailscale)  variant="$2"; shift 2 ;;
+            --yes|-y)     ASSUME_YES=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) if [ -z "$url" ]; then url="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+    [ -n "$url" ] || die "Usage: connector migrate-cnc <https://new-name> --authkey KEY [--old-sha256 FP] [--tailscale app|oss] [--yes]"
+    cnc_url_ok "$url" || die "Not a URL the CNC can be: $url"
+    roles="$(node_role)"
+    # a manager that is no node: its link follows, and nothing joins
+    [ -n "$roles" ] || is_manager || die "This machine never registered with connector (no role); join it: connector register <roles> ${url} --authkey KEY"
+    # The root to take away: the one this node recorded, and the one the admin names, agree.
+    [ -s "$CNC_CA_FILE" ] && kept="$(fp_of_pem <"$CNC_CA_FILE")"
+    if [ -n "$old" ] && [ -n "$kept" ] && [ "$old" != "$kept" ]; then
+        die "The certificate this node trusted (${kept}) is not the one named (${old}); nothing changed."
+    fi
+    [ -n "$old" ] || old="$kept"
+
+    if [ -z "$roles" ]; then
+        log_info "Not a node here (no role): only the manager link follows."
+    else
+        prefs="$(ts_prefs_json "$variant")"
+        current="$(json_field "$prefs" ControlURL)"
+        hostname="$(json_field "$prefs" Hostname)"
+        if [ "$current" = "$url" ]; then
+            log_info "Already on ${url}; not re-joining."
+        else
+            [ -n "$key" ] || die "Re-joining at ${url} needs a fresh key: ask the admin for 'connector invite --migrate ${roles}'."
+            log_info "Moving this node from ${current:-its old CNC} to ${url} (roles: ${roles})..."
+            local -a args=("$roles" "$url" --authkey "$key" --force-reauth --yes)
+            [ -n "$hostname" ] && args+=(--hostname "$hostname")
+            [ -n "$variant" ] && args+=(--tailscale "$variant")
+            cmd_register "${args[@]}"
+        fi
+    fi
+    if [ -n "$old" ]; then
+        untrust_cert_sha256 "$old" || die "The old CNC certificate is still trusted; see above."
+        rm -f "$CNC_CA_FILE"
+    else
+        log_info "No old CNC certificate known here; nothing to stop trusting."
+    fi
+    if is_manager; then
+        load_cnc_link
+        if [ "$CNC_URL" != "$url" ]; then
+            set_cnc_link_url "$url" || die "Could not point the manager link at ${url}."
+            log_success "The manager link now names ${url}."
+        fi
+    fi
+    log_success "Migrated to ${url}."
+}
+
+# --- Backup / restore --------------------------------------------------------
+# The CNC's state -- headscale's database (a consistent copy), its noise and
+# DERP keys, the Let's Encrypt cache, its config, policy and the site's rules
+# -- as a tar encrypted with age to public keys alone (age1... or an SSH
+# ed25519 key): the private half never needs to be on the CNC. A restore is
+# decrypted where that private half is (the admin's machine) and streamed to
+# the CNC over SSH.
+
+# Is <r> a public key a backup may be encrypted to? One line: an age key (in
+# bech32's alphabet), or an ssh-ed25519 key and a comment of no control
+# character -- a newline would carry a second line along.
+backup_recipient_ok() {
+    [[ "$1" =~ ^age1[02-9ac-hj-np-z]{58}$ || "$1" =~ ^ssh-ed25519\ AAAA[A-Za-z0-9+/]+=*(\ [^[:cntrl:]]*)?$ ]]
+}
+
+# <word>s quoted for a remote shell, each after a space; nothing for none.
+shell_words() {
+    [ $# -eq 0 ] || printf ' %q' "$@"
+}
+
+# On the CNC, as root: the encrypted archive to stdout. Args: recipient...
+# A subshell: the state it stages in the clear goes however it ends, and age
+# has taken every recipient before any of that state is copied.
+backup_stream_local() (
+    local tmp="" r f
+    trap '[ -z "$tmp" ] || rm -rf "$tmp"' EXIT
+    require_root backup
+    have age || pkg_install age >/dev/null 2>&1 || die "age encrypts the backup: apt-get install age"
+    have sqlite3 || pkg_install sqlite3 >/dev/null 2>&1 || die "sqlite3 copies the database: apt-get install sqlite3"
+    tmp="$(mktemp -d)"
+    { if [ -s "$HEADSCALE_BACKUP_RECIPIENTS" ]; then grep -v '^[[:space:]]*#' "$HEADSCALE_BACKUP_RECIPIENTS" || true; fi
+      for r in "$@"; do printf '%s\n' "$r"; done; } | awk 'NF' >"$tmp/recipients"
+    [ -s "$tmp/recipients" ] || die "No recipient: pass --recipient <age1...|ssh-ed25519 ...> (a key whose private half is not on this machine), or list them in ${HEADSCALE_BACKUP_RECIPIENTS}."
+    while IFS= read -r r; do
+        backup_recipient_ok "$r" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone"
+    done <"$tmp/recipients"
+    age -R "$tmp/recipients" </dev/null >/dev/null || die "age takes no such recipient (above); nothing was copied."
+    mkdir -p "$tmp/state${HEADSCALE_LIB}" "$tmp/state/etc/headscale"
+    [ -f "$HEADSCALE_LIB/db.sqlite" ] || die "No headscale database at $HEADSCALE_LIB/db.sqlite."
+    sqlite3 "$HEADSCALE_LIB/db.sqlite" ".backup '$tmp/state${HEADSCALE_LIB}/db.sqlite'" || die "Could not copy the database."
+    for f in noise_private.key derp_server_private.key cache certs; do
+        [ ! -e "$HEADSCALE_LIB/$f" ] || cp -a "$HEADSCALE_LIB/$f" "$tmp/state${HEADSCALE_LIB}/" || die "Could not copy $HEADSCALE_LIB/$f."
+    done
+    for f in "$HEADSCALE_CONFIG" "$HEADSCALE_ACL" "$HEADSCALE_ACL_SITE" "$HEADSCALE_BACKUP_RECIPIENTS"; do
+        [ ! -e "$f" ] || cp -a "$f" "$tmp/state/etc/headscale/" || die "Could not copy $f."
+    done
+    tar -C "$tmp/state" -cf - . | age -R "$tmp/recipients"
+)
+
+cmd_backup() {
+    local out="" r sudo="sudo "
+    local -a rcpts=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --out)       out="$2"; shift 2 ;;
+            --recipient) rcpts+=("$2"); shift 2 ;;
+            *) die "Usage: connector backup [--out FILE] [--recipient <age1...|ssh-ed25519 ...>]..." ;;
+        esac
+    done
+    for r in "${rcpts[@]+"${rcpts[@]}"}"; do backup_recipient_ok "$r" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone (nothing of it was sent)"; done
+    [ -n "$out" ] || [ ! -t 1 ] || out="headscale-$(date -u +%Y%m%dT%H%M%SZ).tar.age"
+    [ -z "$out" ] || [ ! -e "$out" ] || die "$out exists: a backup goes into a new file only."
+    if is_cnc; then
+        set -- backup_stream_local "${rcpts[@]+"${rcpts[@]}"}"
+    elif is_manager; then
+        load_cnc_link
+        [ "$CNC_USER" != root ] || sudo=""
+        set -- ssh_cnc "${sudo}${CONNECTOR_BIN} backup-stream$(shell_words "${rcpts[@]+"${rcpts[@]}"}")"
+    else
+        die "Only a CNC or manager takes a backup."
+    fi
+    if [ -z "$out" ]; then "$@"; return; fi
+    ( umask 077; set -o noclobber; "$@" >"$out" ) || { rm -f "$out"; die "The backup failed; nothing kept."; }
+    [ "$(head -c 21 "$out")" = "age-encryption.org/v1" ] || { rm -f "$out"; die "That is not an encrypted backup; nothing kept."; }
+    log_success "Backup: $out ($(wc -c <"$out" | tr -d ' ') bytes, 0600), encrypted to its recipients alone."
+}
+
+# On the CNC, as root: a decrypted backup (a tar) on stdin put in place. The
+# state before is kept aside, and put back when any step of putting the
+# backup in place fails or headscale cannot run what came. A subshell: the
+# backup it stages in the clear goes however it ends.
+restore_stream_local() (
+    local stage="" aside bad why="" managed
+    trap '[ -z "$stage" ] || rm -rf "$stage"' EXIT
+    require_root restore
+    managed="${HEADSCALE_CONFIG##*/} ${HEADSCALE_ACL##*/} ${HEADSCALE_ACL_SITE##*/} ${HEADSCALE_BACKUP_RECIPIENTS##*/}"
+    stage="$(mktemp -d)"
+    cat >"$stage/backup.tar" || die "Could not read the backup; nothing changed."
+    [ -s "$stage/backup.tar" ] || die "No backup came (could it be decrypted?); nothing changed."
+    # what a backup holds and nothing else: files and directories under the
+    # two places, no link of either kind, no .. -- each name whole (tar -t
+    # prints one a line), each type from tar -tv
+    { tar -tvf "$stage/backup.tar" >"$stage/types" && tar -tf "$stage/backup.tar" >"$stage/names"; } 2>/dev/null \
+        || die "Not a backup tar can read; nothing changed."
+    bad="$(awk '$1 !~ /^[-d]/ || / link to /' "$stage/types"
+           awk '/(^|\/)\.\.(\/|$)/ { print; next }
+                /^\.\/(var\/lib\/headscale|etc\/headscale)(\/|$)/ { next }
+                $0 == "./" || $0 == "./var/" || $0 == "./var/lib/" || $0 == "./etc/" { next }
+                { print }' "$stage/names")"
+    [ -z "$bad" ] || die "Not a backup connector made; refused: $(printf '%s\n' "$bad" | awk 'NR == 1')"
+    { mkdir "$stage/x" && tar -C "$stage/x" -xf "$stage/backup.tar"; } || die "Not a backup; nothing changed."
+    [ -f "$stage/x${HEADSCALE_LIB}/db.sqlite" ] && [ -f "$stage/x$HEADSCALE_CONFIG" ] \
+        || die "Not a headscale backup (no database, or no config); nothing changed."
+    aside="${HEADSCALE_LIB}.before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+    [ ! -e "$aside" ] || die "${aside} is there already; nothing changed."
+    systemctl stop headscale 2>/dev/null || true
+    if ! mv "$HEADSCALE_LIB" "$aside"; then
+        systemctl start headscale 2>/dev/null || true
+        die "Could not set the state aside; nothing changed."
+    fi
+    if ! restore_keep_etc "$aside" "$managed"; then
+        rm -rf "${aside:?}/etc" && mv "$aside" "$HEADSCALE_LIB"
+        systemctl start headscale 2>/dev/null || true
+        die "Could not set the state aside; nothing changed."
+    fi
+    if ! restore_put "$stage/x" "$managed"; then why="it could not be put in place"
+    elif ! headscale configtest >/dev/null 2>&1; then why="headscale cannot run it"
+    fi
+    if [ -n "$why" ]; then
+        restore_undo "$aside" "$managed" \
+            || die "Not restored (${why}), and the state before is still in ${aside}: put it back by hand (it, as ${HEADSCALE_LIB}; its etc/ files in /etc/headscale)."
+        systemctl start headscale 2>/dev/null || true
+        die "Not restored: ${why}; the state before is back in place."
+    fi
+    systemctl start headscale 2>/dev/null || true
+    log_success "Restored. The state before is in ${aside}."
+)
+
+# restore_stream_local's steps, each rc 1 at the first thing that fails.
+# The state now, set aside in <aside>: its /etc/headscale <files> in etc/.
+restore_keep_etc() {
+    local aside="$1" f
+    mkdir -p "$aside/etc" || return 1
+    for f in $2; do [ ! -e "/etc/headscale/$f" ] || cp -a "/etc/headscale/$f" "$aside/etc/" || return 1; done
+}
+
+# The backup extracted at <x> in place: /var/lib/headscale, and its
+# /etc/headscale <files> (one the backup lacks is left out).
+restore_put() {
+    local x="$1" f
+    { mkdir -p "$HEADSCALE_LIB" && cp -a "$x${HEADSCALE_LIB}/." "$HEADSCALE_LIB/"; } || return 1
+    for f in $2; do
+        rm -f "/etc/headscale/${f:?}" || return 1
+        [ ! -e "$x/etc/headscale/$f" ] || cp -a "$x/etc/headscale/$f" /etc/headscale/ || return 1
+    done
+    ! id headscale >/dev/null 2>&1 || chown -R headscale:headscale "$HEADSCALE_LIB"
+}
+
+# The state set aside in <aside> back in place, its /etc/headscale <files> too.
+restore_undo() {
+    local aside="$1" f
+    for f in $2; do
+        rm -f "/etc/headscale/${f:?}"
+        [ ! -e "$aside/etc/$f" ] || cp -a "$aside/etc/$f" /etc/headscale/
+    done
+    rm -rf "${aside:?}/etc" "${HEADSCALE_LIB:?}" && mv "$aside" "$HEADSCALE_LIB"
+}
+
+cmd_restore() {
+    local file="" identity="" sudo="sudo "
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --identity) identity="$2"; shift 2 ;;
+            --yes|-y)   ASSUME_YES=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) if [ -z "$file" ]; then file="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+    [ -f "$file" ] && [ -f "$identity" ] || die "Usage: connector restore <backup.tar.age> --identity <age or ssh private key file> [--yes]"
+    have age || die "age decrypts the backup: install it here (brew install age / apt-get install age)."
+    is_admin || die "Only a CNC or manager restores the CNC."
+    # the whole file decrypts with this identity before any of it goes: age
+    # stops at the first chunk that does not, and a tar cut there can still
+    # read, short of what the backup held (the noise key, say)
+    age -d -i "$identity" "$file" >/dev/null || die "${file} does not decrypt whole with ${identity} (above); nothing was sent."
+    confirm "Replace the CNC's headscale state with ${file}'s? (the state now is kept aside)" || die "Declined."
+    if is_cnc; then
+        age -d -i "$identity" "$file" | restore_stream_local
+    else
+        load_cnc_link
+        [ "$CNC_USER" != root ] || sudo=""
+        age -d -i "$identity" "$file" | ssh_cnc "${sudo}${CONNECTOR_BIN} restore-stream"
+    fi
+}
+
+# --- Scheduled backups -------------------------------------------------------
+# The CNC backs itself up every day: the archive `backup` makes, encrypted to
+# the public keys in /etc/headscale/backup.recipients, into a new 0600 file
+# under /var/backups/headscale (0700), the newest <keep> kept -- a day whose
+# backup failed deletes none. The private half is never on the CNC: a copy
+# goes off it with scp, and `restore` takes it as it takes any backup.
+
+# The service the daily timer starts. Args: keep
+backup_service_unit() {
+    cat <<EOF
+# Written by connector backup-schedule: an edit here is replaced.
+[Unit]
+Description=connector: headscale's state, encrypted to its backup recipients
+After=headscale.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=${CONNECTOR_BIN} backup-local --dir ${HEADSCALE_BACKUP_DIR} --keep $1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+EOF
+}
+
+backup_timer_unit() {
+    cat <<'EOF'
+# Written by connector backup-schedule: an edit here is replaced.
+[Unit]
+Description=connector: a daily encrypted backup of headscale's state
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Is <n> how many backups may stay?
+backup_keep_ok() {
+    [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]]
+}
+
+# On the CNC, as root, from the timer: one backup into <dir>, and the newest
+# <keep> kept, by the time in their names.
+backup_local() {
+    local dir="$HEADSCALE_BACKUP_DIR" keep="$HEADSCALE_BACKUP_KEEP" out f n=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir)  dir="$2"; shift 2 ;;
+            --keep) keep="$2"; shift 2 ;;
+            *) die "Usage: connector backup-local [--dir DIR] [--keep N]" ;;
+        esac
+    done
+    require_root backup-local
+    backup_keep_ok "$keep" || die "--keep is how many backups stay, 1 or more: not '$keep'"
+    install -d -m 0700 "$dir" || die "Could not make $dir."
+    out="$dir/headscale-$(date -u +%Y%m%dT%H%M%SZ).tar.age"
+    [ ! -e "$out" ] || die "$out exists: a backup goes into a new file only."
+    ( umask 077; set -o noclobber; backup_stream_local >"$out.part" ) || { rm -f "$out.part"; die "The backup failed; nothing kept."; }
+    [ "$(head -c 21 "$out.part")" = "age-encryption.org/v1" ] || { rm -f "$out.part"; die "That is not an encrypted backup; nothing kept."; }
+    mv -f "$out.part" "$out" || die "Could not keep $out."
+    while IFS= read -r f; do
+        n=$((n + 1))
+        [ "$n" -le "$keep" ] || rm -f -- "$f"
+    done < <(find "$dir" -maxdepth 1 -type f -name 'headscale-*.tar.age' | sort -r)
+    log_success "Backup: $out ($(wc -c <"$out" | tr -d ' ') bytes, 0600)."
+}
+
+# On the CNC, as root: the daily backup, encrypted to <recipient>s (written
+# to the recipients file) or, with none given, to those it lists; --off takes
+# the timer away (the backups, and their recipients, stay); --refresh writes
+# the units of a timer that is there as this connector does (cnc-init and
+# cnc-update), and puts none in.
+backup_schedule_local() {
+    local keep="" off=0 refresh=0 r tmp unit n=0
+    local -a rcpts=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --recipient) rcpts+=("$2"); shift 2 ;;
+            --keep)      keep="$2"; shift 2 ;;
+            --off)       off=1; shift ;;
+            --refresh)   refresh=1; shift ;;
+            *) die "Usage: connector backup-schedule [--recipient <age1...|ssh-ed25519 ...>]... [--keep N] | --off" ;;
+        esac
+    done
+    require_root backup-schedule
+    unit="$BACKUP_UNIT_DIR/connector-backup.service"
+    if [ "$off" = 1 ]; then
+        systemctl disable --now connector-backup.timer >/dev/null 2>&1 || true
+        rm -f "$unit" "$BACKUP_UNIT_DIR/connector-backup.timer"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        log_success "No more daily backups; those in ${HEADSCALE_BACKUP_DIR} stay."
+        return 0
+    fi
+    if [ "$refresh" = 1 ]; then
+        [ -f "$unit" ] || return 0
+        [ -n "$keep" ] || keep="$(sed -n 's/^ExecStart=.* --keep \([0-9]*\)$/\1/p' "$unit")"
+    fi
+    keep="${keep:-$HEADSCALE_BACKUP_KEEP}"
+    backup_keep_ok "$keep" || die "--keep is how many backups stay, 1 or more: not '$keep'"
+    for r in "${rcpts[@]+"${rcpts[@]}"}"; do backup_recipient_ok "$r" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone"; done
+    have age || pkg_install age >/dev/null 2>&1 || die "age encrypts the backups: apt-get install age"
+    have sqlite3 || pkg_install sqlite3 >/dev/null 2>&1 || die "sqlite3 copies the database: apt-get install sqlite3"
+    if [ "${#rcpts[@]}" -gt 0 ]; then
+        tmp="$(mktemp)"
+        { echo "# connector backup-schedule: the public keys a backup is encrypted to"; printf '%s\n' "${rcpts[@]}"; } >"$tmp"
+        # age takes each, or none is written: a typo would fail every day's backup
+        age -R "$tmp" </dev/null >/dev/null || { rm -f "$tmp"; die "age takes no such recipient (above); nothing changed."; }
+        { mkdir -p "$(dirname "$HEADSCALE_BACKUP_RECIPIENTS")" && install -m 0644 "$tmp" "$HEADSCALE_BACKUP_RECIPIENTS"; } \
+            || { rm -f "$tmp"; die "Could not write ${HEADSCALE_BACKUP_RECIPIENTS}."; }
+        rm -f "$tmp"
+    fi
+    while IFS= read -r r; do
+        backup_recipient_ok "$r" || die "${HEADSCALE_BACKUP_RECIPIENTS} holds a line that is no age1... or ssh-ed25519 public key"
+        n=$((n + 1))
+    done < <(grep -v '^[[:space:]]*#' "$HEADSCALE_BACKUP_RECIPIENTS" 2>/dev/null | awk 'NF')
+    [ "$n" -gt 0 ] || die "No recipient: pass --recipient <age1...|ssh-ed25519 ...> (a key whose private half is not on this machine)."
+    age -R "$HEADSCALE_BACKUP_RECIPIENTS" </dev/null >/dev/null \
+        || die "age takes no such recipient in ${HEADSCALE_BACKUP_RECIPIENTS} (above); the daily backup is as it was."
+    mkdir -p "$BACKUP_UNIT_DIR" || die "Could not make $BACKUP_UNIT_DIR."
+    { backup_service_unit "$keep" >"$unit" && backup_timer_unit >"$BACKUP_UNIT_DIR/connector-backup.timer"; } \
+        || die "Could not write the backup's units."
+    { systemctl daemon-reload && systemctl enable --now connector-backup.timer >/dev/null 2>&1; } \
+        || die "systemd did not take connector-backup.timer."
+    log_success "A backup every day into ${HEADSCALE_BACKUP_DIR}, the newest ${keep} kept, encrypted to ${n} recipient(s)."
+}
+
+# Where the daily backup is put, or taken away: on the CNC itself, or from a
+# manager over SSH.
+cmd_backup_schedule() {
+    local sudo="sudo " a prev=""
+    # checked here first: a private key passed by mistake never leaves this machine
+    for a in "$@"; do
+        [ "$prev" != --recipient ] || backup_recipient_ok "$a" || die "Not a recipient: a backup is encrypted to age1... or ssh-ed25519 public keys alone (nothing of it was sent)"
+        [ "$prev" != --keep ] || backup_keep_ok "$a" || die "--keep is how many backups stay, 1 or more: not '$a'"
+        prev="$a"
+    done
+    if is_cnc; then
+        backup_schedule_local "$@"
+    elif is_manager; then
+        load_cnc_link
+        [ "$CNC_USER" != root ] || sudo=""
+        ssh_cnc "${sudo}${CONNECTOR_BIN} backup-schedule-local$(shell_words "$@")"
+    else
+        die "Only a CNC or manager schedules the CNC's backups."
+    fi
 }
 
 # --- Admin: list / approve / revoke -----------------------------------------
@@ -1513,13 +2338,18 @@ cmd_approve() {
         echo "(Simpler: 'connector invite' issues a single-use key so no approval step is needed.)"
         return 0
     fi
-    local id; id="$(resolve_node_id "$node")" || die "Node not found: $node"
-    approve_routes "$id"
+    # the roles first: one refused (prod, ops) touches nothing on the CNC
+    local roles="" tags=""
     if [ -n "$type" ]; then
-        local roles tags
         roles="$(parse_node_roles "$type")"
         [ -n "$roles" ] || die "type must be provider, consumer, or provider,consumer"
+        # approve tags; an operator's machine is untagged, and the ops user's from its key
+        [ "$roles" != ops ] || die "An operator's machine is the ops user's, untagged: it joins with a key from 'connector invite ops', not by approve."
         tags="$(tags_for_roles "$roles")"
+    fi
+    local id; id="$(resolve_node_id "$node")" || die "Node not found: $node"
+    approve_routes "$id"
+    if [ -n "$tags" ]; then
         hs nodes tag --identifier "$id" --tags "$tags"
         log_success "Tagged node $node as $roles."
     fi
@@ -1613,7 +2443,7 @@ hs_nodes_tsv() {
 print_node_table() {
     local rows="$1" self_ip="" me_consumer=0
     [ -n "$rows" ] || { echo "No nodes found."; return 0; }
-    is_consumer && me_consumer=1
+    { is_consumer || is_ops; } && me_consumer=1
     have jq && self_ip="$(ts_cli status --json 2>/dev/null | jq -r '(.Self.TailscaleIPs // [])[0] // empty' 2>/dev/null || true)"
     {
         printf 'ID\tNAME\tROLE\tIP\tONLINE\tCONNECTABLE\n'
@@ -1647,7 +2477,7 @@ print_hosts() {
             out+="  ${cnc_name}  (cnc)"$'\n'
         fi
     fi
-    if have_ts && is_consumer && have jq; then
+    if have_ts && { is_consumer || is_ops; } && have jq; then
         names="$(ts_cli status --json 2>/dev/null | jq -r '
             (.Peer // {}) | to_entries[] | .value
             | select((.Tags // []) | index("tag:provider"))
@@ -2140,11 +2970,9 @@ cmd_cleanup() {
         fi
     fi
     rm -f "$ROLE_FILE"
-    # Remove the trusted self-signed CNC cert, if we installed one.
+    # An older connector's trusted CNC certificate: that one, by its fingerprint.
     if [ -s "$CNC_CA_FILE" ]; then
-        local cn; cn="$(openssl x509 -in "$CNC_CA_FILE" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -n1)"
-        untrust_cnc_cert "$cn"
-        log_info "Removed the trusted CNC certificate."
+        untrust_cert_sha256 "$(fp_of_pem <"$CNC_CA_FILE")" && rm -f "$CNC_CA_FILE"
     fi
     if is_manager && confirm "Also forget the linked CNC?"; then
         rm -f "$CNC_LINK_FILE"; log_success "Forgot CNC link."
@@ -2191,12 +3019,18 @@ connector v${VERSION} - headscale/tailscale mesh manager
 This machine: $(current_roles)
 
 SETUP
-  cnc-init [user@host] [--url https://HOST[:PORT]] [-p SSH_PORT]
-                       Set up the CNC (headscale). With user@host it runs
-                       remotely over SSH and links this PC as a manager.
-                       No domain needed: with a bare IP it self-signs TLS on
-                       :${HS_TLS_PORT_DEFAULT} and pins the cert on clients. If --url is omitted
-                       for a remote, the IP is taken from your SSH config.
+  cnc-init [user@host] --url https://NAME[:PORT] [--acme tls-alpn-01|http-01]
+           [--base-domain D] [--reinit] [-p SSH_PORT]
+                       Set up the CNC (headscale) on a DNS name: headscale gets
+                       NAME's certificate from Let's Encrypt (tls-alpn-01 on
+                       :443, the default; or http-01 on :80, for another port)
+                       and renews it itself; nodes install no trust root. With
+                       user@host it runs remotely over SSH and links this PC as
+                       a manager; a CNC already set up keeps its URL unless
+                       --url names another (then every node follows with
+                       migrate-cnc), and --reinit re-applies this connector.
+                       --base-domain is MagicDNS's suffix (connector.mesh); a
+                       re-run keeps the CNC's unless it names another.
   link <user@host> --url https://HOST[:PORT] [-p SSH_PORT]
                        Attach to an existing CNC (become a manager).
   cnc-update           [manager] Push this machine's connector script to
@@ -2205,10 +3039,20 @@ SETUP
                        nodes; pick from a list, or pass -a/--all for all.
 
 ONBOARD                [admin: run on the CNC or a linked manager]
-  invite [roles] [name]
-                       roles is comma-separated: provider, consumer, manager
-                       (e.g. 'invite provider,consumer'). No args -> menu.
-                       Mints a single-use key and prints the register command.
+  invite [--migrate] [roles] [name]
+                       roles is comma-separated: provider, consumer, manager,
+                       or ops alone (an operator's machine: untagged, it
+                       reaches prod on ssh and https). No args -> menu.
+                       Mints a single-use key and prints the register command;
+                       with --migrate, the migrate-cnc command a node already
+                       registered follows the CNC to its new name with. A prod
+                       machine is never invited (see prod-key).
+  prod-key [--out FILE] [--expiration 1m..60m|1h] [--yes]
+                       Mint the key a prod machine (cnc, a node) joins with:
+                       single-use, tag:prod and nothing else, expiring within
+                       the hour. stdout carries the key alone -- pipe it into
+                       that machine's join, which reads it on stdin -- or
+                       --out writes a new 0600 file.
   manager-key          Print this machine's SSH public key (for a
                        'manager' invite).
   approve [node] [roles]
@@ -2216,13 +3060,23 @@ ONBOARD                [admin: run on the CNC or a linked manager]
                        (roles comma-separated, e.g. provider,consumer).
 
 JOIN
-  register <roles> <url> [--authkey KEY] [--ca-sha256 FP]
-           [--hostname N] [--tailscale app|oss] [--yes]
-                       roles is comma-separated: provider[,consumer].
-                       Join the tailnet (just paste the command 'invite' prints).
-                       Auto-handles WSL systemd (asks first), trusts a self-signed
-                       CNC cert (pinned via --ca-sha256), and on macOS auto-detects
-                       the GUI app or open-source tailscaled (override: --tailscale).
+  register <roles> <url> [--authkey KEY|-] [--hostname N] [--tailscale app|oss] [--yes]
+                       roles is comma-separated: provider[,consumer], or ops.
+                       Join the tailnet (just paste the command 'invite' prints;
+                       '--authkey -' reads the key from stdin). The key reaches
+                       tailscale in a 0600 file, never on its command line.
+                       Auto-handles WSL systemd (asks first), and on macOS
+                       auto-detects the GUI app or open-source tailscaled
+                       (override: --tailscale).
+
+  migrate-cnc <url> --authkey KEY [--old-sha256 FP] [--tailscale app|oss] [--yes]
+                       Follow the CNC to its new name (what 'invite --migrate'
+                       prints): re-join with a fresh key as the roles and name
+                       this node had, stop trusting the root an older connector
+                       installed for the old address (that certificate, by its
+                       SHA-256), and point a manager's link at the new URL
+                       (a manager that is no node needs no key: only its link
+                       follows).
 
 USE
   status               Roles + tailscale/headscale status.
@@ -2242,15 +3096,29 @@ USE
                        attaches strictly), -l lists, -k [name] kills.
   alias <name> <user@name> | alias list | alias rm <name>
                        Save an SSH shortcut (optionally writes ~/.ssh/config).
+  backup [--out FILE] [--recipient <age1...|ssh-ed25519 ...>]...
+                       [admin] The CNC's state (headscale's database, keys,
+                       certificate cache, config and policy), encrypted on the
+                       CNC to public keys alone (and those listed in
+                       /etc/headscale/backup.recipients), into a new 0600 file.
+  restore <backup.tar.age> --identity <private key file> [--yes]
+                       [admin] Decrypt here, where the private key is, and put
+                       the state in place on the CNC: the state before is kept
+                       aside, and back if headscale cannot run what came.
+  backup-schedule [--recipient <age1...|ssh-ed25519 ...>]... [--keep N] | --off
+                       [admin] The CNC backs itself up every day, as backup
+                       does, encrypted to the recipients (written to
+                       /etc/headscale/backup.recipients; none given: those it
+                       lists) into /var/backups/headscale, the newest N (14)
+                       kept. --off stops it; the backups stay.
   cleanup              Disconnect this machine from the tailnet.
   cleanup-cnc          [admin] Delete all nodes + stop headscale.
   help                 This help.
 
 Examples
-  connector cnc-init root@203.0.113.1            # no domain; self-signs TLS on :${HS_TLS_PORT_DEFAULT}
-  connector cnc-init root@203.0.113.1 --url https://vpn.example.com   # with a domain
+  connector cnc-init root@203.0.113.1 --url https://vpn.example.com   # its A record -> 203.0.113.1
   connector invite consumer
-  connector register consumer https://203.0.113.1:${HS_TLS_PORT_DEFAULT} --authkey hskey-xxxx --ca-sha256 ab12...
+  connector register consumer https://vpn.example.com --authkey hskey-xxxx
   connector hop my-laptop
   connector hop -t my-laptop work                # persistent tmux session 'work'
 EOF
@@ -2296,6 +3164,15 @@ main() {
         invite)         cmd_invite "$@" ;;
         manager-key|commander-key)  cmd_manager_key "$@" ;;
         register)       cmd_register "$@" ;;
+        migrate-cnc)    cmd_migrate_cnc "$@" ;;
+        prod-key)       cmd_prod_key "$@" ;;
+        backup)         cmd_backup "$@" ;;
+        restore)        cmd_restore "$@" ;;
+        backup-stream)  backup_stream_local "$@" ;;     # over SSH, from a manager's backup
+        backup-schedule) cmd_backup_schedule "$@" ;;
+        backup-schedule-local) backup_schedule_local "$@" ;;  # over SSH, from a manager's backup-schedule
+        backup-local)   backup_local "$@" ;;            # the daily timer's
+        restore-stream) restore_stream_local "$@" ;;    # over SSH, from a manager's restore
         approve)        cmd_approve "$@" ;;
         list|ls)        cmd_list "$@" ;;
         revoke)         cmd_revoke "$@" ;;
@@ -2323,4 +3200,5 @@ main() {
     esac
 }
 
-main "$@"
+# Sourced (the tests) rather than run: define everything, do nothing.
+[ "${BASH_SOURCE[0]}" != "$0" ] || main "$@"
