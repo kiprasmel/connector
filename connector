@@ -130,7 +130,7 @@ pkg_for() {
 # Install packages with the detected manager (refreshing the DB first).
 pkg_install() {
     case "$(pkg_mgr)" in
-        apt)    as_root apt-get update -qq && as_root apt-get install -y "$@" ;;
+        apt)    as_root apt-get update -qq && as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
         pacman) as_root pacman -Sy --needed --noconfirm "$@" ;;
         dnf)    as_root dnf install -y "$@" ;;
         yum)    as_root yum install -y "$@" ;;
@@ -502,7 +502,11 @@ install_headscale() {
         || { rm -rf "$tmp"; die "${name} is not the pinned release (its sha256 is not ${sha}); nothing installed."; }
     if [ "$kind" = "deb" ]; then
         as_root apt-get update -y
-        as_root apt-get install -y "$tmp/$name"
+        # nothing may ask: an upgrade over a config.yaml connector wrote stopped
+        # at dpkg's conffile prompt with no one to answer, and left the package
+        # half-configured. connector writes the config itself next, so the one
+        # in place is kept (the release's lands beside it, .dpkg-dist).
+        as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold "$tmp/$name"
     else
         as_root install -m 0755 "$tmp/$name" "$HEADSCALE_BIN"
         install_headscale_service

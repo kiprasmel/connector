@@ -50,15 +50,20 @@ setup() {
     [ -z "$(calls_of apt-get)" ]
 }
 
-@test "the pinned release goes in over an older one once its sha256 holds" {
+@test "the pinned release goes in over an older one once its sha256 holds, asking nothing and keeping the config in place" {
     export HS_INSTALLED=0.26.1
+    # shellcheck disable=SC2016  # expands in the stub
+    stub apt-get 'echo "${DEBIAN_FRONTEND:-interactive} $*" >>"$BATS_TEST_TMPDIR/frontend"'
     # the pin names what this download is
     run connector_eval 'headscale_artifact() { printf "headscale_x_linux_amd64.deb %s\n" "$(printf "%s" "$CURL_BODY" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d" " -f1)"; }
         install_headscale'
     assert_success
     assert_output --partial "over 0.26.1"
     run calls_of apt-get
-    assert_line --regexp "^apt-get install -y .*/headscale_x_linux_amd64\.deb$"
+    assert_line --regexp "^apt-get install -y -o Dpkg::Options::=--force-confold .*/headscale_x_linux_amd64\.deb$"
+    # the install, the one step that can ask, runs with nothing to ask
+    run cat "$BATS_TEST_TMPDIR/frontend"
+    assert_line --regexp "^noninteractive install -y -o Dpkg::Options::=--force-confold .*/headscale_x_linux_amd64\.deb$"
 }
 
 @test "a newer headscale is never downgraded" {
