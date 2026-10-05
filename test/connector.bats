@@ -72,3 +72,28 @@ setup() { common_setup; }
     cmp -s "$CONNECTOR" "$sys/connector"
     [ "$(readlink "$sys/con")" = "$sys/connector" ]
 }
+
+@test "an ops machine joins as a fresh, untagged node, and one that came back tagged is refused" {
+    # shellcheck disable=SC2016  # expands in the stub
+    stub tailscale 'case "$1" in ip) echo 100.64.0.9 ;; whois) [ ! -f "$BATS_TEST_TMPDIR/tagged" ] || printf "Machine:\n  Name: mac\n  Tags:          tag:consumer\n" ;; esac'
+    # ops logs out first, so the CNC makes a node of the ops user's
+    run connector_fn ops_fresh_identity ops tailscale
+    assert_success
+    run grep -cx 'tailscale logout' "$CALLS"
+    assert_output 1
+    # another role keeps its node
+    : >"$CALLS"
+    run connector_fn ops_fresh_identity consumer tailscale
+    assert_success
+    run grep -c 'logout' "$CALLS"
+    assert_output 0
+    # untagged: done; tagged: refused, naming the way out
+    run connector_fn ops_untagged_or_die ops tailscale
+    assert_success
+    touch "$BATS_TEST_TMPDIR/tagged"
+    run connector_fn ops_untagged_or_die ops tailscale
+    assert_failure
+    assert_output --partial "joined as a tagged node (tag:consumer), not as ops: revoke it on the CNC"
+    run connector_fn ops_untagged_or_die consumer tailscale
+    assert_success
+}
