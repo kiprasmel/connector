@@ -183,7 +183,12 @@ file_sha256() {
 
 # Resolve the absolute path of this script, following symlinks.
 self_path() {
-    local s="${BASH_SOURCE[0]}" d
+    resolve_path "${BASH_SOURCE[0]}"
+}
+
+# <path> with every symlink on the way followed. Stdout. Args: path
+resolve_path() {
+    local s="$1" d
     while [ -h "$s" ]; do
         d=$(cd -P "$(dirname "$s")" >/dev/null 2>&1 && pwd)
         s=$(readlink "$s")
@@ -1800,8 +1805,15 @@ maybe_fix_wsl_mtu() {
 # Install the running connector to CONNECTOR_BIN and create the 'con' shortcut,
 # so the node has 'connector'/'con' on PATH after joining. Never fatal.
 install_self_local() {
-    local self dir; self="$(self_path)"; dir="${CONNECTOR_BIN%/*}"
+    local self dir onpath; self="$(self_path)"; dir="${CONNECTOR_BIN%/*}"
     [ -n "$self" ] && [ -f "$self" ] || return 0
+    # Already on PATH as this very script -- a checkout's symlink, say: a copy
+    # would shadow it there and go stale at its next commit.
+    onpath="$(command -v connector 2>/dev/null || true)"
+    if [ -n "$onpath" ] && [ "$(resolve_path "$onpath")" = "$self" ]; then
+        log_info "'connector' on PATH is this one (${onpath}); not installing a copy."
+        return 0
+    fi
     as_root mkdir -p "$dir" 2>/dev/null || true
     if [ "$self" != "$CONNECTOR_BIN" ]; then
         as_root install -m 0755 "$self" "$CONNECTOR_BIN" 2>/dev/null \
