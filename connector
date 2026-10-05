@@ -34,6 +34,9 @@ HEADSCALE_CERT="${HEADSCALE_CERT_DIR}/cnc.crt"
 HS_ACME_DEFAULT="tls-alpn-01"
 CONNECTOR_BIN="/usr/local/bin/connector"
 CON_BIN="/usr/local/bin/con"        # short 'con' shortcut, symlinked to connector
+# A system unit (the CNC's backup timer) runs with no HOME: bash's ~ is then
+# the account's own home, from its passwd entry.
+[ -n "${HOME:-}" ] || { HOME=~; export HOME; }
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/connector"
 CNC_LINK_FILE="${STATE_DIR}/cnc"
 ROLE_FILE="${STATE_DIR}/role"

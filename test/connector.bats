@@ -16,6 +16,15 @@ setup() { common_setup; }
     assert_output --partial "connector v"
 }
 
+@test "run by a system unit, with no HOME, connector takes the account's own" {
+    run env -u HOME "$CONNECTOR" help
+    assert_success
+    assert_output --partial "connector v"
+    run env -u HOME bash -c 'source "$CONNECTOR"; echo "$STATE_DIR"'
+    assert_success
+    assert_output "${XDG_CONFIG_HOME:-$(env -u HOME bash -c 'echo ~')/.config}/connector"
+}
+
 @test "roles parse to one canonical list, and an unknown one is refused" {
     run connector_fn parse_node_roles "consumer,provider"
     assert_output "provider,consumer"
