@@ -296,7 +296,9 @@ tags_for_roles() {
     local tags=()
     role_has "$1" provider && tags+=("tag:provider")
     role_has "$1" consumer && tags+=("tag:consumer")
-    local IFS=,; printf '%s' "${tags[*]}"
+    # ops has none, and an empty array is unbound under set -u in bash < 4.4
+    # (macOS's /bin/bash is 3.2)
+    local IFS=,; printf '%s' "${tags[*]+"${tags[*]}"}"
 }
 
 current_roles() {
