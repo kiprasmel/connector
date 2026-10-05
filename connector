@@ -1716,6 +1716,24 @@ register_summary() {
     role_has "$roles" consumer && echo "  Persistent tmux shell: connector hop -t <provider-name>"
 }
 
+# An ops machine is a node of the ops user's, untagged: the ACL lets
+# group:ops alone reach tag:prod. Re-authenticating a machine that is a
+# tagged node already keeps that node -- its tags, its address -- so ops
+# logs out first, and a join that still came back tagged is refused rather
+# than left looking done. Args: roles, runner... (the tailscale cli, with
+# sudo when it needs it)
+ops_fresh_identity() {
+    [ "$1" = ops ] || return 0
+    shift
+    "$@" logout >/dev/null 2>&1 || true
+}
+ops_untagged_or_die() {
+    local roles="$1" tags; shift
+    [ "$roles" = ops ] || return 0
+    tags="$("$@" whois "$("$@" ip -4 2>/dev/null | head -n1)" 2>/dev/null | awk '$1 == "Tags:" { $1 = ""; sub(/^ /, ""); print }')"
+    [ -z "$tags" ] || die "This machine joined as a tagged node (${tags}), not as ops: revoke it on the CNC ('connector revoke <name>'), then register again."
+}
+
 register_macos() {
     local roles="$1" url="$2" key="$3" hostname="$4" variant="$5" reauth="${6:-0}" cli needs_ssh=0
     [ -n "$hostname" ] || hostname="$(node_name)"
@@ -1757,12 +1775,14 @@ register_macos() {
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
     [ -n "$key" ] || up_args+=(--advertise-tags="$tags")
 
+    ops_fresh_identity "$roles" "${runner_cmd[@]}"
     if ! ts_up "$key" "${runner_cmd[@]}" -- "${up_args[@]}"; then
         log_warn "tailscale up failed."
         log_warn "If a browser login URL appeared, finish there; or ask the admin to run 'connector approve'."
         log_warn "If using the GUI app, ensure it is running and its system extension is approved."
         die "tailscale up did not complete."
     fi
+    ops_untagged_or_die "$roles" "${runner_cmd[@]}"
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
     printf '%s\n' "$roles" > "$ROLE_FILE"
     install_self_local
@@ -1877,6 +1897,7 @@ cmd_register() {
     [ -n "$ssh_flag" ] && up_args+=("$ssh_flag")
     [ -n "$key" ] || up_args+=(--advertise-tags="$tags")
 
+    ops_fresh_identity "$roles" as_root tailscale
     if ! ts_up "$key" as_root tailscale up -- "${up_args[@]}"; then
         if [ -z "$key" ]; then
             log_warn "No --authkey supplied; tailscale printed a login URL above."
@@ -1884,6 +1905,7 @@ cmd_register() {
         fi
         die "tailscale up did not complete."
     fi
+    ops_untagged_or_die "$roles" as_root tailscale
 
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
     printf '%s\n' "$roles" > "$ROLE_FILE"
